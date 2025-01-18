@@ -303,78 +303,6 @@ func getCompressionAlgorithm(
 	}
 }
 
-// DO NOT set storage.single_delete.crash_on_invariant_violation.enabled or
-// storage.single_delete.crash_on_ineffectual.enabled to true.
-//
-// Pebble's delete-only compactions can cause a recent RANGEDEL to peek below
-// an older SINGLEDEL and delete an arbitrary subset of data below that
-// SINGLEDEL. When that SINGLEDEL gets compacted (without the RANGEDEL), any
-// of these callbacks can happen, without it being a real correctness problem.
-//
-// Example 1:
-// RANGEDEL [a, c)#10 in L0
-// SINGLEDEL b#5 in L1
-// SET b#3 in L6
-//
-// If the L6 file containing the SET is narrow and the L1 file containing the
-// SINGLEDEL is wide, a delete-only compaction can remove the file in L2
-// before the SINGLEDEL is compacted down. Then when the SINGLEDEL is
-// compacted down, it will not find any SET to delete, resulting in the
-// ineffectual callback.
-//
-// Example 2:
-// RANGEDEL [a, z)#60 in L0
-// SINGLEDEL g#50 in L1
-// SET g#40 in L2
-// RANGEDEL [g,h)#30 in L3
-// SET g#20 in L6
-//
-// In this example, the two SETs represent the same intent, and the RANGEDELs
-// are caused by the CRDB range being dropped. That is, the transaction wrote
-// the intent once, range was dropped, then added back, which caused the SET
-// again, then the transaction committed, causing a SINGLEDEL, and then the
-// range was dropped again. The older RANGEDEL can get fragmented due to
-// compactions it has been part of. Say this L3 file containing the RANGEDEL
-// is very narrow, while the L1, L2, L6 files are wider than the RANGEDEL in
-// L0. Then the RANGEDEL in L3 can be dropped using a delete-only compaction,
-// resulting in an LSM with state:
-//
-// RANGEDEL [a, z)#60 in L0
-// SINGLEDEL g#50 in L1
-// SET g#40 in L2
-// SET g#20 in L6
-//
-// A multi-level compaction involving L1, L2, L6 will cause the invariant
-// violation callback. This example doesn't need multi-level compactions: say
-// there was a Pebble snapshot at g#21 preventing g#20 from being dropped when
-// it meets g#40 in a compaction. That snapshot will not save RANGEDEL
-// [g,h)#30, so we can have:
-//
-// SINGLEDEL g#50 in L1
-// SET g#40, SET g#20 in L6
-//
-// And say the snapshot is removed and then the L1 and L6 compaction happens,
-// resulting in the invariant violation callback.
-//
-// TODO(sumeer): remove these cluster settings or figure out a way to bring
-// back some invariant checking.
-
-var SingleDeleteCrashOnInvariantViolation = settings.RegisterBoolSetting(
-	settings.SystemOnly,
-	"storage.single_delete.crash_on_invariant_violation.enabled",
-	"set to true to crash if the single delete invariant is violated",
-	false,
-	settings.WithVisibility(settings.Reserved),
-)
-
-var SingleDeleteCrashOnIneffectual = settings.RegisterBoolSetting(
-	settings.SystemOnly,
-	"storage.single_delete.crash_on_ineffectual.enabled",
-	"set to true to crash if the single delete was ineffectual",
-	false,
-	settings.WithVisibility(settings.Reserved),
-)
-
 var walFailoverUnhealthyOpThreshold = settings.RegisterDurationSetting(
 	settings.SystemOnly,
 	"storage.wal_failover.unhealthy_op_threshold",
@@ -891,6 +819,8 @@ func DefaultPebbleOptions() *pebble.Options {
 	// This issue tracks re-enablement: https://github.com/cockroachdb/pebble/issues/4139
 	opts.Experimental.MultiLevelCompactionHeuristic = pebble.NoMultiLevel{}
 
+	opts.Experimental.UserKeyCategories = userKeyCategories
+
 	for i := 0; i < len(opts.Levels); i++ {
 		l := &opts.Levels[i]
 		l.BlockSize = 32 << 10       // 32 KB
@@ -1053,6 +983,7 @@ type Pebble struct {
 	storeIDPebbleLog *base.StoreIDContainer
 	replayer         *replay.WorkloadCollector
 	diskSlowFunc     atomic.Pointer[func(vfs.DiskSlowInfo)]
+	lowDiskSpaceFunc atomic.Pointer[func(pebble.LowDiskSpaceInfo)]
 
 	singleDelLogEvery log.EveryN
 }
@@ -1082,6 +1013,13 @@ func (p *Pebble) SetCompactionConcurrency(n uint64) uint64 {
 // registered per Pebble instance.
 func (p *Pebble) RegisterDiskSlowCallback(f func(vfs.DiskSlowInfo)) {
 	p.diskSlowFunc.Store(&f)
+}
+
+// RegisterLowDiskSpaceCallback registers a callback that will be run when a a
+// disk is running out of space. Only one handler can be registered per Pebble
+// instance.
+func (p *Pebble) RegisterLowDiskSpaceCallback(f func(info pebble.LowDiskSpaceInfo)) {
+	p.lowDiskSpaceFunc.Store(&f)
 }
 
 // AdjustCompactionConcurrency adjusts the compaction concurrency up or down by
@@ -1306,27 +1244,6 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 		diskWriteStatsCollector: cfg.DiskWriteStatsCollector,
 	}
 
-	cfg.opts.Experimental.SingleDeleteInvariantViolationCallback = func(userKey []byte) {
-		logFunc := func(ctx context.Context, format string, args ...interface{}) {}
-		if SingleDeleteCrashOnInvariantViolation.Get(&cfg.settings.SV) {
-			logFunc = log.Fatalf
-		} else if p.singleDelLogEvery.ShouldLog() {
-			logFunc = log.Infof
-		}
-		logFunc(logCtx, "SingleDel invariant violation callback (can be false positive) on key %s", roachpb.Key(userKey))
-		atomic.AddInt64(&p.singleDelInvariantViolationCount, 1)
-	}
-	cfg.opts.Experimental.IneffectualSingleDeleteCallback = func(userKey []byte) {
-		logFunc := func(ctx context.Context, format string, args ...interface{}) {}
-		if SingleDeleteCrashOnInvariantViolation.Get(&cfg.settings.SV) {
-			logFunc = log.Fatalf
-		} else if p.singleDelLogEvery.ShouldLog() {
-			logFunc = log.Infof
-		}
-		logFunc(logCtx, "Ineffectual SingleDel callback (can be false positive) on key %s", roachpb.Key(userKey))
-		atomic.AddInt64(&p.singleDelIneffectualCount, 1)
-	}
-
 	// MaxConcurrentCompactions can be set by multiple sources, but all the
 	// sources will eventually call NewPebble. So, we override
 	// cfg.opts.MaxConcurrentCompactions to a closure which will return
@@ -1493,6 +1410,28 @@ func newPebble(ctx context.Context, cfg engineConfig) (p *Pebble, err error) {
 	return p, nil
 }
 
+var userKeyCategories = pebble.MakeUserKeyCategories(
+	EngineComparer.Compare,
+	category("local-1", keys.LocalRangeIDPrefix.AsRawKey()),
+	category("rangeid", keys.LocalRangeIDPrefix.AsRawKey().PrefixEnd()),
+	category("local-2", keys.LocalRangePrefix),
+	category("range", keys.LocalRangePrefix.PrefixEnd()),
+	category("local-3", keys.LocalRangeLockTablePrefix),
+	category("lock", keys.LocalRangeLockTablePrefix.PrefixEnd()),
+	category("local-4", keys.LocalPrefix.PrefixEnd()),
+	category("meta", keys.MetaMax),
+	category("system", keys.SystemMax),
+	category("tenant", nil),
+)
+
+func category(name string, upperBound roachpb.Key) pebble.UserKeyCategory {
+	if upperBound == nil {
+		return pebble.UserKeyCategory{Name: name}
+	}
+	ek := EngineKey{Key: upperBound}
+	return pebble.UserKeyCategory{Name: name, UpperBound: ek.Encode()}
+}
+
 // async launches the provided function in a new goroutine. It uses a wait group
 // to synchronize with (*Pebble).Close to ensure all launched goroutines have
 // exited before Close returns.
@@ -1605,6 +1544,26 @@ func (p *Pebble) makeMetricEtcEventListener(ctx context.Context) pebble.EventLis
 			p.mu.Unlock()
 			if cb != nil {
 				cb()
+			}
+		},
+		LowDiskSpace: func(info pebble.LowDiskSpaceInfo) {
+			if fn := p.lowDiskSpaceFunc.Load(); fn != nil {
+				(*fn)(info)
+			}
+		},
+		PossibleAPIMisuse: func(info pebble.PossibleAPIMisuseInfo) {
+			switch info.Kind {
+			case pebble.IneffectualSingleDelete:
+				if p.singleDelLogEvery.ShouldLog() {
+					log.Infof(p.logCtx, "possible ineffectual SingleDel on key %s", roachpb.Key(info.UserKey))
+				}
+				atomic.AddInt64(&p.singleDelIneffectualCount, 1)
+
+			case pebble.NondeterministicSingleDelete:
+				if p.singleDelLogEvery.ShouldLog() {
+					log.Infof(p.logCtx, "possible nondeterministic SingleDel on key %s", roachpb.Key(info.UserKey))
+				}
+				atomic.AddInt64(&p.singleDelInvariantViolationCount, 1)
 			}
 		},
 	}
@@ -1765,7 +1724,7 @@ func (p *Pebble) ScanInternal(
 	rawLower := EngineKey{Key: lower}.Encode()
 	rawUpper := EngineKey{Key: upper}.Encode()
 	// TODO(sumeer): set category.
-	return p.db.ScanInternal(ctx, sstable.CategoryUnknown, rawLower, rawUpper, visitPointKey,
+	return p.db.ScanInternal(ctx, block.CategoryUnknown, rawLower, rawUpper, visitPointKey,
 		visitRangeDel, visitRangeKey, visitSharedFile, visitExternalFile)
 }
 
@@ -2189,6 +2148,11 @@ func (p *Pebble) GetMetrics() Metrics {
 		m.DiskWriteStats = p.diskWriteStatsCollector.GetStats()
 	}
 	return m
+}
+
+// GetPebbleOptions implements the Engine interface.
+func (p *Pebble) GetPebbleOptions() *pebble.Options {
+	return p.cfg.opts
 }
 
 // GetEncryptionRegistries implements the Engine interface.
@@ -3157,7 +3121,7 @@ func (p *pebbleSnapshot) ScanInternal(
 	rawLower := EngineKey{Key: lower}.Encode()
 	rawUpper := EngineKey{Key: upper}.Encode()
 	// TODO(sumeer): set category.
-	return p.snapshot.ScanInternal(ctx, sstable.CategoryUnknown, rawLower, rawUpper, visitPointKey,
+	return p.snapshot.ScanInternal(ctx, block.CategoryUnknown, rawLower, rawUpper, visitPointKey,
 		visitRangeDel, visitRangeKey, visitSharedFile, visitExternalFile)
 }
 
@@ -3281,7 +3245,7 @@ func (p *pebbleEFOS) ScanInternal(
 	rawLower := EngineKey{Key: lower}.Encode()
 	rawUpper := EngineKey{Key: upper}.Encode()
 	// TODO(sumeer): set category.
-	return p.efos.ScanInternal(ctx, sstable.CategoryUnknown, rawLower, rawUpper, visitPointKey,
+	return p.efos.ScanInternal(ctx, block.CategoryUnknown, rawLower, rawUpper, visitPointKey,
 		visitRangeDel, visitRangeKey, visitSharedFile, visitExternalFile)
 }
 

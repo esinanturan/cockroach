@@ -31,6 +31,8 @@ import (
 type countDetail struct {
 	// count is the number of unexpired leases
 	count int
+	// targetCount is the target number we are trying to reach.
+	targetCount int
 	// numSQLInstances is the number of distinct SQL instances with unexpired leases.
 	numSQLInstances int
 	// sampleSQLInstanceID is one of the sql_instance_id values we are waiting on,
@@ -59,6 +61,30 @@ func CountLeases(
 	return detail.count, nil
 }
 
+// isRegionColumnError detects if a InvalidParameterValue or
+// UndefinedFunction are observed because of the region column.
+// This can happen because of the following reasons:
+//  1. The currently leased system database is not multi-region, but the leased
+//     system.lease table is multi-region.
+//  2. The currently leased system database is multi-region, but the system.lease
+//     descriptor we have is not multi-region.
+//
+// Both cases are transient and are a side effect of using a cache system
+// database descriptor for checks.
+func isTransientRegionColumnError(err error) bool {
+	// No error detected nothing else needs to be checked.
+	if err == nil {
+		return false
+	}
+	// Some unrelated error was observed, so this is not linked to the
+	// region column transitioning from bytes to crdb_region.
+	if pgerror.GetPGCode(err) != pgcode.UndefinedFunction &&
+		pgerror.GetPGCode(err) != pgcode.InvalidParameterValue {
+		return false
+	}
+	return strings.Contains(err.Error(), "crdb_internal_region")
+}
+
 func countLeasesWithDetail(
 	ctx context.Context,
 	db isql.DB,
@@ -84,13 +110,10 @@ func countLeasesWithDetail(
 	leasingDescIsSessionBased := systemDBVersion != nil
 	leasingMode := readSessionBasedLeasingMode(ctx, settings)
 	whereClauses := make([][]string, 2)
-	containsSystemDatabase := false
 	forceMultiRegionQuery := false
+	useBytesOnRetry := false
 	for _, t := range versions {
 		versionClause := ""
-		if t.ID == keys.SystemDatabaseID {
-			containsSystemDatabase = true
-		}
 		if !forAnyVersion {
 			versionClause = fmt.Sprintf("AND version = %d", t.Version)
 		}
@@ -156,20 +179,17 @@ func countLeasesWithDetail(
 						// If we are injecting a raw leases descriptors, that will not have the enum
 						// type set, so convert the region to byte equivalent physical representation.
 						detail, err = countLeasesByRegion(ctx, txn, prober, regionMap, cachedDatabaseRegions,
-							len(descsToInject) > 0, at, whereClause, usesOldSchema[i])
+							len(descsToInject) > 0 || useBytesOnRetry, at, whereClause, usesOldSchema[i])
 					} else {
 						detail, err = countLeasesNonMultiRegion(ctx, txn, at, whereClause, usesOldSchema[i])
-						// It's possible that our cached database descriptor is stale relative to the
-						// visible lease table descriptor. Because the lease manager uses rangefeeds to
-						// keep track of new descriptor versions, when converting to a multi-region
-						// system database its possible for the lease table descriptor update to precede
-						// the system database descriptor update.
-						if err != nil &&
-							pgerror.GetPGCode(err) == pgcode.UndefinedFunction &&
-							containsSystemDatabase {
-							forceMultiRegionQuery = true
-							return txn.KV().GenerateForcedRetryableErr(ctx, "forcing retry once with MR columns")
-						}
+					}
+					// If any transient region column errors occur then we should retry the count query.
+					if isTransientRegionColumnError(err) {
+						forceMultiRegionQuery = true
+						// If the query was already multi-region aware, then the system database is MR,
+						// but our lease descriptor has not been upgraded yet.
+						useBytesOnRetry = cachedDatabaseRegions != nil && cachedDatabaseRegions.IsMultiRegion()
+						return txn.KV().GenerateForcedRetryableErr(ctx, "forcing retry once with MR columns")
 					}
 					return err
 				})
@@ -274,23 +294,7 @@ func countLeasesByRegion(
 		} else {
 			err = queryRegionRows(ctx)
 		}
-		if err != nil {
-			if regionliveness.IsQueryTimeoutErr(err) {
-				// Probe and mark the region potentially.
-				probeErr := prober.ProbeLiveness(ctx, region)
-				if probeErr != nil {
-					err = errors.WithSecondaryError(err, probeErr)
-					return err
-				}
-				return errors.Wrapf(err, "count-lease timed out reading from a region")
-			} else if regionliveness.IsMissingRegionEnumErr(err) {
-				// Skip this region because we were unable to find region in
-				// type descriptor. Since the database regions are cached, they
-				// may be stale and have dropped regions.
-				log.Infof(ctx, "count-lease is skipping region %s because of the "+
-					"following error %v", region, err)
-				return nil
-			}
+		if err := handleRegionLivenessErrors(ctx, prober, region, err); err != nil {
 			return err
 		}
 		if values == nil {
@@ -324,4 +328,30 @@ func getCountLeaseColumns(usesOldSchema bool) string {
 	}
 	sb.WriteString(`, count(distinct sql_instance_id), ifnull(min(sql_instance_id),0)`)
 	return sb.String()
+}
+
+// handleRegionLivenessErrors handles errors that are linked to region liveness
+// timeouts.
+func handleRegionLivenessErrors(
+	ctx context.Context, prober regionliveness.Prober, region string, err error,
+) error {
+	if err != nil {
+		if regionliveness.IsQueryTimeoutErr(err) {
+			// Probe and mark the region potentially.
+			probeErr := prober.ProbeLiveness(ctx, region)
+			if probeErr != nil {
+				err = errors.WithSecondaryError(err, probeErr)
+				return err
+			}
+			return errors.Wrapf(err, "count-lease timed out reading from a region")
+		} else if regionliveness.IsMissingRegionEnumErr(err) {
+			// Skip this region because we were unable to find region in
+			// type descriptor. Since the database regions are cached, they
+			// may be stale and have dropped regions.
+			log.Infof(ctx, "count-lease skipping region %s due to error: %v", region, err)
+			return nil
+		}
+		return err
+	}
+	return err
 }

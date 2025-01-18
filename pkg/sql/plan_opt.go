@@ -263,6 +263,16 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 	}
 
 	// Build the plan tree.
+	const disableTelemetryAndPlanGists = false
+	return p.runExecBuild(ctx, execMemo, disableTelemetryAndPlanGists)
+}
+
+// runExecBuild builds the plan tree for the given memo. It assumes that the
+// optPlanningCtx of the planner has been properly set up.
+func (p *planner) runExecBuild(
+	ctx context.Context, execMemo *memo.Memo, disableTelemetryAndPlanGists bool,
+) error {
+	opc := &p.optPlanningCtx
 	if mode := p.SessionData().ExperimentalDistSQLPlanningMode; mode != sessiondatapb.ExperimentalDistSQLPlanningOff {
 		planningMode := distSQLDefaultPlanning
 		// If this transaction has modified or created any types, it is not safe to
@@ -280,6 +290,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 			p.SemaCtx(),
 			p.EvalContext(),
 			p.autoCommit,
+			disableTelemetryAndPlanGists,
 		)
 		if err != nil {
 			if mode == sessiondatapb.ExperimentalDistSQLPlanningAlways &&
@@ -316,6 +327,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 					p.SemaCtx(),
 					p.EvalContext(),
 					p.autoCommit,
+					disableTelemetryAndPlanGists,
 				)
 			}
 			if err == nil {
@@ -338,6 +350,7 @@ func (p *planner) makeOptimizerPlan(ctx context.Context) error {
 		p.SemaCtx(),
 		p.EvalContext(),
 		p.autoCommit,
+		disableTelemetryAndPlanGists,
 	)
 }
 
@@ -360,6 +373,8 @@ type optPlanningCtx struct {
 	useCache bool
 
 	flags planFlags
+
+	gf explain.PlanGistFactory
 }
 
 // init performs one-time initialization of the planning context; reset() must
@@ -880,12 +895,13 @@ func (opc *optPlanningCtx) runExecBuilder(
 	semaCtx *tree.SemaContext,
 	evalCtx *eval.Context,
 	allowAutoCommit bool,
+	disableTelemetryAndPlanGists bool,
 ) error {
 	var result *planComponents
-	var gf *explain.PlanGistFactory
-	if !opc.p.SessionData().DisablePlanGists {
-		gf = explain.NewPlanGistFactory(f)
-		f = gf
+	if !opc.p.SessionData().DisablePlanGists && !disableTelemetryAndPlanGists {
+		opc.gf.Init(f)
+		defer opc.gf.Reset()
+		f = &opc.gf
 	}
 	var bld *execbuilder.Builder
 	if !planTop.instrumentation.ShouldBuildExplainPlan() {
@@ -893,6 +909,9 @@ func (opc *optPlanningCtx) runExecBuilder(
 			ctx, f, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
 			semaCtx, evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST),
 		)
+		if disableTelemetryAndPlanGists {
+			bld.DisableTelemetry()
+		}
 		plan, err := bld.Build()
 		if err != nil {
 			return err
@@ -905,6 +924,9 @@ func (opc *optPlanningCtx) runExecBuilder(
 			ctx, explainFactory, &opc.optimizer, mem, opc.catalog, mem.RootExpr(),
 			semaCtx, evalCtx, allowAutoCommit, statements.IsANSIDML(stmt.AST),
 		)
+		if disableTelemetryAndPlanGists {
+			bld.DisableTelemetry()
+		}
 		plan, err := bld.Build()
 		if err != nil {
 			return err
@@ -923,8 +945,8 @@ func (opc *optPlanningCtx) runExecBuilder(
 	planTop.instrumentation.scanCounts = bld.ScanCounts
 	planTop.instrumentation.indexesUsed = bld.IndexesUsed
 
-	if gf != nil {
-		planTop.instrumentation.planGist = gf.PlanGist()
+	if opc.gf.Initialized() {
+		planTop.instrumentation.planGist = opc.gf.PlanGist()
 	}
 	planTop.instrumentation.costEstimate = mem.RootExpr().(memo.RelExpr).Cost().C
 	available := mem.RootExpr().(memo.RelExpr).Relational().Statistics().Available
@@ -949,7 +971,9 @@ func (opc *optPlanningCtx) runExecBuilder(
 		// DDLs (e.g. CREATE TABLE) are built non-opaquely, so we need to set the
 		// mode here if it wasn't already set.
 		if planTop.instrumentation.schemaChangerMode == schemaChangerModeNone {
-			telemetry.Inc(sqltelemetry.LegacySchemaChangerCounter)
+			if !disableTelemetryAndPlanGists {
+				telemetry.Inc(sqltelemetry.LegacySchemaChangerCounter)
+			}
 			planTop.instrumentation.schemaChangerMode = schemaChangerModeLegacy
 		}
 	}

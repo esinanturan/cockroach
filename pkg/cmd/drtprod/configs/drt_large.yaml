@@ -85,6 +85,13 @@ targets:
           - --
           - -e
           - "ALTER RANGE default CONFIGURE ZONE USING num_replicas=5,num_voters=5"
+      - command: sql
+        args:
+          - $CLUSTER:1
+          - --
+          - -e
+          - "SET CLUSTER SETTING kv.snapshot_rebalance.max_rate='256 MB'"
+      - script: "pkg/cmd/drtprod/scripts/create_decommission_node.sh"
   - target_name: $WORKLOAD_CLUSTER
     steps:
       - command: create

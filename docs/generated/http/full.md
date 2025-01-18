@@ -3751,9 +3751,6 @@ HotRange message describes a single hot range, ie its QPS, node ID it belongs to
 | range_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | range_id indicates Range ID that's identified as hot range. | [reserved](#support-status) |
 | node_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | node_id indicates the node that contains the current hot range. | [reserved](#support-status) |
 | qps | [double](#cockroach.server.serverpb.HotRangesResponseV2-double) |  | qps (queries per second) shows the amount of queries that interact with current range. | [reserved](#support-status) |
-| table_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | table_name has been deprecated in favor of tables = 16; | [reserved](#support-status) |
-| database_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | database_name has been deprecated in favor of databases = 17; | [reserved](#support-status) |
-| index_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | index_name has been deprecated in favor of indexes = 17; | [reserved](#support-status) |
 | replica_node_ids | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) | repeated | replica_node_ids specifies the list of node ids that contain replicas with current hot range. | [reserved](#support-status) |
 | leaseholder_node_id | [int32](#cockroach.server.serverpb.HotRangesResponseV2-int32) |  | leaseholder_node_id indicates the Node ID that is the current leaseholder for the given range. | [reserved](#support-status) |
 | schema_name | [string](#cockroach.server.serverpb.HotRangesResponseV2-string) |  | schema_name provides the name of schema (if exists) for table in current range. | [reserved](#support-status) |
@@ -6405,7 +6402,6 @@ SettingsRequest inquires what are the current settings in the cluster.
 | Field | Type | Label | Description | Support status |
 | ----- | ---- | ----- | ----------- | -------------- |
 | keys | [string](#cockroach.server.serverpb.SettingsRequest-string) | repeated | The array of setting keys or names to retrieve. An empty keys array means "all". | [reserved](#support-status) |
-| unredacted_values | [bool](#cockroach.server.serverpb.SettingsRequest-bool) |  | Indicate whether to see unredacted setting values. This is opt-in so that a previous version `cockroach zip` does not start reporting values when this becomes active. For good security, the server only obeys this after it checks that the logger-in user has admin privilege. | [reserved](#support-status) |
 
 
 
@@ -6648,6 +6644,7 @@ JobResponse contains the job record for a job.
 | num_runs | [int64](#cockroach.server.serverpb.JobsResponse-int64) |  |  | [reserved](#support-status) |
 | execution_failures | [JobResponse.ExecutionFailure](#cockroach.server.serverpb.JobsResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure) | repeated | ExecutionFailures is a log of execution failures of the job. It is not guaranteed to contain all execution failures and some execution failures may not contain an error or end. | [reserved](#support-status) |
 | coordinator_id | [int64](#cockroach.server.serverpb.JobsResponse-int64) |  | coordinator_id identifies the node coordinating the job. This value will only be present for jobs that are currently running or recently ran. | [reserved](#support-status) |
+| messages | [JobMessage](#cockroach.server.serverpb.JobsResponse-cockroach.server.serverpb.JobMessage) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -6665,6 +6662,21 @@ attempt starting at start and ending at end.
 | start | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  | Start is the time at which the execution started. | [reserved](#support-status) |
 | end | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  | End is the time at which the error occurred. | [reserved](#support-status) |
 | error | [string](#cockroach.server.serverpb.JobsResponse-string) |  | Error is the error which occurred. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.JobsResponse-cockroach.server.serverpb.JobMessage"></a>
+#### JobMessage
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| kind | [string](#cockroach.server.serverpb.JobsResponse-string) |  |  | [reserved](#support-status) |
+| timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobsResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+| message | [string](#cockroach.server.serverpb.JobsResponse-string) |  |  | [reserved](#support-status) |
 
 
 
@@ -6728,6 +6740,7 @@ JobResponse contains the job record for a job.
 | num_runs | [int64](#cockroach.server.serverpb.JobResponse-int64) |  |  | [reserved](#support-status) |
 | execution_failures | [JobResponse.ExecutionFailure](#cockroach.server.serverpb.JobResponse-cockroach.server.serverpb.JobResponse.ExecutionFailure) | repeated | ExecutionFailures is a log of execution failures of the job. It is not guaranteed to contain all execution failures and some execution failures may not contain an error or end. | [reserved](#support-status) |
 | coordinator_id | [int64](#cockroach.server.serverpb.JobResponse-int64) |  | coordinator_id identifies the node coordinating the job. This value will only be present for jobs that are currently running or recently ran. | [reserved](#support-status) |
+| messages | [JobMessage](#cockroach.server.serverpb.JobResponse-cockroach.server.serverpb.JobMessage) | repeated |  | [reserved](#support-status) |
 
 
 
@@ -6746,6 +6759,21 @@ attempt starting at start and ending at end.
 | start | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  | Start is the time at which the execution started. | [reserved](#support-status) |
 | end | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  | End is the time at which the error occurred. | [reserved](#support-status) |
 | error | [string](#cockroach.server.serverpb.JobResponse-string) |  | Error is the error which occurred. | [reserved](#support-status) |
+
+
+
+
+
+<a name="cockroach.server.serverpb.JobResponse-cockroach.server.serverpb.JobMessage"></a>
+#### JobMessage
+
+
+
+| Field | Type | Label | Description | Support status |
+| ----- | ---- | ----- | ----------- | -------------- |
+| kind | [string](#cockroach.server.serverpb.JobResponse-string) |  |  | [reserved](#support-status) |
+| timestamp | [google.protobuf.Timestamp](#cockroach.server.serverpb.JobResponse-google.protobuf.Timestamp) |  |  | [reserved](#support-status) |
+| message | [string](#cockroach.server.serverpb.JobResponse-string) |  |  | [reserved](#support-status) |
 
 
 

@@ -588,6 +588,38 @@ type RemoveTrigger struct {
 	Trigger scpb.Trigger
 }
 
+// AddPolicy adds a policy to a table.
+type AddPolicy struct {
+	immediateMutationOp
+	Policy scpb.Policy
+}
+
+// RemovePolicy removes a policy from a table.
+type RemovePolicy struct {
+	immediateMutationOp
+	Policy scpb.Policy
+}
+
+// SetPolicyName sets the name of a policy.
+type SetPolicyName struct {
+	immediateMutationOp
+	TableID  descpb.ID
+	PolicyID descpb.PolicyID
+	Name     string
+}
+
+// AddPolicyRole adds a new role to a policy.
+type AddPolicyRole struct {
+	immediateMutationOp
+	Role scpb.PolicyRole
+}
+
+// RemovePolicyRole removes an existing role from a policy.
+type RemovePolicyRole struct {
+	immediateMutationOp
+	Role scpb.PolicyRole
+}
+
 // UpdateTableBackReferencesInTypes updates back references to a table
 // in the specified types.
 type UpdateTableBackReferencesInTypes struct {

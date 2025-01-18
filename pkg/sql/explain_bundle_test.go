@@ -288,9 +288,9 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		contentCheck := func(name, contents string) error {
 			if name == "schema.sql" {
 				for _, tableName := range tableNames {
-					if regexp.MustCompile("CREATE TABLE defaultdb.public."+tableName).FindString(contents) == "" {
+					if regexp.MustCompile("USE defaultdb;\nCREATE TABLE public."+tableName).FindString(contents) == "" {
 						return errors.Newf(
-							"could not find 'CREATE TABLE defaultdb.public.%s' in schema.sql:\n%s", tableName, contents)
+							"could not find 'USE defaultdb;\nCREATE TABLE public.%s' in schema.sql:\n%s", tableName, contents)
 					}
 				}
 			}
@@ -442,15 +442,15 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		checkBundle(
 			t, fmt.Sprint(rows), "s.foo", func(name, contents string) error {
 				if name == "schema.sql" {
-					reg := regexp.MustCompile("s.foo")
+					reg := regexp.MustCompile(`s\.foo`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for 's.foo' function in schema.sql")
 					}
-					reg = regexp.MustCompile("^foo")
+					reg = regexp.MustCompile(`^CREATE FUNCTION public\.foo`)
 					if reg.FindString(contents) != "" {
 						return errors.Errorf("found irrelevant function 'foo' in schema.sql")
 					}
-					reg = regexp.MustCompile("s.a")
+					reg = regexp.MustCompile(`s\.a`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for relation 's.a' in schema.sql")
 					}
@@ -473,15 +473,15 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		checkBundle(
 			t, fmt.Sprint(rows), "s.bar", func(name, contents string) error {
 				if name == "schema.sql" {
-					reg := regexp.MustCompile("s.bar")
+					reg := regexp.MustCompile(`s\.bar`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for 's.bar' procedure in schema.sql")
 					}
-					reg = regexp.MustCompile("^bar")
+					reg = regexp.MustCompile(`^CREATE PROCEDURE public\.bar`)
 					if reg.FindString(contents) != "" {
 						return errors.Errorf("Found irrelevant procedure 'bar' in schema.sql")
 					}
-					reg = regexp.MustCompile("s.a")
+					reg = regexp.MustCompile(`s\.a`)
 					if reg.FindString(contents) == "" {
 						return errors.Errorf("could not find definition for relation 's.a' in schema.sql")
 					}
@@ -563,17 +563,36 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 		r.Exec(t, "CREATE TABLE db2.s2.t2 (pk INT PRIMARY KEY);")
 		rows := r.QueryStr(t, "EXPLAIN ANALYZE (DEBUG) SELECT * FROM db1.t1, db2.s2.t2;")
 		checkBundle(
-			t, fmt.Sprint(rows), "db1.public.t1", nil, false, /* expectErrors */
+			t, fmt.Sprint(rows), "public.t1", nil, false, /* expectErrors */
 			base, plans, "distsql.html vec.txt vec-v.txt stats-db1.public.t1.sql stats-db2.s2.t2.sql",
 		)
 		checkBundle(
-			t, fmt.Sprint(rows), "db2.s2.t2", nil, false, /* expectErrors */
+			t, fmt.Sprint(rows), "s2.t2", nil, false, /* expectErrors */
 			base, plans, "distsql.html vec.txt vec-v.txt stats-db1.public.t1.sql stats-db2.s2.t2.sql",
+		)
+	})
+
+	t.Run("multiple databases and special characters", func(t *testing.T) {
+		r.Exec(t, `CREATE DATABASE "db.name";`)
+		r.Exec(t, `CREATE DATABASE "db'name";`)
+		r.Exec(t, `CREATE SCHEMA "db.name"."sc.name"`)
+		r.Exec(t, `CREATE SCHEMA "db'name"."sc'name"`)
+		r.Exec(t, `CREATE TABLE "db.name"."sc.name".t (pk INT PRIMARY KEY);`)
+		r.Exec(t, `CREATE TABLE "db'name"."sc'name".t (pk INT PRIMARY KEY);`)
+		rows := r.QueryStr(t, `EXPLAIN ANALYZE (DEBUG) SELECT * FROM "db.name"."sc.name".t, "db'name"."sc'name".t;`)
+		checkBundle(
+			t, fmt.Sprint(rows), `"sc.name".t`, nil, false, /* expectErrors */
+			base, plans, `distsql.html vec.txt vec-v.txt stats-"db.name"."sc.name".t.sql stats-"db'name"."sc'name".t.sql`,
+		)
+		checkBundle(
+			t, fmt.Sprint(rows), `"sc'name".t`, nil, false, /* expectErrors */
+			base, plans, `distsql.html vec.txt vec-v.txt stats-"db.name"."sc.name".t.sql stats-"db'name"."sc'name".t.sql`,
 		)
 	})
 
 	t.Run("plan-gist matching", func(t *testing.T) {
 		r.Exec(t, "CREATE TABLE gist (k INT PRIMARY KEY);")
+		r.Exec(t, "INSERT INTO gist SELECT generate_series(1, 10)")
 		const fprint = `SELECT * FROM gist`
 
 		// Come up with a target gist.
@@ -587,20 +606,20 @@ CREATE TABLE users(id UUID DEFAULT gen_random_uuid() PRIMARY KEY, promo_id INT R
 				if name != "plan.txt" {
 					return nil
 				}
-				// Add a new line at the beginning for cleaner formatting in the
-				// test.
-				contents = "\n" + contents
-				// The gist appears to be somewhat non-deterministic (but its
-				// decoding stays the same), so we populate the expected
-				// contents based on the particular gist.
-				expected := fmt.Sprintf(`
--- plan is incomplete due to gist matching: %s
-
-• scan
-  table: gist@gist_pkey
-  spans: FULL SCAN`, gist)
-				if contents != expected {
-					return errors.Newf("unexpected contents of plan.txn\nexpected:\n%s\ngot:\n%s", expected, contents)
+				// We don't hard-code the full expected output here so that it
+				// doesn't need an update every time we change EXPLAIN ANALYZE
+				// output format. Instead, we only assert that a few lines are
+				// present in the output.
+				for _, expectedLine := range []string{
+					"• scan",
+					"  sql nodes: n1",
+					"  actual row count: 10",
+					"  table: gist@gist_pkey",
+					"  spans: FULL SCAN",
+				} {
+					if !strings.Contains(contents, expectedLine) {
+						return errors.Newf("didn't find %q in the output: %v", expectedLine, contents)
+					}
 				}
 				return nil
 			}, false, /* expectErrors */
@@ -673,8 +692,8 @@ func readUnzippedFile(t *testing.T, f *zip.File) string {
 // arbitrary number of strings; each string contains one or more filenames
 // separated by a space.
 // - tableName: if non-empty, checkBundle asserts that the substring equal to
-// tableName is present in schema.sql. It doesn't have to be a fully qualified
-// name, but that is encouraged.
+// tableName is present in schema.sql. It is expected to be either
+// schema-qualified or just the table name.
 // - expectErrors: if set, indicates that non-critical errors might have
 // occurred during the bundle collection and shouldn't fail the test.
 func checkBundle(
@@ -929,7 +948,7 @@ func TestExplainBundleEnv(t *testing.T) {
 		_, err := sqlDB.ExecContext(ctx, line)
 		if err != nil {
 			words := strings.Split(line, " ")
-			t.Fatalf("%v: probably need to add %q into 'sessionVarNeedsQuotes' map", err, words[1])
+			t.Fatalf("%s\n%v: probably need to add %q into 'sessionVarNeedsEscaping' map", line, err, words[1])
 		}
 	}
 

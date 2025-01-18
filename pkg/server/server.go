@@ -957,12 +957,15 @@ func NewServer(cfg Config, stopper *stop.Stopper) (serverctl.ServerStartupInterf
 		cfg.LicenseEnforcer,
 	)
 	kvpb.RegisterInternalServer(grpcServer.Server, node)
+	if err := kvpb.DRPCRegisterBatch(grpcServer.drpc.Mux, node.AsDRPCBatchServer()); err != nil {
+		return nil, err
+	}
 	kvserver.RegisterPerReplicaServer(grpcServer.Server, node.perReplicaServer)
 	kvserver.RegisterPerStoreServer(grpcServer.Server, node.perReplicaServer)
 	ctpb.RegisterSideTransportServer(grpcServer.Server, ctReceiver)
 
 	// Create blob service for inter-node file sharing.
-	blobService, err := blobs.NewBlobService(cfg.Settings.ExternalIODir)
+	blobService, err := blobs.NewBlobService(cfg.ExternalIODir)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating blob service")
 	}
@@ -1954,6 +1957,10 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		return errors.Wrapf(err, "failed to register engines for the disk stats map")
 	}
 
+	// Set up a store metrics registry provider to register AC store-level
+	// metrics.
+	mrp := s.node.makeStoreRegistryProvider()
+
 	// Stores have been initialized, so Node can now provide Pebble metrics.
 	//
 	// Note that all existing stores will be operational before Pebble-level
@@ -1962,7 +1969,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 	// existing stores shouldn’t be able to acquire leases yet. Although, below
 	// Raft commands like log application and snapshot application may be able
 	// to bypass admission control.
-	s.storeGrantCoords.SetPebbleMetricsProvider(ctx, pmp, s.node)
+	s.storeGrantCoords.SetPebbleMetricsProvider(ctx, pmp, mrp, s.node)
 
 	// Once all stores are initialized, check if offline storage recovery
 	// was done prior to start and record any actions appropriately.
@@ -2073,6 +2080,7 @@ func (s *topLevelServer) PreStart(ctx context.Context) error {
 		s.sqlServer.execCfg.InternalDB.CloneWithMemoryMonitor(sql.MemoryMetrics{}, ieMon),
 		nil, /* TenantExternalIORecorder */
 		s.appRegistry,
+		s.cfg.ExternalIODir,
 	)
 
 	if err := s.runIdempontentSQLForInitType(ctx, state.initType); err != nil {

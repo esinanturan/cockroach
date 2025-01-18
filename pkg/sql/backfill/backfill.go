@@ -359,7 +359,7 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 	}
 
 	for i := int64(0); i < int64(chunkSize); i++ {
-		ok, err := cb.fetcher.NextRowDecodedInto(ctx, fetchedValues, cb.colIdxMap)
+		ok, _, err := cb.fetcher.NextRowDecodedInto(ctx, fetchedValues, cb.colIdxMap)
 		if err != nil {
 			return roachpb.Key{}, err
 		}
@@ -918,7 +918,7 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 		return nil
 	}
 	for i := int64(0); i < chunkSize; i++ {
-		ok, err := fetcher.NextRowDecodedInto(ctx, ib.rowVals, ib.colIdxMap)
+		ok, _, err := fetcher.NextRowDecodedInto(ctx, ib.rowVals, ib.colIdxMap)
 		if err != nil {
 			return nil, nil, memUsedPerChunk, err
 		}
@@ -1046,9 +1046,13 @@ func (ib *IndexBackfiller) RunIndexBackfillChunk(
 
 	for _, entry := range entries {
 		if traceKV {
-			log.VEventf(ctx, 2, "InitPut %s -> %s", entry.Key, entry.Value.PrettyPrint())
+			log.VEventf(ctx, 2, "CPut %s -> %s", entry.Key, entry.Value.PrettyPrint())
 		}
-		batch.InitPut(entry.Key, &entry.Value, false /* failOnTombstones */)
+		// Note that we generally don't expect the previous value to exist, so
+		// CPut with nil expValue would be sufficient. This is not the case when
+		// performing the primary key change where the previous value might
+		// exist.
+		batch.CPutAllowingIfNotExists(entry.Key, &entry.Value, entry.Value.TagAndDataBytes())
 	}
 	writeBatch := txn.Run
 	if alsoCommit {

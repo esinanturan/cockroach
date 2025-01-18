@@ -1129,6 +1129,15 @@ type Engine interface {
 	// needs to be thread-safe as it could be called repeatedly in multiple threads
 	// over a short period of time.
 	RegisterDiskSlowCallback(cb func(info pebble.DiskSlowInfo))
+
+	// RegisterLowDiskSpaceCallback registers a callback that will be run when a
+	// disk is running out of space. This callback needs to be thread-safe as it
+	// could be called repeatedly in multiple threads over a short period of time.
+	RegisterLowDiskSpaceCallback(cb func(info pebble.LowDiskSpaceInfo))
+
+	// GetPebbleOptions returns the options used when creating the engine. The
+	// caller must not modify these.
+	GetPebbleOptions() *pebble.Options
 }
 
 // Batch is the interface for batch specific operations.

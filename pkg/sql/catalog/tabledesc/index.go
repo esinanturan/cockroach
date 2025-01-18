@@ -391,7 +391,7 @@ func (w index) UseDeletePreservingEncoding() bool {
 	return w.desc.UseDeletePreservingEncoding && !w.maybeMutation.DeleteOnly()
 }
 
-// ForcePut forces all writes to use Put rather than CPut or InitPut.
+// ForcePut forces all writes to use Put rather than CPut.
 //
 // Users of this options should take great care as it
 // effectively mean unique constraints are not respected.
@@ -508,6 +508,11 @@ func (w index) GetConstraintValidity() descpb.ConstraintValidity {
 // IsEnforced implements the catalog.Constraint interface.
 func (w index) IsEnforced() bool {
 	return !w.IsMutation() || w.WriteAndDeleteOnly()
+}
+
+// NewTestIndex wraps an index descriptor in an index struct for use in unit tests.
+func NewTestIndex(desc *descpb.IndexDescriptor, ordinal int) index {
+	return index{desc: desc, ordinal: ordinal}
 }
 
 // partitioning is the backing struct for a catalog.Partitioning interface.

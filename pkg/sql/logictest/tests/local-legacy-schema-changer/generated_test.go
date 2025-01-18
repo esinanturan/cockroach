@@ -626,6 +626,13 @@ func TestLogic_distsql_srfs(
 	runLogicTest(t, "distsql_srfs")
 }
 
+func TestLogic_do(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "do")
+}
+
 func TestLogic_drop_database(
 	t *testing.T,
 ) {
@@ -2500,13 +2507,6 @@ func TestLogic_vectorize_unsupported(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "vectorize_unsupported")
-}
-
-func TestLogic_vectoross(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "vectoross")
 }
 
 func TestLogic_views(

@@ -127,8 +127,9 @@ func (mo *MaxOffsetType) String() string {
 // BaseConfig holds parameters that are needed to setup either a KV or a SQL
 // server.
 type BaseConfig struct {
-	Settings *cluster.Settings
 	*base.Config
+
+	Settings *cluster.Settings
 
 	Tracer *tracing.Tracer
 
@@ -278,6 +279,11 @@ type BaseConfig struct {
 
 	// CidrLookup is used to look up the tag name for a given IP address.
 	CidrLookup *cidr.Lookup
+
+	// ExternalIODir is the local file path under which remotely-initiated
+	// operations that can specify node-local I/O paths (such as BACKUP, RESTORE
+	// or IMPORT) can access files.
+	ExternalIODir string
 }
 
 // MakeBaseConfig returns a BaseConfig with default values.
@@ -853,9 +859,6 @@ func (cfg *Config) CreateEngines(ctx context.Context) (Engines, error) {
 						return nil, nil
 					},
 				}))
-			}
-			if len(spec.RocksDBOptions) > 0 {
-				return nil, errors.Errorf("store %d: using Pebble storage engine but StoreSpec provides RocksDB options", i)
 			}
 		}
 		eng, err := storage.Open(ctx, storeEnvs[i], cfg.Settings, storageConfigOpts...)

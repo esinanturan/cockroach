@@ -443,6 +443,7 @@ func (e *stageExecStmt) Exec(
 		if len(stmt) == 0 {
 			continue
 		}
+		t.Logf("Starting execution of statment: %+v", stmt)
 		// Bind any variables for the statement.
 		boundSQL := os.Expand(stmt, func(s string) string {
 			switch s {
@@ -870,6 +871,9 @@ func executeSchemaChangeTxn(
 			)
 			_, err = conn.ExecContext(
 				ctx, "SET experimental_enable_temp_tables=true",
+			)
+			_, err = conn.ExecContext(
+				ctx, "SET enable_row_level_security=true",
 			)
 			if err != nil {
 				return err

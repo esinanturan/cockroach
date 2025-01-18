@@ -1302,21 +1302,40 @@ func TestChangefeedRandomExpressions(t *testing.T) {
 			err = assertPayloadsBaseErr(context.Background(), seedFeed, assertedPayloads, false, false)
 			closeFeedIgnoreError(t, seedFeed)
 			if err != nil {
-				code := pgerror.GetPGCode(err)
 				// Skip errors that may come up during SQL execution. If the SQL query
 				// didn't fail with these errors, it's likely because the query was built in
 				// a way that did not have to execute on the row that caused the error, but
 				// the CDC query did.
-				switch code {
-				case pgcode.ConfigFile,
-					pgcode.DatetimeFieldOverflow,
-					pgcode.InvalidEscapeCharacter,
-					pgcode.InvalidEscapeSequence,
-					pgcode.InvalidParameterValue,
-					pgcode.InvalidRegularExpression:
-					t.Logf("Skipping statement %s because it encountered pgerror %s: %s", createStmt, code, err)
+				// Since we get the error that caused the changefeed job to
+				// fail from scraping the job status and creating a new
+				// error, we unfortunately don't have the pgcode and have to
+				// rely on known strings.
+				validPgErrs := []string{
+					"cannot subtract infinite dates",
+					"regexp compilation failed",
+					"invalid regular expression",
+					"error parsing GeoJSON",
+					"error parsing EWKT",
+					"geometry type is unsupported",
+					"should be of length",
+					"dwithin distance cannot be less than zero",
+					"parameter has to be of type Point",
+					"expected LineString",
+					"no locations to init GEOS",
+				}
+				containsKnownPgErr := func(e error) (interface{}, bool) {
+					for _, v := range validPgErrs {
+						if strings.Contains(e.Error(), v) {
+							return nil, true
+						}
+					}
+					return nil, false
+				}
+				if _, contains := errors.If(err, containsKnownPgErr); contains {
+					t.Logf("Skipping statement %s because it encountered pgerror %s", createStmt, err)
 					continue
 				}
+
 				t.Fatal(err)
 			}
 			numNonTrivialTestRuns++
@@ -2317,11 +2336,11 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 
 	// Checkpoint progress frequently, allow a large enough checkpoint, and
 	// reduce the lag threshold to allow lag checkpointing to trigger
-	changefeedbase.FrontierCheckpointFrequency.Override(
+	changefeedbase.SpanCheckpointInterval.Override(
 		context.Background(), &s.ClusterSettings().SV, 10*time.Millisecond)
-	changefeedbase.FrontierCheckpointMaxBytes.Override(
+	changefeedbase.SpanCheckpointMaxBytes.Override(
 		context.Background(), &s.ClusterSettings().SV, 100<<20)
-	changefeedbase.FrontierHighwaterLagCheckpointThreshold.Override(
+	changefeedbase.SpanCheckpointLagThreshold.Override(
 		context.Background(), &s.ClusterSettings().SV, 10*time.Millisecond)
 
 	// We'll start changefeed with the cursor.
@@ -2503,9 +2522,9 @@ func TestChangefeedSchemaChangeBackfillCheckpoint(t *testing.T) {
 		require.NoError(t, jobFeed.Pause())
 
 		// Checkpoint progress frequently, and set the checkpoint size limit.
-		changefeedbase.FrontierCheckpointFrequency.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 1)
-		changefeedbase.FrontierCheckpointMaxBytes.Override(
+		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
 
 		var tableSpan roachpb.Span
@@ -3918,6 +3937,71 @@ func TestChangefeedAvroNotice(t *testing.T) {
 
 	sql := fmt.Sprintf("CREATE CHANGEFEED FOR d.foo INTO 'null://' WITH format=experimental_avro, confluent_schema_registry='%s'", schemaReg.URL())
 	expectNotice(t, s.Server, sql, `avro is no longer experimental, use format=avro`)
+}
+
+func TestChangefeedResolvedNotice(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cluster, _, cleanup := startTestCluster(t)
+	defer cleanup()
+	s := cluster.Server(1)
+
+	pgURL, cleanup := sqlutils.PGUrl(t, s.SQLAddr(), t.Name(), url.User(username.RootUser))
+	defer cleanup()
+	pgBase, err := pq.NewConnector(pgURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var actual string
+	connector := pq.ConnectorWithNoticeHandler(pgBase, func(n *pq.Error) {
+		actual = n.Message
+	})
+
+	dbWithHandler := gosql.OpenDB(connector)
+	defer dbWithHandler.Close()
+
+	sqlDB := sqlutils.MakeSQLRunner(dbWithHandler)
+
+	sqlDB.Exec(t, `CREATE TABLE ☃ (i INT PRIMARY KEY)`)
+	sqlDB.Exec(t, `INSERT INTO ☃ VALUES (0)`)
+
+	t.Run("resolved<min_checkpoint_frequency", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='5s', min_checkpoint_frequency='10s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `resolved (5s) messages will not be emitted more frequently than the configured min_checkpoint_frequency (10s), but may be emitted less frequently`, actual)
+	})
+	t.Run("resolved<min_checkpoint_frequency default", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='20ms'`)
+		defer closeFeed(t, testFeed)
+		// Note: default min_checkpoint_frequency is set to 100ms in startTestCluster.
+		require.Equal(t, `resolved (20ms) messages will not be emitted more frequently than the configured min_checkpoint_frequency (100ms), but may be emitted less frequently`, actual)
+	})
+	t.Run("resolved=min_checkpoint_frequency", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='5s', min_checkpoint_frequency='5s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	})
+	t.Run("resolved>min_checkpoint_frequency", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved='10s', min_checkpoint_frequency='5s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `changefeed will emit to topic _u2603_`, actual)
+	})
+	t.Run("resolved default", func(t *testing.T) {
+		actual = "(no notice)"
+		f := makeKafkaFeedFactory(t, s, dbWithHandler)
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR ☃ INTO 'kafka://does.not.matter/' WITH resolved, min_checkpoint_frequency='10s'`)
+		defer closeFeed(t, testFeed)
+		require.Equal(t, `resolved (0s) messages will not be emitted more frequently than the configured min_checkpoint_frequency (10s), but may be emitted less frequently`, actual)
+	})
 }
 
 func TestChangefeedOutputTopics(t *testing.T) {
@@ -5509,7 +5593,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 	sqlDB.ExpectErrWithTimeout(
 		t, `param sasl_handshake must be a bool`,
-		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_handshake=maybe`,
+		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_user=x&sasl_password=y&sasl_handshake=maybe`,
 	)
 	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_enabled must be enabled to configure SASL handshake behavior`,
@@ -5541,14 +5625,14 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_client_id is only a valid parameter for sasl_mechanism=OAUTHBEARER`,
-		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_client_id=a`,
+		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_client_id=a`,
 	)
 	sqlDB.ExpectErrWithTimeout(
 		t, `sasl_enabled must be enabled to configure SASL mechanism`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_mechanism=SCRAM-SHA-256`,
 	)
 	sqlDB.ExpectErrWithTimeout(
-		t, `param sasl_mechanism must be one of SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER, PLAIN or AWS_MSK_IAM`,
+		t, `param sasl_mechanism must be one of AWS_MSK_IAM, OAUTHBEARER, PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512`,
 		`CREATE CHANGEFEED FOR foo INTO $1`, `kafka://nope/?sasl_enabled=true&sasl_mechanism=unsuppported`,
 	)
 	sqlDB.ExpectErrWithTimeout(
@@ -7257,9 +7341,9 @@ func TestChangefeedBackfillCheckpoint(t *testing.T) {
 		}
 
 		// Checkpoint progress frequently, and set the checkpoint size limit.
-		changefeedbase.FrontierCheckpointFrequency.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 1)
-		changefeedbase.FrontierCheckpointMaxBytes.Override(
+		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, maxCheckpointSize)
 
 		registry := s.Server.JobRegistry().(*jobs.Registry)
@@ -7408,9 +7492,9 @@ func TestCoreChangefeedBackfillScanCheckpoint(t *testing.T) {
 			b.Header.MaxSpanRequestKeys = 1 + rnd.Int63n(25)
 			return nil
 		}
-		changefeedbase.FrontierCheckpointFrequency.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 1)
-		changefeedbase.FrontierCheckpointMaxBytes.Override(
+		changefeedbase.SpanCheckpointMaxBytes.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 100<<20)
 
 		emittedCount := 0
@@ -7472,7 +7556,7 @@ func TestCheckpointFrequency(t *testing.T) {
 	// If we also specify minimum amount of time between updates, we would skip updates
 	// until enough time has elapsed.
 	minAdvance := 10 * time.Minute
-	changefeedbase.MinHighWaterMarkCheckpointAdvance.Override(ctx, &js.settings.SV, minAdvance)
+	changefeedbase.ResolvedTimestampMinUpdateInterval.Override(ctx, &js.settings.SV, minAdvance)
 
 	require.False(t, js.canCheckpointHighWatermark(frontierAdvanced))
 	ts.Advance(minAdvance)
@@ -9852,7 +9936,7 @@ func TestChangefeedProtectedTimestampUpdate(t *testing.T) {
 		// Checkpoint and trigger potential protected timestamp updates frequently.
 		// Make the protected timestamp lag long enough that it shouldn't be
 		// immediately updated after a restart.
-		changefeedbase.FrontierCheckpointFrequency.Override(
+		changefeedbase.SpanCheckpointInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)
 		changefeedbase.ProtectTimestampInterval.Override(
 			context.Background(), &s.Server.ClusterSettings().SV, 10*time.Millisecond)

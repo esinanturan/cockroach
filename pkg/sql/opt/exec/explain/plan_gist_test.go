@@ -23,7 +23,8 @@ import (
 )
 
 func makeGist(ot *opttester.OptTester, t *testing.T) explain.PlanGist {
-	f := explain.NewPlanGistFactory(exec.StubFactory{})
+	var f explain.PlanGistFactory
+	f.Init(exec.StubFactory{})
 	expr, err := ot.Optimize()
 	if err != nil {
 		t.Error(err)
@@ -32,7 +33,7 @@ func makeGist(ot *opttester.OptTester, t *testing.T) explain.PlanGist {
 	if rel, ok := expr.(memo.RelExpr); ok {
 		mem = rel.Memo()
 	}
-	_, err = ot.ExecBuild(f, mem, expr)
+	_, err = ot.ExecBuild(&f, mem, expr)
 	if err != nil {
 		t.Error(err)
 	}
@@ -46,7 +47,7 @@ func explainGist(gist string, catalog cat.Catalog) string {
 	if err != nil {
 		panic(err)
 	}
-	err = explain.Emit(context.Background(), &eval.Context{}, explainPlan, ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
+	err = explain.Emit(context.Background(), &eval.Context{}, explainPlan, ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" }, false /* createPostQueryPlanIfMissing */)
 	if err != nil {
 		panic(err)
 	}
@@ -75,7 +76,7 @@ func plan(ot *opttester.OptTester, t *testing.T) string {
 	}
 	flags := explain.Flags{HideValues: true, Deflake: explain.DeflakeAll, OnlyShape: true}
 	ob := explain.NewOutputBuilder(flags)
-	err = explain.Emit(context.Background(), &eval.Context{}, explainPlan.(*explain.Plan), ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" })
+	err = explain.Emit(context.Background(), &eval.Context{}, explainPlan.(*explain.Plan), ob, func(table cat.Table, index cat.Index, scanParams exec.ScanParams) string { return "" }, false /* createPostQueryPlanIfMissing */)
 	if err != nil {
 		t.Error(err)
 	}

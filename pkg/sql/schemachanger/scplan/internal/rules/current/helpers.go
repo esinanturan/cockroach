@@ -16,10 +16,11 @@ import (
 
 const (
 	// rulesVersion version of elements that can be appended to rel rule names.
-	rulesVersion = "-25.1"
+	rulesVersion = "-25.2"
 )
 
 // rulesVersionKey version of elements used by this rule set.
+// TODO(spilchen): Need to update this to V25_2 when it is available.
 var rulesVersionKey = clusterversion.V25_1
 
 // descriptorIsNotBeingDropped creates a clause which leads to the outer clause
@@ -311,6 +312,14 @@ func isTriggerDependent(e scpb.Element) bool {
 	case *scpb.TriggerName, *scpb.TriggerEnabled, *scpb.TriggerTiming,
 		*scpb.TriggerEvents, *scpb.TriggerTransition, *scpb.TriggerWhen,
 		*scpb.TriggerFunctionCall, *scpb.TriggerDeps:
+		return true
+	}
+	return false
+}
+
+func isPolicyDependent(e scpb.Element) bool {
+	switch e.(type) {
+	case *scpb.PolicyName, *scpb.PolicyRole:
 		return true
 	}
 	return false

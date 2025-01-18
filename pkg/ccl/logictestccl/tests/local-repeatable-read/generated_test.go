@@ -671,6 +671,13 @@ func TestRepeatableReadLogic_distsql_srfs(
 	runLogicTest(t, "distsql_srfs")
 }
 
+func TestRepeatableReadLogic_do(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "do")
+}
+
 func TestRepeatableReadLogic_drop_database(
 	t *testing.T,
 ) {
@@ -1607,6 +1614,13 @@ func TestRepeatableReadLogic_routine_schema_change(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "routine_schema_change")
+}
+
+func TestRepeatableReadLogic_row_level_security(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "row_level_security")
 }
 
 func TestRepeatableReadLogic_row_level_ttl(

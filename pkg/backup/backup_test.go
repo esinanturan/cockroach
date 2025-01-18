@@ -3963,6 +3963,9 @@ func TestBackupRestoreChecksum(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
+	// Test Server too slow under deadlock.
+	skip.UnderDeadlock(t)
+
 	const numAccounts = 1000
 	_, sqlDB, dir, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
@@ -4720,7 +4723,7 @@ func TestRestoreDatabaseVersusTable(t *testing.T) {
 	tc, origDB, _, cleanupFn := backupRestoreTestSetup(t, singleNode, numAccounts, InitManualReplication)
 	defer cleanupFn()
 	s := tc.ApplicationLayer(0)
-	args := base.TestServerArgs{ExternalIODir: s.ClusterSettings().ExternalIODir}
+	args := base.TestServerArgs{ExternalIODir: s.ExternalIODir()}
 
 	for _, q := range []string{
 		`CREATE DATABASE d2`,

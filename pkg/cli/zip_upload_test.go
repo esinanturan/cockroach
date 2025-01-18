@@ -23,7 +23,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
@@ -135,10 +134,9 @@ func TestUploadZipEndToEnd(t *testing.T) {
 	// those two in this list to avoid unnecessary errors
 	origTableDumps := clusterWideTableDumps
 	clusterWideTableDumps = map[string]columnParserMap{
-		"system.namespace.txt": {},
-		"crdb_internal.system_jobs.txt": {
-			"progress": makeProtoColumnParser[*jobspb.Progress](),
-		},
+		"system.namespace.txt":            {},
+		"crdb_internal.system_jobs.txt":   origTableDumps["crdb_internal.system_jobs.txt"],
+		"crdb_internal.cluster_locks.txt": origTableDumps["crdb_internal.cluster_locks.txt"],
 	}
 	defer func() {
 		clusterWideTableDumps = origTableDumps

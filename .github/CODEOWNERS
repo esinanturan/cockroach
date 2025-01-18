@@ -75,9 +75,11 @@
 /pkg/sql/delegate/*job*.go   @cockroachdb/jobs-prs @cockroachdb/disaster-recovery
 
 /pkg/sql/importer/           @cockroachdb/sql-queries-prs
+/pkg/sql/importer/export*    @cockroachdb/cdc-prs
 /pkg/ccl/importerccl/        @cockroachdb/sql-queries-prs
 
 /pkg/sql/appstatspb           @cockroachdb/obs-prs
+/pkg/sql/contention/          @cockroachdb/obs-prs
 /pkg/sql/execstats/           @cockroachdb/obs-prs
 /pkg/sql/scheduledlogging/    @cockroachdb/obs-prs
 /pkg/sql/sqlstats/            @cockroachdb/obs-prs
@@ -220,6 +222,7 @@
 /pkg/server/server_controller_*.go       @cockroachdb/server-prs
 /pkg/server/server_controller_http.go    @cockroachdb/obs-prs @cockroachdb/server-prs
 /pkg/server/server_controller_sql.go     @cockroachdb/sql-foundations @cockroachdb/server-prs
+/pkg/server/server_drpc_test.go          @cockroachdb/server-prs
 /pkg/server/server_http*.go              @cockroachdb/obs-prs @cockroachdb/server-prs
 /pkg/server/server_import_ts*.go         @cockroachdb/obs-prs @cockroachdb/kv-prs
 /pkg/server/server_obs*                  @cockroachdb/obs-prs
@@ -424,7 +427,7 @@
 #!/pkg/ccl/utilccl/          @cockroachdb/unowned
 /pkg/ccl/workloadccl/        @cockroachdb/test-eng
 /pkg/ccl/benchccl/rttanalysisccl/     @cockroachdb/sql-foundations
-#!/pkg/clusterversion/       @cockroachdb/dev-inf-noreview  @cockroachdb/kv-prs-noreview @cockroachdb/test-eng-prs
+#!/pkg/clusterversion/       @cockroachdb/kv-prs-noreview @cockroachdb/dev-inf-noreview @cockroachdb/test-eng-noreview
 /pkg/clusterversion/cockroach_versions.go @cockroachdb/release-eng-prs @cockroachdb/upgrade-prs
 /pkg/cmd/allocsim/           @cockroachdb/kv-prs
 /pkg/cmd/bazci/              @cockroachdb/dev-inf
