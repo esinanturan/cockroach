@@ -334,8 +334,9 @@ func (tc *Collection) WriteDescToBatch(
 	}
 	desc.MaybeIncrementVersion()
 	// Replicated PCR descriptors cannot be modified unless the collection
-	// is setup for updating them.
-	if !tc.readerCatalogSetup && desc.GetReplicatedPCRVersion() != 0 {
+	// is setup for updating them. If write validation is disabled then, allow
+	// PCR reader catalog descriptors to be modified, otherwise repair is impossible.
+	if !tc.readerCatalogSetup && desc.GetReplicatedPCRVersion() != 0 && !tc.skipValidationOnWrite {
 		return pgerror.Newf(pgcode.ReadOnlySQLTransaction,
 			"replicated %s %s (%d) cannot be mutated",
 			desc.GetObjectTypeString(),
@@ -492,6 +493,11 @@ func (tc *Collection) WriteCommentToBatch(
 			tree.NewDInt(tree.DInt(key.SubID)),
 			tree.NewDString(oldCmt),
 		}
+	}
+
+	// Validate the values being used when updating the table.
+	if !catalogkeys.IsValidCommentType(key.CommentType) {
+		return errors.AssertionFailedf("invalid comment type %d", key.CommentType)
 	}
 
 	var err error

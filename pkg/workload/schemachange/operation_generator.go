@@ -1306,6 +1306,14 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 		return false
 	}()
 
+	// Randomly create as schema locked table.
+	if og.params.rng.Intn(2) == 0 {
+		stmt.StorageParams = append(stmt.StorageParams, tree.StorageParam{
+			Key:   "schema_locked",
+			Value: tree.DBoolTrue,
+		})
+	}
+
 	tableExists, err := og.tableExists(ctx, tx, tableName)
 	if err != nil {
 		return nil, err
@@ -3821,6 +3829,14 @@ func (og *operationGenerator) randTypeName(
 func (og *operationGenerator) randTable(
 	ctx context.Context, tx pgx.Tx, pctExisting int, desiredSchema string,
 ) (*tree.TableName, error) {
+	// Because the declarative schema change can automatically set / unset
+	// schema_locked on tables, we will allow random table selection include
+	// schema_locked tables. When working with the legacy schema changer, we
+	// will intentionally only select non-schema locked tables.
+	excludeSchemaLocked := "  AND create_statement NOT LIKE '%schema_locked%' "
+	if og.useDeclarativeSchemaChanger {
+		excludeSchemaLocked = ""
+	}
 	if err := og.setSeedInDB(ctx, tx); err != nil {
 		return nil, err
 	}
@@ -3833,13 +3849,15 @@ func (og *operationGenerator) randTable(
 			return &treeTableName, nil
 		}
 		q := fmt.Sprintf(`
-		  SELECT table_name
-		    FROM [SHOW TABLES]
-		   WHERE table_name SIMILAR TO 'table_w[0-9]_+%%'
+		  SELECT descriptor_name 
+		    FROM crdb_internal.create_statements
+		   WHERE descriptor_name SIMILAR TO 'table_w[0-9]_+%%'
 				 AND schema_name = '%s'
+		     AND descriptor_type='table'
+		 	   %s 
 		ORDER BY random()
 		   LIMIT 1;
-		`, desiredSchema)
+		`, desiredSchema, excludeSchemaLocked)
 
 		var tableName string
 		if err := tx.QueryRow(ctx, q).Scan(&tableName); err != nil {
@@ -3870,13 +3888,17 @@ func (og *operationGenerator) randTable(
 		return &treeTableName, nil
 	}
 
-	const q = `
-  SELECT schema_name, table_name
-    FROM [SHOW TABLES]
-   WHERE table_name SIMILAR TO 'table_w[0-9]_+%'
-ORDER BY random()
-   LIMIT 1;
-`
+	q := fmt.Sprintf(`
+SELECT schema_name, descriptor_name 
+		    FROM crdb_internal.create_statements
+		   WHERE descriptor_name SIMILAR TO 'table_w[0-9]_+%%'
+		     AND descriptor_type='table'
+		 	   %s 
+		ORDER BY random()
+		   LIMIT 1;
+`,
+		excludeSchemaLocked)
+
 	var schemaName string
 	var tableName string
 	if err := tx.QueryRow(ctx, q).Scan(&schemaName, &tableName); err != nil {
@@ -5115,6 +5137,10 @@ func findExistingPolicy(
 		policyExists = true
 	}
 
+	if rows.Err() != nil {
+		return nil, false, rows.Err()
+	}
+
 	return &policyWithInfo, policyExists, nil
 }
 
@@ -5236,7 +5262,7 @@ func (og *operationGenerator) alterPolicy(ctx context.Context, tx pgx.Tx) (*opSt
 			usesDummyRole = true
 		}
 
-		sqlStatement.WriteString(fmt.Sprintf(" TO %s", roles))
+		sqlStatement.WriteString(fmt.Sprintf(" TO %s", lexbase.EscapeSQLIdent(roles)))
 	default: // USING and/or WITH CHECK expressions
 		// For case 2 and 3, we generate USING, WITH CHECK, or both
 		includeUsing = alterType == 2 || og.randIntn(2) == 0
@@ -5278,9 +5304,8 @@ func (og *operationGenerator) alterPolicy(ctx context.Context, tx pgx.Tx) (*opSt
 	opStmt.sql = sqlStatement.String()
 
 	opStmt.expectedExecErrors.addAll(codesWithConditions{
-		{code: pgcode.UndefinedObject, condition: !policyExists},
+		{code: pgcode.UndefinedObject, condition: !policyExists || usesDummyRole},
 		{code: pgcode.UndefinedTable, condition: !tableExists},
-		{code: pgcode.UndefinedObject, condition: usesDummyRole},
 	})
 
 	return opStmt, nil

@@ -433,6 +433,15 @@ type Replica struct {
 	// GetEnabledWhenLeader is consistent with raftMu.flowControlLevel.
 	flowControlV2 replica_rac2.Processor
 
+	// logStorage encapsulates and provides access to the raft log storage, which
+	// includes its Pebble representation, the sideloaded storage for AddSSTable
+	// commands, and the raft entries cache.
+	//
+	// logStorage shares mu and raftMu mutexes with this Replica, which allows
+	// updating its state transactionally with other actions that the Replica
+	// needs to perform, such as updating the state machine.
+	logStorage *replicaLogStorage
+
 	// raftMu protects Raft processing the replica.
 	//
 	// Locking notes: Replica.raftMu < Replica.mu
@@ -442,27 +451,11 @@ type Replica struct {
 		// Note that there are two StateLoaders, in raftMu and mu,
 		// depending on which lock is being held.
 		stateLoader stateloader.StateLoader
-		// on-disk storage for sideloaded SSTables. Always non-nil.
-		// TODO(pav-kv): remove, since this is duplicated in logStorage.
-		sideloaded logstore.SideloadStorage
-		// logStorage provides access to the raft log storage. Set once upon Replica
-		// creation, and is never nil.
-		//
-		// TODO(pav-kv): move log state (such as shMu.lastIndexNotDurable) into the
-		// log storage type. Make the log storage type observe the writes and
-		// maintain this state, as opposed to doing it from a few places in Replica
-		// (like handleRaftReady).
-		logStorage *logstore.LogStore
 
 		// stateMachine is used to apply committed raft entries.
 		stateMachine replicaStateMachine
 		// decoder is used to decode committed raft entries.
 		decoder replicaDecoder
-
-		// bytesAccount accounts bytes used by various Raft components, like entries
-		// to be applied. Currently, it only tracks bytes used by committed entries
-		// being applied to the state machine.
-		bytesAccount logstore.BytesAccount
 
 		flowControlLevel kvflowcontrol.V2EnabledWhenLeaderLevel
 
@@ -587,44 +580,8 @@ type Replica struct {
 	shMu struct {
 		// The state of the Raft state machine.
 		// Invariant: state.TruncatedState == nil. The field is being phased out in
-		// favour of raftTruncState below.
+		// favour of the one contained in logStorage.
 		state kvserverpb.ReplicaState
-		// raftTruncState contains the raft log truncation state, i.e. the ID of the
-		// last entry of the log prefix that has been compacted out from the raft
-		// log storage.
-		raftTruncState kvserverpb.RaftTruncatedState
-		// Last index/term written to the raft log (not necessarily durable locally
-		// or committed by the group). Note that lastTermNotDurable may be 0 (and
-		// thus invalid) even when lastIndexNotDurable is known, in which case the
-		// term will have to be retrieved from the Raft log entry. Use the
-		// invalidLastTerm constant for this case.
-		lastIndexNotDurable kvpb.RaftIndex
-		lastTermNotDurable  kvpb.RaftTerm
-		// raftLogSize is the approximate size in bytes of the persisted raft
-		// log, including sideloaded entries' payloads. The value itself is not
-		// persisted and is computed lazily, paced by the raft log truncation
-		// queue which will recompute the log size when it finds it
-		// uninitialized. This recomputation mechanism isn't relevant for ranges
-		// which see regular write activity (for those the log size will deviate
-		// from zero quickly, and so it won't be recomputed but will undercount
-		// until the first truncation is carried out), but it prevents a large
-		// dormant Raft log from sitting around forever, which has caused problems
-		// in the past.
-		//
-		// Note that both raftLogSize and raftLogSizeTrusted do not include the
-		// effect of pending log truncations (see Replica.pendingLogTruncations).
-		// Hence, they are fine for metrics etc., but not for deciding whether we
-		// should create another pending truncation. For the latter, we compute
-		// the post-pending-truncation size using pendingLogTruncations.
-		raftLogSize int64
-		// If raftLogSizeTrusted is false, don't trust the above raftLogSize until
-		// it has been recomputed.
-		raftLogSizeTrusted bool
-		// raftLogLastCheckSize is the value of raftLogSize the last time the Raft
-		// log was checked for truncation or at the time of the last Raft log
-		// truncation.
-		raftLogLastCheckSize int64
-
 		// leaderID is the ID of the leader replica within the Raft group.
 		// NB: this is updated in a separate critical section from the Raft group,
 		// and can therefore briefly be out of sync with the Raft status.
@@ -1089,6 +1046,9 @@ type Replica struct {
 		// Requires Replica.raftMu be held when providing logical ops and
 		//  informing the processor of closed timestamp updates. This properly
 		//  synchronizes updates that are linearized and driven by the Raft log.
+		//
+		// proc should only be accessed via getRangefeedProcessorAndFilter or
+		// getRangefeedProcessor in nearly all cases.
 		proc rangefeed.Processor
 		// opFilter is a best-effort filter that informs the raft processing
 		// goroutine of which logical operations the rangefeed processor is
@@ -1153,7 +1113,7 @@ type Replica struct {
 	// range. It is updated asynchronously by listening on span configuration
 	// changes, leaseholder changes, and periodically at the interval of
 	// kv.closed_timestamp.policy_refresh_interval by PolicyRefresher.
-	cachedClosedTimestampPolicy atomic.Int32
+	cachedClosedTimestampPolicy atomic.Pointer[ctpb.RangeClosedTimestampPolicy]
 }
 
 // String returns the string representation of the replica using an
@@ -1184,7 +1144,7 @@ func (r *Replica) ID() storage.FullReplicaID {
 // LogStorageRaftMuLocked returns the Replica's log storage.
 // raftMu must be held when using the returned object.
 func (r *Replica) LogStorageRaftMuLocked() *logstore.LogStore {
-	return r.raftMu.logStorage
+	return r.asLogStorage().ls
 }
 
 // cleanupFailedProposal cleans up after a proposal that has failed. It
@@ -1386,20 +1346,19 @@ func toClientClosedTsPolicy(
 	}
 }
 
-// closedTimestampPolicyRLocked returns the closed timestamp policy of the
-// range, which is updated asynchronously by listening on span configuration
-// changes, leaseholder changes, and periodically at the interval of
+// closedTimestampPolicy returns the closed timestamp policy of the range, which
+// is updated asynchronously by listening on span configuration changes,
+// leaseholder changes, and periodically at the interval of
 // kv.closed_timestamp.policy_refresh_interval.
 //
-// NOTE: an exported version of this method which does not require the replica
-// lock exists in helpers_test.go. Move here if needed.
-func (r *Replica) closedTimestampPolicyRLocked() ctpb.RangeClosedTimestampPolicy {
-	// TODO(wenyi): try to remove the need for this key comparison under RLock.
-	// See more in #143648.
-	if r.shMu.state.Desc.ContainsKey(roachpb.RKey(keys.NodeLivenessPrefix)) {
+// NOTE: an exported version of this method exists in helpers_test.go.
+func closedTimestampPolicy(
+	desc *roachpb.RangeDescriptor, policy ctpb.RangeClosedTimestampPolicy,
+) ctpb.RangeClosedTimestampPolicy {
+	if desc.ContainsKey(roachpb.RKey(keys.NodeLivenessPrefix)) {
 		return ctpb.LAG_BY_CLUSTER_SETTING
 	}
-	return ctpb.RangeClosedTimestampPolicy(r.cachedClosedTimestampPolicy.Load())
+	return policy
 }
 
 // RefreshPolicy updates the replica's cached closed timestamp policy based on
@@ -1449,11 +1408,12 @@ func (r *Replica) RefreshPolicy(latencies map[roachpb.NodeID]time.Duration) {
 			closedts.PolicySwitchWhenLatencyExceedsBucketFraction.Get(&r.store.GetStoreConfig().Settings.SV),
 		)
 	}
-	oldPolicy := ctpb.RangeClosedTimestampPolicy(r.cachedClosedTimestampPolicy.Load())
+	oldPolicy := *r.cachedClosedTimestampPolicy.Load()
 	newPolicy := computeNewPolicy(oldPolicy)
 	if newPolicy != oldPolicy {
 		r.store.metrics.ClosedTimestampPolicyChange.Inc(1)
-		r.cachedClosedTimestampPolicy.Store(int32(newPolicy))
+		p := newPolicy
+		r.cachedClosedTimestampPolicy.Store(&p)
 	}
 }
 
@@ -1587,10 +1547,9 @@ func (r *Replica) Version() roachpb.Version {
 // GetRangeInfo atomically reads the range's current range info.
 func (r *Replica) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	desc := r.descRLocked()
 	l, _ /* nextLease */ := r.getLeaseRLocked()
-	closedts := toClientClosedTsPolicy(r.closedTimestampPolicyRLocked())
+	r.mu.RUnlock()
 
 	// Sanity check the lease.
 	if !l.Empty() {
@@ -1606,6 +1565,8 @@ func (r *Replica) GetRangeInfo(ctx context.Context) roachpb.RangeInfo {
 		}
 	}
 
+	closedts := toClientClosedTsPolicy(
+		closedTimestampPolicy(desc, *r.cachedClosedTimestampPolicy.Load()))
 	return roachpb.RangeInfo{
 		Desc:                  *desc,
 		Lease:                 l,
@@ -1952,18 +1913,18 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	ri.RangefeedRegistrations = int64(r.numRangefeedRegistrations())
 
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	ri.ReplicaState = *(protoutil.Clone(&r.shMu.state)).(*kvserverpb.ReplicaState)
 	// TODO(#97613): add a dedicated TruncatedState field to RangeInfo when the
 	// TruncatedState field is removed from ReplicaState. We can't do it right now
 	// because the ReplicaState is embedded into RangeInfo, and this confuses the
 	// proto compiler.
-	ri.TruncatedState = (protoutil.Clone(&r.shMu.raftTruncState)).(*kvserverpb.RaftTruncatedState)
+	ls := r.asLogStorage()
+	ri.TruncatedState = (protoutil.Clone(&ls.shMu.trunc)).(*kvserverpb.RaftTruncatedState)
 
-	ri.LastIndex = r.shMu.lastIndexNotDurable
+	ri.LastIndex = ls.shMu.last.Index
 	ri.NumPending = uint64(r.numPendingProposalsRLocked())
-	ri.RaftLogSize = r.shMu.raftLogSize
-	ri.RaftLogSizeTrusted = r.shMu.raftLogSizeTrusted
+	ri.RaftLogSize = ls.shMu.size
+	ri.RaftLogSizeTrusted = ls.shMu.sizeTrusted
 	ri.NumDropped = uint64(r.mu.droppedMessages)
 	if r.mu.proposalQuota != nil {
 		ri.ApproximateProposalQuota = int64(r.mu.proposalQuota.ApproximateQuota())
@@ -1979,7 +1940,17 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	if r.mu.tenantID != (roachpb.TenantID{}) {
 		ri.TenantID = r.mu.tenantID.ToUint64()
 	}
-	ri.ClosedTimestampPolicy = toClientClosedTsPolicy(r.closedTimestampPolicyRLocked())
+	ri.ClosedTimestampPolicy = toClientClosedTsPolicy(
+		closedTimestampPolicy(r.descRLocked(), *r.cachedClosedTimestampPolicy.Load()))
+	if m := r.mu.pausedFollowers; len(m) > 0 {
+		var sl []roachpb.ReplicaID
+		for id := range m {
+			sl = append(sl, id)
+		}
+		slices.Sort(sl)
+		ri.PausedReplicas = sl
+	}
+	r.mu.RUnlock()
 	r.sideTransportClosedTimestamp.mu.Lock()
 	ri.ClosedTimestampSideTransportInfo.ReplicaClosed = r.sideTransportClosedTimestamp.mu.cur.ts
 	ri.ClosedTimestampSideTransportInfo.ReplicaLAI = r.sideTransportClosedTimestamp.mu.cur.lai
@@ -1990,14 +1961,6 @@ func (r *Replica) State(ctx context.Context) kvserverpb.RangeInfo {
 	ri.ClosedTimestampSideTransportInfo.CentralLAI = centralLAI
 	if err := r.breaker.Signal().Err(); err != nil {
 		ri.CircuitBreakerError = err.Error()
-	}
-	if m := r.mu.pausedFollowers; len(m) > 0 {
-		var sl []roachpb.ReplicaID
-		for id := range m {
-			sl = append(sl, id)
-		}
-		slices.Sort(sl)
-		ri.PausedReplicas = sl
 	}
 	return ri
 }
@@ -2010,9 +1973,9 @@ func (r *Replica) assertStateRaftMuLockedReplicaMuRLocked(
 ) {
 	if ts := r.shMu.state.TruncatedState; ts != nil {
 		log.Fatalf(ctx, "non-empty RaftTruncatedState in ReplicaState: %+v", ts)
-	} else if loaded, err := r.mu.stateLoader.LoadRaftTruncatedState(ctx, reader); err != nil {
+	} else if loaded, err := r.raftMu.stateLoader.LoadRaftTruncatedState(ctx, reader); err != nil {
 		log.Fatalf(ctx, "%s", err)
-	} else if ts := r.shMu.raftTruncState; loaded != ts {
+	} else if ts := r.asLogStorage().shMu.trunc; loaded != ts {
 		log.Fatalf(ctx, "on-disk and in-memory RaftTruncatedState diverged: %s",
 			redact.Safe(pretty.Diff(loaded, ts)))
 	}
@@ -2298,7 +2261,8 @@ func (r *Replica) checkSpanInRangeRLocked(ctx context.Context, rspan roachpb.RSp
 	}
 	return kvpb.NewRangeKeyMismatchErrorWithCTPolicy(
 		ctx, rspan.Key.AsRawKey(), rspan.EndKey.AsRawKey(), desc,
-		r.shMu.state.Lease, toClientClosedTsPolicy(r.closedTimestampPolicyRLocked()))
+		r.shMu.state.Lease, toClientClosedTsPolicy(closedTimestampPolicy(
+			desc, *r.cachedClosedTimestampPolicy.Load())))
 }
 
 // checkTSAboveGCThresholdRLocked returns an error if a request (identified by
@@ -2840,13 +2804,13 @@ func (r *Replica) GetMutexForTesting() *ReplicaMutex {
 // SetCachedClosedTimestampPolicyForTesting sets the closed timestamp policy on r
 // to be the given policy. It is a test-only helper method.
 func (r *Replica) SetCachedClosedTimestampPolicyForTesting(policy ctpb.RangeClosedTimestampPolicy) {
-	r.cachedClosedTimestampPolicy.Store(int32(policy))
+	r.cachedClosedTimestampPolicy.Store(&policy)
 }
 
 // GetCachedClosedTimestampPolicyForTesting returns the closed timestamp policy on r.
 // It is a test-only helper method.
 func (r *Replica) GetCachedClosedTimestampPolicyForTesting() ctpb.RangeClosedTimestampPolicy {
-	return ctpb.RangeClosedTimestampPolicy(r.cachedClosedTimestampPolicy.Load())
+	return *r.cachedClosedTimestampPolicy.Load()
 }
 
 // RefreshLeaderlessWatcherUnavailableStateForTesting refreshes the replica's

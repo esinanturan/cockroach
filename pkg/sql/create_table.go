@@ -1420,8 +1420,7 @@ func NewTableDesc(
 	desc := tabledesc.InitTableDescriptor(
 		id, dbID, sc.GetID(), n.Table.Table(), creationTime, privileges, persistence,
 	)
-
-	setter := tablestorageparam.NewSetter(&desc)
+	setter := tablestorageparam.NewSetter(&desc, true /* isNewObject */)
 	if err := storageparam.Set(
 		ctx,
 		semaCtx,
@@ -1965,6 +1964,9 @@ func NewTableDesc(
 				}
 			}
 			if d.Type == idxtype.VECTOR {
+				if !evalCtx.Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V25_2.Version()) {
+					return nil, pgerror.Newf(pgcode.FeatureNotSupported, "cannot create a vector index until finalizing on 25.2")
+				}
 				// Disable vector indexes by default in 25.2.
 				// TODO(andyk): Remove this check after 25.2.
 				if err := vecindex.CheckEnabled(&st.SV); err != nil {

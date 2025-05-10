@@ -389,7 +389,7 @@ func (b *Builder) buildInsert(ins *tree.Insert, inScope *scope) (outScope *scope
 		mb.addTargetColsForUpdate(ins.OnConflict.Exprs)
 
 		// Build each of the SET expressions.
-		mb.addUpdateCols(ins.OnConflict.Exprs)
+		mb.addUpdateCols(ins.OnConflict.Exprs, nil /* colRefs */)
 
 		// Project row-level BEFORE triggers for UPDATE.
 		mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate, false /* cascade */)
@@ -760,9 +760,28 @@ func (mb *mutationBuilder) buildInsert(
 	// check constraint, refer to the correct columns.
 	mb.disambiguateColumns()
 
+	// Apply SELECT policies if:
+	// - There is an ON CONFLICT clause, which always requires SELECT policies
+	//   due to the conflict scan accessing existing data.
+	// - The RETURNING clause references any columns, which also necessitates
+	//   SELECT policies.
+	includeSelectPolicies := hasOnConflict
+	if mb.tab.IsRowLevelSecurityEnabled() && !includeSelectPolicies && returning != nil {
+		// RETURNING is constructed last and depends on the final scope, so we can’t
+		// build it early or move it. However, we can build temporary scopes to
+		// gather referenced columns (colRefs) just to determine if SELECT policies
+		// are needed. If policies are already required or RLS is not enabled, we skip
+		// this work.
+		var colRefs opt.ColSet
+		_, _ = mb.maybeBuildReturningScopes(returning, &colRefs)
+		// For INSERT, the RETURNING clause can only reference columns from the target table.
+		// So, it's sufficient to check whether any columns are referenced, rather than
+		// verifying if each one belongs to the table.
+		includeSelectPolicies = !colRefs.Empty()
+	}
+
 	// Add any check constraint boolean columns to the input.
-	mb.addCheckConstraintCols(false, /* isUpdate */
-		cat.PolicyScopeInsert, returning != nil || hasOnConflict /* includeSelectOnInsert */)
+	mb.addCheckConstraintCols(false /* isUpdate */, cat.PolicyScopeInsert, includeSelectPolicies)
 
 	// Project partial index PUT boolean columns.
 	mb.projectPartialIndexPutCols()
@@ -968,7 +987,7 @@ func (mb *mutationBuilder) buildUpsert(returning *tree.ReturningExprs) {
 
 	// Add any check constraint boolean columns to the input.
 	mb.addCheckConstraintCols(false, /* isUpdate */
-		cat.PolicyScopeUpsert, false /* includeSelectOnInsert */)
+		cat.PolicyScopeUpsert, false /* includeSelectPolicies */)
 
 	// Add the partial index predicate expressions to the table metadata.
 	// These expressions are used to prune fetch columns during
@@ -1105,5 +1124,5 @@ func (mb *mutationBuilder) buildOnConflictWhereClause(
 			Right: whereClause.Expr,
 		},
 	}
-	mb.b.buildWhere(where, mb.outScope)
+	mb.b.buildWhere(where, mb.outScope, nil /* colRefs */)
 }

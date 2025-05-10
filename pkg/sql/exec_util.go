@@ -21,7 +21,6 @@ import (
 	"time"
 
 	apd "github.com/cockroachdb/apd/v3"
-	"github.com/cockroachdb/cockroach/pkg/backup/backuppb"
 	"github.com/cockroachdb/cockroach/pkg/base"
 	"github.com/cockroachdb/cockroach/pkg/cloud/externalconn"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
@@ -41,7 +40,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangecache"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/rangefeed/rangefeedcache"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/protectedts"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
@@ -1104,6 +1102,9 @@ var (
 		Unit:         metric.Unit_COUNT,
 		LabeledName:  "sql.count",
 		StaticLabels: metric.MakeLabelPairs(metric.LabelQueryType, "select"),
+		Essential:    true,
+		Category:     metric.Metadata_SQL,
+		HowToUse:     "This high-level metric reflects workload volume. Monitor this metric to identify abnormal application behavior or patterns over time. If abnormal patterns emerge, apply the metric's time range to the SQL Activity pages to investigate interesting outliers or patterns. For example, on the Transactions page and the Statements page, sort on the Execution Count column. To find problematic sessions, on the Sessions page, sort on the Transaction Count column. Find the sessions with high transaction counts and trace back to a user or application.",
 	}
 	MetaUpdateExecuted = metric.Metadata{
 		Name:         "sql.update.count",
@@ -1312,6 +1313,8 @@ func getMetricMeta(meta metric.Metadata, internal bool) metric.Metadata {
 		meta.Name += ".internal"
 		meta.Help += " (internal queries)"
 		meta.Measurement = "SQL Internal Statements"
+		meta.Essential = false
+		meta.HowToUse = ""
 		if meta.LabeledName != "" {
 			meta.StaticLabels = append(meta.StaticLabels, metric.MakeLabelPairs(metric.LabelQueryInternal, "true")...)
 		}
@@ -1900,67 +1903,6 @@ type SchemaTelemetryTestingKnobs struct {
 
 // ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
 func (*SchemaTelemetryTestingKnobs) ModuleTestingKnobs() {}
-
-// BackupRestoreTestingKnobs contains knobs for backup and restore behavior.
-//
-// TODO (msbutler): move these to backup
-type BackupRestoreTestingKnobs struct {
-	// AfterBackupChunk is called after each chunk of a backup is completed.
-	AfterBackupChunk func()
-
-	// AfterBackupCheckpoint if set will be called after a BACKUP-CHECKPOINT
-	// is written.
-	AfterBackupCheckpoint func()
-
-	// AfterLoadingCompactionManifestOnResume is run once the backup manifest has been
-	// loaded/created on the resumption of a compaction job.
-	AfterLoadingCompactionManifestOnResume func(manifest *backuppb.BackupManifest)
-
-	// CaptureResolvedTableDescSpans allows for intercepting the spans which are
-	// resolved during backup planning, and will eventually be backed up during
-	// execution.
-	CaptureResolvedTableDescSpans func([]roachpb.Span)
-
-	// RunAfterSplitAndScatteringEntry allows blocking the RESTORE job after a
-	// single RestoreSpanEntry has been split and scattered.
-	RunAfterSplitAndScatteringEntry func(ctx context.Context)
-
-	// RunAfterProcessingRestoreSpanEntry allows blocking the RESTORE job after a
-	// single RestoreSpanEntry has been processed and added to the SSTBatcher.
-	RunAfterProcessingRestoreSpanEntry func(ctx context.Context, entry *execinfrapb.RestoreSpanEntry) error
-
-	// RunAfterExportingSpanEntry allows blocking the BACKUP job after a single
-	// span has been exported.
-	RunAfterExportingSpanEntry func(ctx context.Context, response *kvpb.ExportResponse)
-
-	// BackupMonitor is used to overwrite the monitor used by backup during
-	// testing. This is typically the bulk mem monitor if not
-	// specified here.
-	BackupMemMonitor *mon.BytesMonitor
-
-	RestoreDistSQLRetryPolicy *retry.Options
-
-	RunBeforeRestoreFlow func() error
-
-	RunAfterRestoreFlow func() error
-
-	BackupDistSQLRetryPolicy *retry.Options
-
-	RunBeforeBackupFlow func() error
-
-	RunAfterBackupFlow func() error
-
-	RunAfterRetryIteration func(err error) error
-
-	RunAfterRestoreProcDrains func()
-
-	RunBeforeResolvingCompactionDest func() error
-}
-
-var _ base.ModuleTestingKnobs = &BackupRestoreTestingKnobs{}
-
-// ModuleTestingKnobs implements the base.ModuleTestingKnobs interface.
-func (*BackupRestoreTestingKnobs) ModuleTestingKnobs() {}
 
 // StreamingTestingKnobs contains knobs for streaming behavior.
 type StreamingTestingKnobs struct {
@@ -4180,6 +4122,10 @@ func (m *sessionDataMutator) SetVectorSearchBeamSize(val int32) {
 
 func (m *sessionDataMutator) SetPropagateAdmissionHeaderToLeafTransactions(val bool) {
 	m.data.PropagateAdmissionHeaderToLeafTransactions = val
+}
+
+func (m *sessionDataMutator) SetOptimizerUseExistsFilterHoistRule(val bool) {
+	m.data.OptimizerUseExistsFilterHoistRule = val
 }
 
 // Utility functions related to scrubbing sensitive information on SQL Stats.

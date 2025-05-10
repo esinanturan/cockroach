@@ -876,19 +876,6 @@ func (r *Replica) handleRaftReady(
 	return r.handleRaftReadyRaftMuLocked(ctx, inSnap)
 }
 
-func (r *Replica) attachRaftEntriesMonitorRaftMuLocked() {
-	r.raftMu.bytesAccount = r.store.cfg.RaftEntriesMonitor.NewAccount(
-		r.store.metrics.RaftLoadedEntriesBytes)
-}
-
-func (r *Replica) detachRaftEntriesMonitorRaftMuLocked() {
-	// Return all the used bytes back to the limiter.
-	r.raftMu.bytesAccount.Clear()
-	// De-initialize the account so that log storage Entries() calls don't track
-	// the entries anymore.
-	r.raftMu.bytesAccount = logstore.BytesAccount{}
-}
-
 // handleRaftReadyRaftMuLocked is the same as handleRaftReady but requires that
 // the replica's raftMu be held.
 //
@@ -1015,7 +1002,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 	}
 
 	if hasReady {
-		logRaftReady(ctx, ready)
+		r.maybeLogRaftReadyRaftMuLocked(ctx, ready)
 	}
 	// Even if we don't have a Ready, or entries in Ready,
 	// replica_rac2.Processor may need to do some work.
@@ -1067,11 +1054,11 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 		// from log storage, and ignores the in-memory unstable entries. Consider a
 		// more complete flow control mechanism here, and eliminating the plumbing
 		// hack with the bytesAccount.
-		r.attachRaftEntriesMonitorRaftMuLocked()
+		r.asLogStorage().attachRaftEntriesMonitorRaftMuLocked()
 		// We apply committed entries during this handleRaftReady, so it is ok to
 		// release the corresponding memory tokens at the end of this func. Next
 		// time we enter this function, the account will be empty again.
-		defer r.detachRaftEntriesMonitorRaftMuLocked()
+		defer r.asLogStorage().detachRaftEntriesMonitorRaftMuLocked()
 		if toApply, err = logSnapshot.Slice(
 			ready.Committed, r.store.cfg.RaftMaxCommittedSizePerReady,
 		); err != nil {
@@ -1188,7 +1175,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			defer releaseMergeLock()
 
 			stats.tSnapBegin = crtime.NowMono()
-			if err := r.applySnapshot(ctx, inSnap, snap, app.HardState, subsumedRepls); err != nil {
+			if err := r.applySnapshotRaftMuLocked(ctx, inSnap, snap, app.HardState, subsumedRepls); err != nil {
 				return stats, errors.Wrap(err, "while applying snapshot")
 			}
 			for _, msg := range app.Responses {
@@ -1206,7 +1193,7 @@ func (r *Replica) handleRaftReadyRaftMuLocked(
 			stats.tSnapEnd = crtime.NowMono()
 			stats.snap.applied = true
 
-			// The raft log state was updated in applySnapshot, but we also want to
+			// The raft log state was updated in applySnapshotRaftMuLocked, but we also want to
 			// reflect these changes in the state variable here.
 			// TODO(pav-kv): this is unnecessary. We only do it because there is an
 			// unconditional storing of this state below. Avoid doing it twice.

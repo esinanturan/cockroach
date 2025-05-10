@@ -12,6 +12,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/abortspan"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/plan"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/ctpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/closedts/tracker"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol"
@@ -146,6 +147,7 @@ func newUninitializedReplicaWithoutRaftGroup(
 		allocatorToken: &plan.AllocatorToken{},
 	}
 	r.sideTransportClosedTimestamp.init(store.cfg.ClosedTimestampReceiver, rangeID)
+	r.cachedClosedTimestampPolicy.Store(new(ctpb.RangeClosedTimestampPolicy))
 
 	r.mu.pendingLeaseRequest = makePendingLeaseRequest(r)
 	r.mu.stateLoader = stateloader.Make(rangeID)
@@ -193,8 +195,7 @@ func newUninitializedReplicaWithoutRaftGroup(
 	}
 	r.lastProblemRangeReplicateEnqueueTime.Store(store.Clock().PhysicalTime())
 
-	// NB: state and raftTruncState will be loaded when the replica gets
-	// initialized.
+	// NB: state will be loaded when the replica gets initialized.
 	r.shMu.state = uninitState
 
 	r.rangeStr.store(replicaID, uninitState.Desc)
@@ -207,22 +208,36 @@ func newUninitializedReplicaWithoutRaftGroup(
 
 	r.raftMu.rangefeedCTLagObserver = newRangeFeedCTLagObserver()
 	r.raftMu.stateLoader = stateloader.Make(rangeID)
-	r.raftMu.sideloaded = logstore.NewDiskSideloadStorage(
+
+	// Initialize all the components of the log storage. The state of the log
+	// storage, such as RaftTruncatedState and the last entry ID, will be loaded
+	// when the replica is initialized.
+	sideloaded := logstore.NewDiskSideloadStorage(
 		store.cfg.Settings,
 		rangeID,
-		store.TODOEngine().GetAuxiliaryDir(),
+		// NB: sideloaded log entries are persisted in the state engine so that they
+		// can be ingested to the state machine locally, when being applied.
+		store.StateEngine().GetAuxiliaryDir(),
 		store.limiters.BulkIOWriteRate,
-		store.TODOEngine(),
+		store.StateEngine(),
 	)
-	r.raftMu.logStorage = &logstore.LogStore{
+	r.logStorage = &replicaLogStorage{
+		ctx:                r.raftCtx,
+		raftEntriesMonitor: store.cfg.RaftEntriesMonitor,
+		cache:              store.raftEntryCache,
+		onSync:             (*replicaSyncCallback)(r),
+		metrics:            store.metrics,
+	}
+	r.logStorage.mu.RWMutex = (*syncutil.RWMutex)(&r.mu.ReplicaMutex)
+	r.logStorage.raftMu.Mutex = &r.raftMu.Mutex
+	r.logStorage.ls = &logstore.LogStore{
 		RangeID:     rangeID,
-		Engine:      store.TODOEngine(),
-		Sideload:    r.raftMu.sideloaded,
+		Engine:      store.LogEngine(),
+		Sideload:    sideloaded,
 		StateLoader: r.raftMu.stateLoader.StateLoader,
 		// NOTE: use the same SyncWaiter loop for all raft log writes performed by a
 		// given range ID, to ensure that callbacks are processed in order.
 		SyncWaiter: store.syncWaiters[int(rangeID)%len(store.syncWaiters)],
-		EntryCache: store.raftEntryCache,
 		Settings:   store.cfg.Settings,
 		DisableSyncLogWriteToss: buildutil.CrdbTestBuild &&
 			store.TestingKnobs().DisableSyncLogWriteToss,
@@ -316,9 +331,10 @@ func (r *Replica) initRaftMuLockedReplicaMuLocked(
 	if r.shMu.state.ForceFlushIndex != (roachpb.ForceFlushIndex{}) {
 		r.flowControlV2.ForceFlushIndexChangedLocked(context.TODO(), r.shMu.state.ForceFlushIndex.Index)
 	}
-	r.shMu.raftTruncState = s.TruncState
-	r.shMu.lastIndexNotDurable = s.LastEntryID.Index
-	r.shMu.lastTermNotDurable = s.LastEntryID.Term
+	// TODO(pav-kv): make a method to initialize the log storage.
+	ls := r.asLogStorage()
+	ls.shMu.trunc = s.TruncState
+	ls.shMu.last = s.LastEntryID
 
 	// Initialize the Raft group. This may replace a Raft group that was installed
 	// for the uninitialized replica to process Raft requests or snapshots.

@@ -1005,6 +1005,7 @@ func TestChangefeedMultiTable(t *testing.T) {
 func TestChangefeedCursor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	require.NoError(t, log.SetVModule("event_processing=3,blocking_buffer=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -6132,8 +6133,6 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 144912)
-
 	// Set TestingKnobs to return a known session for easier
 	// comparison.
 	adoptionInterval := 20 * time.Minute
@@ -6175,9 +6174,11 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 		// another node.
 		sqlDB.Exec(t, `UPDATE system.jobs SET claim_session_id = NULL WHERE id = $1`, jobID)
 
-		timeout := 5 * time.Second
+		timeout := (5 * time.Second) + changefeedbase.Quantize.Get(&s.Server.ClusterSettings().SV)
+
 		if util.RaceEnabled {
-			timeout = 30 * time.Second
+			// Timeout should be at least 30s to allow for race conditions.
+			timeout += 25 * time.Second
 		}
 		// Expect that the distflow fails since it can't
 		// update the checkpoint.
@@ -7975,7 +7976,7 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 
 		// Even though checkpointing was disabled, when we drain, an attempt is
 		// made to persist up-to-date checkpoint.
-		require.NoError(t, jf.TickHighWaterMark(beforeInsert))
+		require.NoError(t, jf.WaitForHighWaterMark(beforeInsert))
 
 		// Let the retry proceed.
 		ctx, cancel = context.WithTimeout(context.Background(), time.Second*60)

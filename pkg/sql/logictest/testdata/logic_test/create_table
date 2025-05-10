@@ -1,3 +1,6 @@
+# LogicTest: !local-mixed-25.1 !local-mixed-24.3
+# TODO(mw5h): Remove this once 25.2 is our minimum supported version.
+
 subtest regression_42858
 
 statement ok
@@ -1228,5 +1231,5 @@ CREATE TABLE create_table_index_elem_duplicate_storage_params_e (
 
 subtest end
 
-statement error pq: unimplemented: column col2 has type refcursor, which is not indexable\nHINT: You have attempted to use a feature that is not yet implemented.\nSee: https://go.crdb.dev/issue-v/35730/v25.2
+statement error pq: unimplemented: column col2 has type refcursor, which is not indexable\nHINT: You have attempted to use a feature that is not yet implemented.\nSee: https://go.crdb.dev/issue-v/35730/dev
 CREATE TABLE not_indexable (COL1 INT PRIMARY KEY, COL2 REFCURSOR, COL3 REFCURSOR, INDEX (COL2, COL3))
