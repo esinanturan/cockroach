@@ -2983,7 +2983,7 @@ func populateQueriesTable(
 // formatActiveQuery formats a serverpb.ActiveQuery by interpolating its
 // placeholders within the string.
 func formatActiveQuery(query serverpb.ActiveQuery) string {
-	parsed, parseErr := parser.ParseOneRetainComments(query.Sql)
+	parsed, parseErr := parser.ParseOneWithOptions(query.Sql, parser.DefaultParseOptions.RetainComments())
 	if parseErr != nil {
 		// If we failed to interpolate, rather than give up just send out the
 		// SQL without interpolated placeholders. Hallelujah!
@@ -4084,7 +4084,7 @@ func showRowLevelSecurityStatements(
 	rlsStmts *tree.DArray,
 ) error {
 	// Add the row level security ALTER statements to the rls_statements column.
-	if alterRLSStatements, err := showRLSAlterStatement(tn, table, false); err != nil {
+	if alterRLSStatements, err := showRLSAlterStatement(tn, table); err != nil {
 		return err
 	} else if len(alterRLSStatements) != 0 {
 		if err = rlsStmts.Append(tree.NewDString(alterRLSStatements)); err != nil {
@@ -4094,12 +4094,10 @@ func showRowLevelSecurityStatements(
 
 	// Add the row level security policy statements to the rls_statements column.
 	for _, policy := range table.GetPolicies() {
-		if policyStatement, err := showPolicyStatement(ctx, tn, table, evalCtx, semaCtx, sessionData, policy, false); err != nil {
+		if policyStatement, err := showPolicyStatement(ctx, tn, table, evalCtx, semaCtx, sessionData, policy); err != nil {
 			return err
-		} else if len(policyStatement) != 0 {
-			if err := rlsStmts.Append(tree.NewDString(policyStatement)); err != nil {
-				return err
-			}
+		} else if err = rlsStmts.Append(tree.NewDString(policyStatement)); err != nil {
+			return err
 		}
 	}
 
@@ -5556,7 +5554,7 @@ CREATE TABLE crdb_internal.gossip_alerts (
 					tree.NewDInt(tree.DInt(result.NodeID)),
 					storeID,
 					tree.NewDString(strings.ToLower(alert.Category.String())),
-					tree.NewDString(alert.Description),
+					tree.NewDString(string(alert.SafeDescription)),
 					tree.NewDFloat(tree.DFloat(alert.Value)),
 				); err != nil {
 					return err
@@ -6391,7 +6389,7 @@ CREATE TABLE crdb_internal.invalid_objects (
 )`,
 	populate: func(
 		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
-	) error {
+	) (retError error) {
 		// The internalLookupContext will only have descriptors in the current
 		// database. To deal with this, we fall through.
 		c, err := p.Descriptors().GetAllFromStorageUnvalidated(ctx, p.txn)
@@ -6537,6 +6535,54 @@ CREATE TABLE crdb_internal.invalid_objects (
 				return doDescriptorValidationErrors(ctx, desc, lCtx)
 			}); err != nil {
 				return err
+			}
+
+			// Validate the system.comments table.
+			txn := p.InternalSQLTxn()
+			rows, err := txn.QueryIterator(ctx, "scan-comments-table",
+				txn.KV(), "SELECT type, object_id, sub_id FROM system.comments")
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := rows.Close(); err != nil {
+					retError = errors.CombineErrors(retError, err)
+				}
+			}()
+			for {
+				hasMore, err := rows.Next(ctx)
+				if err != nil {
+					return err
+				}
+				if !hasMore {
+					break
+				}
+				datums := rows.Cur()
+				commentType := tree.MustBeDInt(datums[0])
+				objectID := tree.MustBeDInt(datums[1])
+				subID := tree.MustBeDInt(datums[2])
+				cmtKey := catalogkeys.MakeCommentKey(uint32(objectID), uint32(subID), catalogkeys.CommentType(commentType))
+				// Validate the objects exist for the comments.
+				desc := c.LookupDescriptor(descpb.ID(objectID))
+				if desc == nil {
+					missingDescErr := errors.AssertionFailedf("comment exists for non-existent descriptor %d", objectID)
+					if err := addRow(
+						tree.NewDInt(objectID),
+						tree.NewDString(""),
+						tree.NewDString(""),
+						tree.NewDString(""),
+						tree.NewDString(missingDescErr.Error()),
+						tree.NewDString(missingDescErr.Error())); err != nil {
+						return err
+					}
+					continue
+				}
+				// Validate the comment key is sane.
+				if validationErr := cmtKey.Validate(); validationErr != nil {
+					if err := addValidationErrorRow(desc, validationErr, lCtx); err != nil {
+						return err
+					}
+				}
 			}
 
 			return c.ForEachNamespaceEntry(func(ne nstree.NamespaceEntry) error {
@@ -8715,7 +8761,8 @@ CREATE TABLE crdb_internal.%s (
 	implicit_txn               BOOL NOT NULL,
 	cpu_sql_nanos              INT8,
 	error_code                 STRING,
-	last_error_redactable      STRING
+	last_error_redactable      STRING,
+	query_tags                 JSONB
 )`
 
 var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
@@ -8842,6 +8889,27 @@ func populateStmtInsights(
 				}
 			}
 
+			var keys = []string{"name", "value"}
+			arrayBuilder := json.NewArrayBuilder(len(s.QueryTags))
+			for _, queryTag := range s.QueryTags {
+				builder, err := json.NewFixedKeysObjectBuilder(keys)
+				if err != nil {
+					return err
+				}
+				if err := builder.Set(keys[0], json.FromString(queryTag.Name)); err != nil {
+					return err
+				}
+				if err := builder.Set(keys[1], json.FromString(queryTag.Value)); err != nil {
+					return err
+				}
+				json, err := builder.Build()
+				if err != nil {
+					return err
+				}
+				arrayBuilder.Add(json)
+			}
+			commentsJson := arrayBuilder.Build()
+
 			err = errors.CombineErrors(err, addRow(
 				tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
 				tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
@@ -8872,6 +8940,7 @@ func populateStmtInsights(
 				tree.NewDInt(tree.DInt(s.CPUSQLNanos)),
 				errorCode,
 				errorMsg,
+				tree.NewDJSON(commentsJson),
 			))
 		}
 	}

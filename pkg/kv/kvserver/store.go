@@ -47,6 +47,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
+	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage/snaprecv"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/multiqueue"
@@ -752,7 +753,7 @@ prose below, and the source .dot file is in store_doc_replica_lifecycle.dot.
 	                              +---------------------+
 	          +------------------ |       Absent        | ---------------------------------------------------------------------------------------------------+
 	          |                   +---------------------+                                                                                                    |
-	          |                     |                        Subsume              Crash          applySnapshot                                               |
+	          |                     |                        Subsume              Crash          applySnapshotRaftMuLocked                                   |
 	          |                     | Store.Start          +---------------+    +---------+    +---------------+                                             |
 	          |                     v                      v               |    v         |    v               |                                             |
 	          |                   +-----------------------------------------------------------------------------------------------------------------------+  |
@@ -763,7 +764,7 @@ prose below, and the source .dot file is in store_doc_replica_lifecycle.dot.
 	|    |    |                   +-----------------------------------------------------------------------------------------------------------------------+  |    |
 	|    |    |                     |                      ^                    ^                                   |              |                    |    |    |
 	|    |    | Raft msg            | Crash                | applySnapshot      | post-split                        |              |                    |    |    |
-	|    |    |                     v                      |                    |                                   |              |                    |    |    |
+	|    |    |                     v                      |   RaftMuLocked     |                                   |              |                    |    |    |
 	|    |    |                   +---------------------------------------------------------+  pre-split            |              |                    |    |    |
 	|    |    +-----------------> |                                                         | <---------------------+--------------+--------------------+----+    |
 	|    |                        |                                                         |                       |              |                    |         |
@@ -913,7 +914,7 @@ type Store struct {
 	limiters            batcheval.Limiters
 	txnWaitMetrics      *txnwait.Metrics
 	raftMetrics         *raft.Metrics
-	sstSnapshotStorage  SSTSnapshotStorage
+	sstSnapshotStorage  snaprecv.SSTSnapshotStorage
 	protectedtsReader   spanconfig.ProtectedTSReader
 	ctSender            *sidetransport.Sender
 	policyRefresher     *policyrefresher.PolicyRefresher
@@ -1671,7 +1672,7 @@ func NewStore(
 	// we use them now is because we want snapshot apply to be completely atomic but that
 	// is out the window with two engines, so we may as well break the atomicity in the
 	// common case and do something more effective.
-	s.sstSnapshotStorage = NewSSTSnapshotStorage(s.TODOEngine(), s.limiters.BulkIOWriteRate)
+	s.sstSnapshotStorage = snaprecv.NewSSTSnapshotStorage(s.TODOEngine(), s.limiters.BulkIOWriteRate)
 	if err := s.sstSnapshotStorage.Clear(); err != nil {
 		log.Warningf(ctx, "failed to clear snapshot storage: %v", err)
 	}
@@ -2360,7 +2361,7 @@ func (s *Store) Start(ctx context.Context, stopper *stop.Stopper) error {
 		// acquiring the new lease, which will wake them up.
 		//
 		// NB: cluster settings haven't propagated yet, so we have to check the last
-		// known lease instead of desiredLeaseTypeRLocked. We also check Sequence >
+		// known lease instead of desiredLeaseType. We also check Sequence >
 		// 0 to omit ranges that haven't seen a lease yet.
 		if l, _ := rep.GetLease(); !l.SupportsQuiescence() && l.Sequence > 0 {
 			rep.maybeUnquiesce(ctx, true /* wakeLeader */, true /* mayCampaign */)

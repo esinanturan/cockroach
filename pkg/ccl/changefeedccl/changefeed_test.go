@@ -1005,6 +1005,7 @@ func TestChangefeedMultiTable(t *testing.T) {
 func TestChangefeedCursor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	require.NoError(t, log.SetVModule("event_processing=3,blocking_buffer=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -6132,8 +6133,6 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 144912)
-
 	// Set TestingKnobs to return a known session for easier
 	// comparison.
 	adoptionInterval := 20 * time.Minute
@@ -6175,9 +6174,11 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 		// another node.
 		sqlDB.Exec(t, `UPDATE system.jobs SET claim_session_id = NULL WHERE id = $1`, jobID)
 
-		timeout := 5 * time.Second
+		timeout := (5 * time.Second) + changefeedbase.Quantize.Get(&s.Server.ClusterSettings().SV)
+
 		if util.RaceEnabled {
-			timeout = 30 * time.Second
+			// Timeout should be at least 30s to allow for race conditions.
+			timeout += 25 * time.Second
 		}
 		// Expect that the distflow fails since it can't
 		// update the checkpoint.
@@ -6561,7 +6562,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 
 	sqlDB.ExpectErrWithTimeout(
-		t, `request timestamp .* too far in future`,
+		t, `timestamp '.*' is in the future`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH cursor=$1`, timeutil.Now().Add(time.Hour),
 	)
 
@@ -7975,7 +7976,7 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 
 		// Even though checkpointing was disabled, when we drain, an attempt is
 		// made to persist up-to-date checkpoint.
-		require.NoError(t, jf.TickHighWaterMark(beforeInsert))
+		require.NoError(t, jf.WaitForHighWaterMark(beforeInsert))
 
 		// Let the retry proceed.
 		ctx, cancel = context.WithTimeout(context.Background(), time.Second*60)
@@ -11154,21 +11155,21 @@ func TestChangefeedHeadersJSONVals(t *testing.T) {
 		expected       cdctest.Headers
 		warn           string
 	}{
-		// {
-		// 	name:           "empty",
-		// 	headersJSONStr: `'{}'`,
-		// 	expected:       cdctest.Headers{},
-		// },
-		// {
-		// 	name:           "flat primitives - happy path",
-		// 	headersJSONStr: `'{"a": "b", "c": "d", "e": 42, "f": false}'`,
-		// 	expected: cdctest.Headers{
-		// 		{K: "a", V: []byte("b")},
-		// 		{K: "c", V: []byte("d")},
-		// 		{K: "e", V: []byte("42")},
-		// 		{K: "f", V: []byte("false")},
-		// 	},
-		// },
+		{
+			name:           "empty",
+			headersJSONStr: `'{}'`,
+			expected:       cdctest.Headers{},
+		},
+		{
+			name:           "flat primitives - happy path",
+			headersJSONStr: `'{"a": "b", "c": "d", "e": 42, "f": false}'`,
+			expected: cdctest.Headers{
+				{K: "a", V: []byte("b")},
+				{K: "c", V: []byte("d")},
+				{K: "e", V: []byte("42")},
+				{K: "f", V: []byte("false")},
+			},
+		},
 		{
 			name:           "some bad some good",
 			headersJSONStr: `'{"a": "b", "c": 1, "d": true, "e": null, "f": [1, 2, 3], "g": {"h": "i"}}'`,
@@ -11541,6 +11542,33 @@ func TestChangefeedAsSelectForEmptyTable(t *testing.T) {
 		feed, err := f.Feed(`CREATE CHANGEFEED AS SELECT rowid FROM empty`)
 		require.NoError(t, err)
 		defer closeFeed(t, feed)
+	}
+
+	cdcTest(t, testFn)
+}
+
+func TestChangefeedMVCCTimestampWithQueries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (key INT PRIMARY KEY);`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1);`)
+
+		feed, err := f.Feed(`CREATE CHANGEFEED WITH mvcc_timestamp, format=json, envelope=bare AS SELECT * FROM foo`)
+		require.NoError(t, err)
+		defer closeFeed(t, feed)
+
+		msgs, err := readNextMessages(ctx, feed, 1)
+		require.NoError(t, err)
+
+		var m map[string]any
+		require.NoError(t, gojson.Unmarshal(msgs[0].Value, &m))
+		ts := m["__crdb__"].(map[string]any)["mvcc_timestamp"].(string)
+		assertReasonableMVCCTimestamp(t, ts)
 	}
 
 	cdcTest(t, testFn)

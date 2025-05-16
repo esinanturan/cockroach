@@ -13,8 +13,8 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/quantize"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/vecdist"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/workspace"
-	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/container/list"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -171,7 +171,7 @@ func New(quantizer quantize.Quantizer, seed int64) *Store {
 	st := &Store{
 		dims:          quantizer.GetDims(),
 		seed:          seed,
-		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims()),
+		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims(), quantizer.GetDistanceMetric()),
 		quantizer:     quantizer,
 	}
 
@@ -600,7 +600,8 @@ func (s *Store) MarshalBinary() (data []byte, err error) {
 	}
 
 	storeProto := StoreProto{
-		Config:     vecpb.Config{Dims: int32(s.dims), Seed: s.seed},
+		Dims:       s.dims,
+		Seed:       s.seed,
 		Partitions: make([]PartitionProto, 0, len(s.mu.partitions)),
 		NextKey:    s.mu.nextKey,
 		Vectors:    make([]VectorProto, 0, len(s.mu.vectors)),
@@ -666,8 +667,8 @@ func Load(data []byte) (*Store, error) {
 
 	// Construct the InMemoryStore object.
 	inMemStore := &Store{
-		dims: int(storeProto.Config.Dims),
-		seed: storeProto.Config.Seed,
+		dims: storeProto.Dims,
+		seed: storeProto.Seed,
 	}
 	inMemStore.mu.clock = 2
 	inMemStore.mu.partitions = make(map[qualifiedPartitionKey]*memPartition, len(storeProto.Partitions))
@@ -676,8 +677,8 @@ func Load(data []byte) (*Store, error) {
 	inMemStore.mu.stats = storeProto.Stats
 	inMemStore.mu.pending.Init()
 
-	raBitQuantizer := quantize.NewRaBitQuantizer(int(storeProto.Config.Dims), storeProto.Config.Seed)
-	unquantizer := quantize.NewUnQuantizer(int(storeProto.Config.Dims))
+	raBitQuantizer := quantize.NewRaBitQuantizer(storeProto.Dims, storeProto.Seed, vecdist.L2Squared)
+	unquantizer := quantize.NewUnQuantizer(storeProto.Dims, vecdist.L2Squared)
 
 	// Construct the Partition objects.
 	for i := range storeProto.Partitions {

@@ -61,7 +61,9 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 
 	// Check if sql_safe_updates is enabled and this is a vector index
 	if n.Type == idxtype.VECTOR {
-		if p.EvalContext().SessionData().SafeUpdates {
+		if !p.EvalContext().Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V25_2.Version()) {
+			return nil, pgerror.Newf(pgcode.FeatureNotSupported, "cannot create a vector index until finalizing on 25.2")
+		} else if p.EvalContext().SessionData().SafeUpdates {
 			return nil, pgerror.DangerousStatementf("CREATE VECTOR INDEX will disable writes to the table while the index is being built")
 		} else {
 			p.BufferClientNotice(ctx, pgnotice.Newf("CREATE VECTOR INDEX will disable writes to the table while the index is being built"))
@@ -101,7 +103,7 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	}
 
 	// Disallow schema changes if this table's schema is locked.
-	if err := checkSchemaChangeIsAllowed(tableDesc, n, p.ExecCfg().Settings); err != nil {
+	if err := p.checkSchemaChangeIsAllowed(ctx, tableDesc, n); err != nil {
 		return nil, err
 	}
 

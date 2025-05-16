@@ -1169,7 +1169,8 @@ func (n *Node) startPeriodicLivenessCompaction(
 								}.Encode()
 
 							timeBeforeCompaction := timeutil.Now()
-							if err := store.StateEngine().CompactRange(startEngineKey, endEngineKey); err != nil {
+							if err := store.StateEngine().CompactRange(
+								context.Background(), startEngineKey, endEngineKey); err != nil {
 								log.Errorf(ctx, "failed compacting liveness replica: %+v with error: %s", repl, err)
 							}
 
@@ -1194,7 +1195,7 @@ func (n *Node) startPeriodicLivenessCompaction(
 
 // updateNodeRangeCount updates the internal counter of the total ranges across
 // all stores. This value is used to make a decision on whether the node should
-// use expiration leases (see Replica.shouldUseExpirationLeaseRLocked).
+// use expiration leases (see Replica.shouldUseExpirationLease).
 func (n *Node) updateNodeRangeCount() {
 	var count int64
 	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
@@ -1513,7 +1514,7 @@ func (n *Node) writeNodeStatus(ctx context.Context, mustExist bool) error {
 			}
 			if numNodes > 1 {
 				// Avoid this warning on single-node clusters, which require special UX.
-				log.Warningf(ctx, "health alerts detected: %+v", result)
+				log.Warningf(ctx, "health alerts detected: %s", result)
 			}
 			if err := n.storeCfg.Gossip.AddInfoProto(
 				gossip.MakeNodeHealthAlertKey(n.Descriptor.NodeID), &result, 2*base.DefaultMetricsSampleInterval, /* ttl */
