@@ -585,11 +585,6 @@ func IsEndTxnExceedingDeadline(commitTS hlc.Timestamp, deadline hlc.Timestamp) b
 func IsEndTxnTriggeringRetryError(
 	txn *roachpb.Transaction, deadline hlc.Timestamp,
 ) (retry bool, reason kvpb.TransactionRetryReason, extraMsg redact.RedactableString) {
-	if txn.WriteTooOld {
-		// If we saw any WriteTooOldErrors, we must restart to avoid lost
-		// update anomalies.
-		return true, kvpb.RETRY_WRITE_TOO_OLD, ""
-	}
 	if !txn.IsoLevel.ToleratesWriteSkew() && txn.WriteTimestamp != txn.ReadTimestamp {
 		// Return a transaction retry error if the commit timestamp isn't equal to
 		// the txn timestamp.
@@ -1337,6 +1332,25 @@ func splitTriggerHelper(
 		gc.TxnCleanupThreshold.Get(&rec.ClusterSettings().SV),
 	); err != nil {
 		return enginepb.MVCCStats{}, result.Result{}, err
+	}
+
+	// Copy the last consistency checker run timestamp from the LHS to the RHS.
+	// This avoids running the consistency checker on the RHS immediately after
+	// the split.
+	lastTS := hlc.Timestamp{}
+	if _, err := storage.MVCCGetProto(ctx, batch,
+		keys.QueueLastProcessedKey(split.LeftDesc.StartKey, "consistencyChecker"),
+		hlc.Timestamp{}, &lastTS, storage.MVCCGetOptions{}); err != nil {
+		return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err,
+			"unable to fetch the last consistency checker run for LHS")
+	}
+
+	if err := storage.MVCCPutProto(ctx, batch,
+		keys.QueueLastProcessedKey(split.RightDesc.StartKey, "consistencyChecker"),
+		hlc.Timestamp{}, &lastTS,
+		storage.MVCCWriteOptions{Stats: h.AbsPostSplitRight(), Category: fs.BatchEvalReadCategory}); err != nil {
+		return enginepb.MVCCStats{}, result.Result{}, errors.Wrap(err,
+			"unable to copy the last consistency checker run to RHS")
 	}
 
 	// Note: we don't copy the queue last processed times. This means

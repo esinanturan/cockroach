@@ -270,15 +270,21 @@ func TestTxnWriteBufferBlindWritesIncludingOtherRequests(t *testing.T) {
 	getB := &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: keyB}}
 	delC := delArgs(keyC, txn.Sequence)
 	scanDE := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: keyD, EndKey: keyE}}
+	queryLocks := &kvpb.QueryLocksRequest{RequestHeader: kvpb.RequestHeader{Key: keyA, EndKey: keyE}, IncludeUncontended: true}
+	leaseInfo := &kvpb.LeaseInfoRequest{}
 	ba.Add(putA)
 	ba.Add(getB)
 	ba.Add(delC)
 	ba.Add(scanDE)
+	ba.Add(queryLocks)
+	ba.Add(leaseInfo)
 
 	mockSender.MockSend(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-		require.Len(t, ba.Requests, 2)
+		require.Len(t, ba.Requests, 4)
 		require.IsType(t, &kvpb.GetRequest{}, ba.Requests[0].GetInner())
 		require.IsType(t, &kvpb.ScanRequest{}, ba.Requests[1].GetInner())
+		require.IsType(t, &kvpb.QueryLocksRequest{}, ba.Requests[2].GetInner())
+		require.IsType(t, &kvpb.LeaseInfoRequest{}, ba.Requests[3].GetInner())
 
 		br := ba.CreateReply()
 		br.Txn = ba.Txn
@@ -289,13 +295,15 @@ func TestTxnWriteBufferBlindWritesIncludingOtherRequests(t *testing.T) {
 	require.Nil(t, pErr)
 	require.NotNil(t, br)
 
-	// Expect 4 responses, even though only 2 KV requests were sent. Moreover,
-	// ensure that the responses are in the correct order.
-	require.Len(t, br.Responses, 4)
-	require.Equal(t, br.Responses[0].GetInner(), &kvpb.PutResponse{})
-	require.Equal(t, br.Responses[1].GetInner(), &kvpb.GetResponse{})
-	require.Equal(t, br.Responses[2].GetInner(), &kvpb.DeleteResponse{})
-	require.Equal(t, br.Responses[3].GetInner(), &kvpb.ScanResponse{})
+	// Expect 6 responses, even though only 4 KV requests were sent. Moreover,
+	// ensure that the responses are in the correct order and non-nil.
+	require.Len(t, br.Responses, 6)
+	require.IsType(t, &kvpb.PutResponse{}, br.Responses[0].GetInner())
+	require.IsType(t, &kvpb.GetResponse{}, br.Responses[1].GetInner())
+	require.IsType(t, &kvpb.DeleteResponse{}, br.Responses[2].GetInner())
+	require.IsType(t, &kvpb.ScanResponse{}, br.Responses[3].GetInner())
+	require.IsType(t, &kvpb.QueryLocksResponse{}, br.Responses[4].GetInner())
+	require.IsType(t, &kvpb.LeaseInfoResponse{}, br.Responses[5].GetInner())
 
 	// Verify the writes were buffered correctly.
 	expBufferedWrites := []bufferedWrite{
@@ -408,17 +416,19 @@ func TestTxnWriteBufferCorrectlyAdjustsFlushErrors(t *testing.T) {
 // TestTxnWriteBufferCorrectlyAdjustsErrorsAfterBuffering ensures that the
 // txnWriteBuffer correctly adjusts the index of the errors returned when a part
 // of the batch is buffered on the client.
-//
-// TODO(arul): extend this test to transformations as well once we start
-// transforming read-write requests into separate bits.
 func TestTxnWriteBufferCorrectlyAdjustsErrorsAfterBuffering(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	for errIdx, resErrIdx := range map[int32]int32{
-		0: 1, // points to the GetB
-		1: 4, // points to the GetE
-		2: 5, // points to the GetF
+	for errIdx, resErrIdx := range map[int32]*kvpb.ErrPosition{
+		0: {Index: 1},  // points to the GetB
+		1: {Index: 4},  // points to the ScanE
+		2: {Index: 5},  // points to the RevScanF
+		3: nil,         // points to the CPutG
+		4: {Index: 7},  // points to the QueryLocks
+		5: {Index: 8},  // points to the LeaseInfo
+		6: nil,         // points to the CPutH
+		7: {Index: 11}, // points to the GetJ
 	} {
 		t.Run(fmt.Sprintf("errIdx=%d", errIdx), func(t *testing.T) {
 			ctx := context.Background()
@@ -426,8 +436,10 @@ func TestTxnWriteBufferCorrectlyAdjustsErrorsAfterBuffering(t *testing.T) {
 
 			txn := makeTxnProto()
 			txn.Sequence = 1
-			keyA, keyB, keyC, keyD, keyE, keyF := roachpb.Key("a"), roachpb.Key("b"), roachpb.Key("c"),
-				roachpb.Key("d"), roachpb.Key("e"), roachpb.Key("f")
+			keyA, keyB, keyC, keyD, keyE, keyF, keyG, keyH, keyI, keyJ :=
+				roachpb.Key("a"), roachpb.Key("b"), roachpb.Key("c"), roachpb.Key("d"),
+				roachpb.Key("e"), roachpb.Key("f"), roachpb.Key("g"), roachpb.Key("h"),
+				roachpb.Key("i"), roachpb.Key("j")
 
 			// Construct a batch request where some of the requests will be buffered.
 			ba := &kvpb.BatchRequest{}
@@ -436,21 +448,38 @@ func TestTxnWriteBufferCorrectlyAdjustsErrorsAfterBuffering(t *testing.T) {
 			getB := &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: keyB}}
 			delC := delArgs(keyC, txn.Sequence)
 			putD := putArgs(keyD, "val2", txn.Sequence)
-			getE := &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: keyE}}
-			getF := &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: keyF}}
+			scanE := &kvpb.ScanRequest{RequestHeader: kvpb.RequestHeader{Key: keyE}}
+			revScanF := &kvpb.ReverseScanRequest{RequestHeader: kvpb.RequestHeader{Key: keyF}}
+			cputG := &kvpb.ConditionalPutRequest{RequestHeader: kvpb.RequestHeader{Key: keyG}}
+			queryLocks := &kvpb.QueryLocksRequest{}
+			leaseInfo := &kvpb.LeaseInfoRequest{}
+			cputH := &kvpb.ConditionalPutRequest{RequestHeader: kvpb.RequestHeader{Key: keyH}}
+			putI := putArgs(keyI, "val3", txn.Sequence)
+			getJ := &kvpb.GetRequest{RequestHeader: kvpb.RequestHeader{Key: keyJ}}
 
 			ba.Add(putA)
 			ba.Add(getB)
 			ba.Add(delC)
 			ba.Add(putD)
-			ba.Add(getE)
-			ba.Add(getF)
+			ba.Add(scanE)
+			ba.Add(revScanF)
+			ba.Add(cputG)
+			ba.Add(queryLocks)
+			ba.Add(leaseInfo)
+			ba.Add(cputH)
+			ba.Add(putI)
+			ba.Add(getJ)
 
 			mockSender.MockSend(func(ba *kvpb.BatchRequest) (*kvpb.BatchResponse, *kvpb.Error) {
-				require.Len(t, ba.Requests, 3)
+				require.Len(t, ba.Requests, 8)
 				require.IsType(t, &kvpb.GetRequest{}, ba.Requests[0].GetInner())
-				require.IsType(t, &kvpb.GetRequest{}, ba.Requests[1].GetInner())
-				require.IsType(t, &kvpb.GetRequest{}, ba.Requests[2].GetInner())
+				require.IsType(t, &kvpb.ScanRequest{}, ba.Requests[1].GetInner())
+				require.IsType(t, &kvpb.ReverseScanRequest{}, ba.Requests[2].GetInner())
+				require.IsType(t, &kvpb.GetRequest{}, ba.Requests[3].GetInner())
+				require.IsType(t, &kvpb.QueryLocksRequest{}, ba.Requests[4].GetInner())
+				require.IsType(t, &kvpb.LeaseInfoRequest{}, ba.Requests[5].GetInner())
+				require.IsType(t, &kvpb.GetRequest{}, ba.Requests[6].GetInner())
+				require.IsType(t, &kvpb.GetRequest{}, ba.Requests[7].GetInner())
 
 				pErr := kvpb.NewErrorWithTxn(errors.New("boom"), &txn)
 				pErr.SetErrorIndex(errIdx)
@@ -461,9 +490,7 @@ func TestTxnWriteBufferCorrectlyAdjustsErrorsAfterBuffering(t *testing.T) {
 			require.Nil(t, br)
 			require.NotNil(t, pErr)
 			require.Equal(t, &txn, pErr.GetTxn())
-
-			require.NotNil(t, pErr.Index)
-			require.Equal(t, resErrIdx, pErr.Index.Index)
+			require.Equal(t, resErrIdx, pErr.Index)
 
 			// The batch we sent encountered an error; nothing should have been
 			// buffered.
@@ -1948,17 +1975,6 @@ func TestTxnWriteBufferBatchRequestValidation(t *testing.T) {
 					},
 				}
 				return &kvpb.BatchRequest{Header: header}
-			},
-		},
-		{
-			name: "batch with InitPut",
-			ba: func() *kvpb.BatchRequest {
-				b := &kvpb.BatchRequest{Header: kvpb.Header{Txn: &txn}}
-				b.Add(&kvpb.InitPutRequest{
-					RequestHeader: kvpb.RequestHeader{Key: keyA, Sequence: txn.Sequence},
-					Value:         roachpb.Value{},
-				})
-				return b
 			},
 		},
 		{

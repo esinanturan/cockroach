@@ -8,7 +8,7 @@ package cspann
 import (
 	"bytes"
 	"context"
-	"math/rand"
+	"math"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,17 +28,40 @@ import (
 // of search results that will be reranked with the original full-size vectors.
 const RerankMultiplier = 10
 
-// DeletedMultiplier increases the number of results that will be reranked, in
+// DeletedMinCount sets a minimum number of results that will be reranked, in
 // order to account for vectors that may have been deleted in the primary index.
+const DeletedMinCount = 10
+
+// DeletedMultiplier increases the number of results that will be reranked by
+// this factor, in order to account for vectors that may have been deleted in
+// the primary index.
 const DeletedMultiplier = 1.2
 
 // MaxQualitySamples specifies the max value of the QualitySamples index option.
 const MaxQualitySamples = 32
 
+// IncreaseRerankResults returns good values for maxResults and maxExtraResults
+// that have a high probability of returning the desired number of results, even
+// when there are deleted results. Deleted results will be filtered out by the
+// rerank process, so we need to make sure there are additional results that can
+// be returned instead.
+//
+// TODO(andyk): Switch the index to use a search iterator so the caller can keep
+// requesting further results rather than guessing at how many additional
+// results might be needed.
+func IncreaseRerankResults(desiredMaxResults int) (maxResults, maxExtraResults int) {
+	maxResults = max(int(math.Ceil(float64(desiredMaxResults)*DeletedMultiplier)), DeletedMinCount)
+	maxExtraResults = desiredMaxResults * RerankMultiplier
+	return maxResults, maxExtraResults
+}
+
 // IndexOptions specifies options that control how the index will be built, as
 // well as default options for how it will be searched. A given search operation
 // can specify SearchOptions to override the default behavior.
 type IndexOptions struct {
+	// RotAlgorithm specifies the type of random orthogonal transformation to
+	// apply to vectors before indexing and search. See RotAlgorithm for details.
+	RotAlgorithm RotAlgorithm
 	// MinPartitionSize specifies the size below which a partition will be merged
 	// into other partitions at the same level.
 	MinPartitionSize int
@@ -185,9 +208,9 @@ type Index struct {
 	// stats maintains locally-cached statistics about the vector index that are
 	// used by adaptive search to improve search accuracy.
 	stats statsManager
-	// rot is a square dims x dims matrix that performs random orthogonal
-	// transformations on input vectors, in order to distribute skew more evenly.
-	rot num32.Matrix
+	// rot computes random orthogonal transformations on query and data vectors
+	// to more evenly distribute skew across dimensions.
+	rot RandomOrthoTransformer
 }
 
 // NewIndex constructs a new vector index instance. Typically, only one Index
@@ -210,7 +233,7 @@ func NewIndex(
 	vi := &Index{
 		options:       *options,
 		store:         store,
-		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims()),
+		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims(), quantizer.GetDistanceMetric()),
 		quantizer:     quantizer,
 	}
 	if vi.options.MinPartitionSize == 0 {
@@ -243,31 +266,8 @@ func NewIndex(
 			"QualitySamples option %d exceeds max allowed value", vi.options.QualitySamples)
 	}
 
-	rng := rand.New(rand.NewSource(seed))
-
-	// Generate dims x dims random orthogonal matrix to mitigate the impact of
-	// skewed input data distributions:
-	//
-	//   1. Set skew: some dimensions can have higher variance than others. For
-	//      example, perhaps all vectors in a set have similar values for one
-	//      dimension but widely differing values in another dimension.
-	//   2. Vector skew: Individual vectors can have internal skew, such that
-	//      values higher than the mean are more spread out than values lower
-	//      than the mean.
-	//
-	// Multiplying vectors by this matrix helps with both forms of skew. While
-	// total skew does not change, the skew is more evenly distributed across
-	// the dimensions. Now quantizing the vector will have more uniform
-	// information loss across dimensions. Critically, none of this impacts
-	// distance calculations, as orthogonal transformations do not change
-	// distances or angles between vectors.
-	//
-	// Ultimately, performing a random orthogonal transformation (ROT) means that
-	// the index will work more consistently across a diversity of input data
-	// sets, even those with skewed data distributions. In addition, the RaBitQ
-	// algorithm depends on the statistical properties that are granted by the
-	// ROT.
-	vi.rot = num32.MakeRandomOrthoMatrix(rng, quantizer.GetDims())
+	// Initialize the random orthogonal transformer.
+	vi.rot.Init(vi.options.RotAlgorithm, quantizer.GetDims(), seed)
 
 	// Initialize fixup processor.
 	var fixupSeed int64
@@ -323,7 +323,7 @@ func (vi *Index) FormatStats() string {
 // across vectors in a set. Distance and angle between any two vectors
 // remains unchanged, as long as the same ROT is applied to both.
 func (vi *Index) RandomizeVector(original vector.T, randomized vector.T) vector.T {
-	return num32.MulMatrixByVector(&vi.rot, original, randomized, num32.NoTranspose)
+	return vi.rot.RandomizeVector(original, randomized)
 }
 
 // UnRandomizeVector inverts the random orthogonal transformation performed by
@@ -331,7 +331,7 @@ func (vi *Index) RandomizeVector(original vector.T, randomized vector.T) vector.
 // form. The caller is responsible for allocating the original vector with
 // length equal to the index's dimensions.
 func (vi *Index) UnRandomizeVector(randomized vector.T, original vector.T) vector.T {
-	return num32.MulMatrixByVector(&vi.rot, randomized, original, num32.Transpose)
+	return vi.rot.UnRandomizeVector(randomized, original)
 }
 
 // Close shuts down any background fixup workers. While this also happens when
@@ -350,6 +350,10 @@ func (vi *Index) Close() {
 // before Insert when a vector is updated. Even then, it's not guaranteed that
 // Delete will find the old vector. The search set handles this rare case by
 // filtering out results with duplicate key bytes.
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
+// TODO(andyk): This is not true of the MemStore.
 func (vi *Index) Insert(
 	ctx context.Context, idxCtx *Context, treeKey TreeKey, vec vector.T, key KeyBytes,
 ) error {
@@ -393,6 +397,10 @@ func (vi *Index) Insert(
 //
 // NOTE: Even if the vector is removed, there may still be duplicate dangling
 // instances of the vector still remaining in the index.
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
+// TODO(andyk): This is not true of the MemStore.
 func (vi *Index) Delete(
 	ctx context.Context, idxCtx *Context, treeKey TreeKey, vec vector.T, key KeyBytes,
 ) (deleted bool, err error) {
@@ -423,6 +431,10 @@ func (vi *Index) Delete(
 // and returns them in the search set. Set searchSet.MaxResults to limit the
 // number of results. This is called within the scope of a transaction so that
 // the index does not appear to change during the search.
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
+// TODO(andyk): This is not true of the MemStore.
 func (vi *Index) Search(
 	ctx context.Context,
 	idxCtx *Context,
@@ -440,6 +452,10 @@ func (vi *Index) Search(
 // partition, as well as the centroid of the partition (in the Vector field).
 // This is useful for callers that directly insert KV rows rather than using
 // this library to do it.
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
+// TODO(andyk): This is not true of the MemStore.
 func (vi *Index) SearchForInsert(
 	ctx context.Context, idxCtx *Context, treeKey TreeKey, vec vector.T,
 ) (*SearchResult, error) {
@@ -471,6 +487,10 @@ func (vi *Index) SearchForInsert(
 // It returns a single search result containing the key of that partition, or
 // nil if the vector cannot be found. This is useful for callers that directly
 // delete KV rows rather than using this library to do it.
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
+// TODO(andyk): This is not true of the MemStore.
 func (vi *Index) SearchForDelete(
 	ctx context.Context, idxCtx *Context, treeKey TreeKey, vec vector.T, key KeyBytes,
 ) (*SearchResult, error) {
@@ -492,12 +512,6 @@ func (vi *Index) SearchForDelete(
 	}
 
 	return vi.searchForUpdateHelper(ctx, idxCtx, removeFunc, key, vi.options.MaxDeleteAttempts)
-}
-
-// SuspendFixups suspends background fixup processing until ProcessFixups is
-// explicitly called. It is used for testing.
-func (vi *Index) SuspendFixups() {
-	vi.fixups.Suspend()
 }
 
 // DiscardFixups drops all pending fixups. It is used for testing.
@@ -779,7 +793,7 @@ func (vi *Index) fallbackOnTargets(
 
 		// Calculate the distance of the query vector to the centroids.
 		for i := range tempResults {
-			tempResults[i].QuerySquaredDistance = num32.L2SquaredDistance(vec, tempResults[i].Vector)
+			tempResults[i].QueryDistance = num32.L2SquaredDistance(vec, tempResults[i].Vector)
 			searchSet.Add(&tempResults[i])
 		}
 
@@ -885,7 +899,7 @@ func (vi *Index) rerankSearchResults(
 	// Compute exact distances for the vectors.
 	for i := range candidates {
 		candidate := &candidates[i]
-		candidate.QuerySquaredDistance = num32.L2SquaredDistance(candidate.Vector, queryVector)
+		candidate.QueryDistance = num32.L2SquaredDistance(candidate.Vector, queryVector)
 		candidate.ErrorBound = 0
 	}
 
@@ -921,8 +935,8 @@ func (vi *Index) getFullVectors(
 			// the case of a dangling partition key.
 			if candidates[i].ChildKey.KeyBytes != nil {
 				// Vector was deleted, so add fixup to delete it.
-				vi.fixups.AddDeleteVector(
-					ctx, candidates[i].ParentPartitionKey, candidates[i].ChildKey.KeyBytes)
+				vi.fixups.AddDeleteVector(ctx, idxCtx.treeKey,
+					candidates[i].ParentPartitionKey, candidates[i].ChildKey.KeyBytes)
 			}
 
 			// Move the last candidate to the current position and reduce size
@@ -1085,17 +1099,6 @@ func (vi *Index) Format(
 		return "", err
 	}
 	return buf.String(), nil
-}
-
-// ensureSliceCap returns a slice of length = 0, of the given capacity and
-// generic type. If the existing slice has enough capacity, that slice is
-// returned after setting its length to zero. Otherwise, a new, larger slice is
-// allocated.
-func ensureSliceCap[T any](s []T, c int) []T {
-	if cap(s) < c {
-		return make([]T, 0, c)
-	}
-	return s[:0]
 }
 
 // ensureSliceLen returns a slice of the given length and generic type. If the

@@ -2553,21 +2553,12 @@ func TestStoreReplicaGCAfterMerge(t *testing.T) {
 
 	// Be extra paranoid and verify the exact value of the replica tombstone.
 	checkTombstone := func(eng storage.Engine) {
-		var rhsTombstone kvserverpb.RangeTombstone
-		rhsTombstoneKey := keys.RangeTombstoneKey(rhsDesc.RangeID)
-		ok, err = storage.MVCCGetProto(ctx, eng, rhsTombstoneKey, hlc.Timestamp{},
-			&rhsTombstone, storage.MVCCGetOptions{})
-		if err != nil {
-			t.Fatal(err)
-		} else if !ok {
-			t.Fatalf("missing range tombstone at key %s", rhsTombstoneKey)
-		}
-		if e, a := roachpb.ReplicaID(math.MaxInt32), rhsTombstone.NextReplicaID; e != a {
-			t.Fatalf("expected next replica ID to be %d, but got %d", e, a)
-		}
+		ts, err := stateloader.Make(rhsDesc.RangeID).LoadRangeTombstone(ctx, eng)
+		require.NoError(t, err)
+		require.Equal(t, roachpb.ReplicaID(math.MaxInt32), ts.NextReplicaID)
 	}
-	checkTombstone(store0.TODOEngine())
-	checkTombstone(store1.TODOEngine())
+	checkTombstone(store0.StateEngine())
+	checkTombstone(store1.StateEngine())
 }
 
 // TestStoreRangeMergeAddReplicaRace verifies that when an add replica request
@@ -3910,7 +3901,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			writer := storage.MakeIngestionSSTWriter(ctx, st, file)
 			if i < len(keySpans)-1 {
 				// The last span is the MVCC span, and is always cleared via Excise.
-				// See multiSSTWriter.
+				// See MultiSSTWriter.
 				if err := writer.ClearRawRange(span.Key, span.EndKey, true /* pointKeys */, true /* rangeKeys */); err != nil {
 					return err
 				}
@@ -4000,15 +3991,13 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 				require.NoError(t, sst.ClearRawRange(keys.RaftHardStateKey(rangeID), s.EndKey, true, false))
 			}
 
-			tombstoneKey := keys.RangeTombstoneKey(rangeID)
-			tombstoneValue := &kvserverpb.RangeTombstone{NextReplicaID: math.MaxInt32}
-			if err := storage.MVCCBlindPutProto(
-				context.Background(), &sst, tombstoneKey, hlc.Timestamp{}, tombstoneValue, storage.MVCCWriteOptions{},
+			if err := stateloader.Make(rangeID).SetRangeTombstone(
+				context.Background(), &sst,
+				kvserverpb.RangeTombstone{NextReplicaID: math.MaxInt32},
 			); err != nil {
 				return err
 			}
-			err := sst.Finish()
-			if err != nil {
+			if err := sst.Finish(); err != nil {
 				return err
 			}
 			expectedSSTs = append(expectedSSTs, sstFile.Data())
@@ -4023,7 +4012,7 @@ func TestStoreRangeMergeRaftSnapshot(t *testing.T) {
 			EndKey:   roachpb.RKey(keyEnd),
 		}
 		if err := storage.ClearRangeWithHeuristic(
-			ctx, receivingEng, &sst, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey(), 64, 8,
+			ctx, receivingEng, &sst, desc.StartKey.AsRawKey(), desc.EndKey.AsRawKey(), 64,
 		); err != nil {
 			return err
 		}

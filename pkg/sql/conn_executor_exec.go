@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -74,6 +75,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 	"go.opentelemetry.io/otel/attribute"
@@ -386,6 +388,14 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmt = makeStatement(parserStmt, queryID, stmtFingerprintFmtMask)
 	}
 
+	if len(stmt.QueryTags) > 0 {
+		tags := &logtags.Buffer{}
+		for _, tag := range stmt.QueryTags {
+			tags = tags.Add("querytag-"+tag.Key, tag.Value)
+		}
+		ctx = logtags.AddTags(ctx, tags)
+	}
+
 	var queryTimeoutTicker *time.Timer
 	var txnTimeoutTicker *time.Timer
 	queryTimedOut := false
@@ -675,6 +685,12 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 	p.semaCtx.Placeholders.Assign(pinfo, stmt.NumPlaceholders)
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
+
+	if buildutil.CrdbTestBuild {
+		// Ensure that each statement is formatted regardless of logging
+		// settings.
+		_ = p.FormatAstAsRedactableString(stmt.AST, p.extendedEvalCtx.Annotations)
+	}
 
 	// This flag informs logging decisions.
 	// Some statements are not dispatched to the execution engine and need
@@ -1671,6 +1687,12 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	p.extendedEvalCtx.Annotations = &p.semaCtx.Annotations
 	p.semaCtx.Placeholders.Assign(pinfo, vars.stmt.NumPlaceholders)
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
+
+	if buildutil.CrdbTestBuild {
+		// Ensure that each statement is formatted regardless of logging
+		// settings.
+		_ = p.FormatAstAsRedactableString(vars.stmt.AST, p.extendedEvalCtx.Annotations)
+	}
 
 	// This flag informs logging decisions.
 	// Some statements are not dispatched to the execution engine and need
@@ -3348,6 +3370,22 @@ func (ex *connExecutor) makeExecPlan(
 	// Include gist in error reports.
 	ih := &planner.instrumentation
 	ctx = withPlanGist(ctx, ih.planGist.String())
+	if buildutil.CrdbTestBuild && ih.planGist.String() != "" {
+		// Ensure that the gist can be decoded in test builds.
+		//
+		// In 50% cases, use nil catalog.
+		var catalog cat.Catalog
+		if ex.rng.internal.Float64() < 0.5 && !planner.SessionData().AllowRoleMembershipsToChangeDuringTransaction {
+			// For some reason, TestAllowRoleMembershipsToChangeDuringTransaction
+			// times out with non-nil catalog, so we'll keep it as nil when the
+			// session var is set to 'true' ('false' is the default).
+			catalog = planner.optPlanningCtx.catalog
+		}
+		_, err := explain.DecodePlanGistToRows(ctx, &planner.extendedEvalCtx.Context, ih.planGist.String(), catalog)
+		if err != nil {
+			return ctx, errors.NewAssertionErrorWithWrappedErrf(err, "failed to decode plan gist: %q", ih.planGist.String())
+		}
+	}
 
 	// Now that we have the plan gist, check whether we should get a bundle for
 	// it.
@@ -4063,6 +4101,8 @@ func (ex *connExecutor) enableTracing(modes []string) error {
 			traceKV = true
 		case "cluster":
 			recordingType = tracingpb.RecordingVerbose
+		case "compact":
+			// compact modifies the output format.
 		default:
 			return pgerror.Newf(pgcode.Syntax,
 				"set tracing: unknown mode %q", s)

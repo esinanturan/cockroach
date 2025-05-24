@@ -69,6 +69,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -618,7 +619,7 @@ func TestRaftLogSizeAfterTruncation(t *testing.T) {
 	require.NotNil(t, repl)
 	index := repl.GetLastIndex()
 
-	// Verifies the recomputed log size against what we track in `r.mu.raftLogSize`.
+	// Verifies the recomputed log size against what we track in log storage.
 	assertCorrectRaftLogSize := func() {
 		// Lock raftMu so that the log doesn't change while we compute its size.
 		repl.RaftLock()
@@ -2498,7 +2499,7 @@ func TestQuotaPool(t *testing.T) {
 	settings := cluster.MakeTestingClusterSettings()
 	// Override the kvflowcontrol.Mode setting to apply_to_elastic, as when
 	// apply_to_all is set (metamorphically), the quota pool will be disabled.
-	// See getQuotaPoolEnabledRLocked.
+	// See getQuotaPoolEnabled.
 	kvflowcontrol.Mode.Override(ctx, &settings.SV, kvflowcontrol.ApplyToElastic)
 	// Disable metamorphism and always run with fortification enabled, as it helps
 	// guard against unexpected leadership changes that the test doesn't expect.
@@ -3084,7 +3085,7 @@ func TestReplicaRemovalCampaign(t *testing.T) {
 
 			if td.remove {
 				// Simulate second replica being transferred by removing it.
-				if err := store0.RemoveReplica(ctx, replica2, replica2.Desc().NextReplicaID, kvserver.RemoveOptions{
+				if err := store0.RemoveReplica(ctx, replica2, replica2.Desc().NextReplicaID, redact.SafeString(t.Name()), kvserver.RemoveOptions{
 					DestroyData: true,
 				}); err != nil {
 					t.Fatal(err)
@@ -3225,16 +3226,10 @@ func TestRaftRemoveRace(t *testing.T) {
 		tc.AddVotersOrFatal(t, key, tc.Target(2))
 
 		// Verify the tombstone key does not exist. See #12130.
-		tombstoneKey := keys.RangeTombstoneKey(desc.RangeID)
-		var tombstone kvserverpb.RangeTombstone
-		if ok, err := storage.MVCCGetProto(
-			ctx, tc.GetFirstStoreFromServer(t, 2).TODOEngine(), tombstoneKey,
-			hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
-		); err != nil {
-			t.Fatal(err)
-		} else if ok {
-			t.Fatal("tombstone should not exist")
-		}
+		ts, err := stateloader.Make(desc.RangeID).LoadRangeTombstone(
+			ctx, tc.GetFirstStoreFromServer(t, 2).StateEngine())
+		require.NoError(t, err)
+		require.Equal(t, kvserverpb.RangeTombstone{}, ts)
 	}
 }
 
@@ -5314,13 +5309,9 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 		}
 		ensureNoTombstone := func(t *testing.T, store *kvserver.Store, rangeID roachpb.RangeID) {
 			t.Helper()
-			var tombstone kvserverpb.RangeTombstone
-			tombstoneKey := keys.RangeTombstoneKey(rangeID)
-			ok, err := storage.MVCCGetProto(
-				ctx, store.TODOEngine(), tombstoneKey, hlc.Timestamp{}, &tombstone, storage.MVCCGetOptions{},
-			)
+			ts, err := stateloader.Make(rangeID).LoadRangeTombstone(ctx, store.StateEngine())
 			require.NoError(t, err)
-			require.False(t, ok)
+			require.Zero(t, ts.NextReplicaID)
 		}
 		getHardState := func(
 			t *testing.T, store *kvserver.Store, rangeID roachpb.RangeID,
@@ -5495,7 +5486,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 			// raft message when the other nodes split and then after the above call
 			// it will find out about its new replica ID and write a tombstone for the
 			// old one.
-			waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).TODOEngine(), rhsID)
+			waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).StateEngine(), rhsID)
 			lhsPartition.deactivate()
 			tc.WaitForValues(t, keyA, []int64{8, 8, 8})
 			hs := getHardState(t, tc.GetFirstStoreFromServer(t, 0), rhsID)
@@ -5547,7 +5538,7 @@ func TestProcessSplitAfterRightHandSideHasBeenRemoved(t *testing.T) {
 			// raft message when the other nodes split and then after the above call
 			// it will find out about its new replica ID and write a tombstone for the
 			// old one.
-			waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).TODOEngine(), rhsID)
+			waitForTombstone(t, tc.GetFirstStoreFromServer(t, 0).StateEngine(), rhsID)
 
 			// We do all of this incrementing to ensure that nobody will ever
 			// succeed in sending a message the new RHS replica after we restart

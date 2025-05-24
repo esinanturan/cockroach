@@ -898,15 +898,6 @@ func (og *operationGenerator) addForeignKeyConstraint(
 	if err != nil {
 		return nil, err
 	}
-	// If we are intentionally using an invalid child type, then it doesn't make
-	// sense to validate if the rows validate the constraint.
-	rowsSatisfyConstraint := true
-	if !fetchInvalidChild {
-		rowsSatisfyConstraint, err = og.rowsSatisfyFkConstraint(ctx, tx, parentTable, parentColumn, childTable, childColumn)
-		if err != nil {
-			return nil, err
-		}
-	}
 
 	stmt := makeOpStmt(OpStmtDDL)
 	stmt.expectedExecErrors.addAll(codesWithConditions{
@@ -923,7 +914,6 @@ func (og *operationGenerator) addForeignKeyConstraint(
 	// separate job validating the constraint, we can't at transaction time predict,
 	// perfectly if an error is expected. We can confirm post transaction with a time
 	// travel query.
-	_ = rowsSatisfyConstraint
 	stmt.potentialExecErrors.add(pgcode.ForeignKeyViolation)
 	og.potentialCommitErrors.add(pgcode.ForeignKeyViolation)
 
@@ -1293,18 +1283,18 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 		}
 		return false
 	}()
-	mixedVersion, err := isMixedVersionState(ctx, tx)
+
+	// Randomly create as schema locked table.
+	versionBefore253, err := isClusterVersionLessThan(ctx, tx, clusterversion.V25_3.Version())
 	if err != nil {
 		return nil, err
 	}
-	hasUnsupportedBit0Type := func() bool {
-		for _, def := range stmt.Defs {
-			if col, ok := def.(*tree.ColumnTableDef); ok && isUnsupportedBit0Type(col.Type.SQLString(), mixedVersion) {
-				return true
-			}
-		}
-		return false
-	}()
+	if og.params.rng.Intn(2) == 0 && !versionBefore253 {
+		stmt.StorageParams = append(stmt.StorageParams, tree.StorageParam{
+			Key:   "schema_locked",
+			Value: tree.DBoolTrue,
+		})
+	}
 
 	tableExists, err := og.tableExists(ctx, tx, tableName)
 	if err != nil {
@@ -1324,7 +1314,6 @@ func (og *operationGenerator) createTable(ctx context.Context, tx pgx.Tx) (*opSt
 	opStmt.potentialExecErrors.addAll(codesWithConditions{
 		{code: pgcode.Syntax, condition: hasVectorType},
 		{code: pgcode.FeatureNotSupported, condition: hasVectorType},
-		{code: pgcode.InvalidParameterValue, condition: hasUnsupportedBit0Type},
 	})
 	opStmt.sql = tree.Serialize(stmt)
 	return opStmt, nil
@@ -3624,22 +3613,12 @@ func (og *operationGenerator) randParentColumnForFkRelation(
 	var typName string
 	var nullable string
 
-	nestedTxn, err := tx.Begin(ctx)
-	if err != nil {
-		return nil, nil, err
-	}
-	err = nestedTxn.QueryRow(ctx, fmt.Sprintf(`
+	err := tx.QueryRow(ctx, fmt.Sprintf(`
 	SELECT table_schema, table_name, column_name, crdb_sql_type, is_nullable FROM (
 		%s
 	)`, subQuery.String())).Scan(&tableSchema, &tableName, &columnName, &typName, &nullable)
 	if err != nil {
-		if rbErr := nestedTxn.Rollback(ctx); rbErr != nil {
-			err = errors.CombineErrors(rbErr, err)
-		}
 		return nil, nil, err
-	}
-	if err = nestedTxn.Commit(ctx); err != nil {
-		return nil, nil, errors.WithStack(err)
 	}
 
 	columnToReturn := column{
@@ -3821,6 +3800,14 @@ func (og *operationGenerator) randTypeName(
 func (og *operationGenerator) randTable(
 	ctx context.Context, tx pgx.Tx, pctExisting int, desiredSchema string,
 ) (*tree.TableName, error) {
+	// Because the declarative schema change can automatically set / unset
+	// schema_locked on tables, we will allow random table selection include
+	// schema_locked tables. When working with the legacy schema changer, we
+	// will intentionally only select non-schema locked tables.
+	excludeSchemaLocked := "  AND create_statement NOT LIKE '%schema_locked%' "
+	if og.useDeclarativeSchemaChanger {
+		excludeSchemaLocked = ""
+	}
 	if err := og.setSeedInDB(ctx, tx); err != nil {
 		return nil, err
 	}
@@ -3833,13 +3820,15 @@ func (og *operationGenerator) randTable(
 			return &treeTableName, nil
 		}
 		q := fmt.Sprintf(`
-		  SELECT table_name
-		    FROM [SHOW TABLES]
-		   WHERE table_name SIMILAR TO 'table_w[0-9]_+%%'
+		  SELECT descriptor_name 
+		    FROM crdb_internal.create_statements
+		   WHERE descriptor_name SIMILAR TO 'table_w[0-9]_+%%'
 				 AND schema_name = '%s'
+		     AND descriptor_type='table'
+		 	   %s 
 		ORDER BY random()
 		   LIMIT 1;
-		`, desiredSchema)
+		`, desiredSchema, excludeSchemaLocked)
 
 		var tableName string
 		if err := tx.QueryRow(ctx, q).Scan(&tableName); err != nil {
@@ -3870,13 +3859,17 @@ func (og *operationGenerator) randTable(
 		return &treeTableName, nil
 	}
 
-	const q = `
-  SELECT schema_name, table_name
-    FROM [SHOW TABLES]
-   WHERE table_name SIMILAR TO 'table_w[0-9]_+%'
-ORDER BY random()
-   LIMIT 1;
-`
+	q := fmt.Sprintf(`
+SELECT schema_name, descriptor_name 
+		    FROM crdb_internal.create_statements
+		   WHERE descriptor_name SIMILAR TO 'table_w[0-9]_+%%'
+		     AND descriptor_type='table'
+		 	   %s 
+		ORDER BY random()
+		   LIMIT 1;
+`,
+		excludeSchemaLocked)
+
 	var schemaName string
 	var tableName string
 	if err := tx.QueryRow(ctx, q).Scan(&schemaName, &tableName); err != nil {
@@ -4024,14 +4017,9 @@ func (og *operationGenerator) randType(
 	if err != nil {
 		return nil, nil, err
 	}
-	mixedVersion, err := isMixedVersionState(ctx, tx)
-	if err != nil {
-		return nil, nil, err
-	}
 
 	typ := randgen.RandSortingType(og.params.rng)
-	for (pgVectorNotSupported && typ.Family() == types.PGVectorFamily) ||
-		isUnsupportedBit0Type(typ.SQLString(), mixedVersion) {
+	for pgVectorNotSupported && typ.Family() == types.PGVectorFamily {
 		typ = randgen.RandSortingType(og.params.rng)
 	}
 
@@ -4213,11 +4201,6 @@ FROM
 		possibleParamReferences = append(possibleParamReferences, fmt.Sprintf(`enum_%d %s`, i, enum["name"]))
 	}
 
-	mixedVersion, err := isMixedVersionState(ctx, tx)
-	if err != nil {
-		return nil, err
-	}
-
 	// Generate random parameters / values for builtin types.
 	for i, typeVal := range randgen.SeedTypes {
 		// If we have types where invalid values can exist then skip over these,
@@ -4228,9 +4211,6 @@ FROM
 			typeVal == types.RegClass ||
 			typeVal.Family() == types.OidFamily ||
 			typeVal.Family() == types.VoidFamily {
-			continue
-		}
-		if isUnsupportedBit0Type(typeVal.SQLString(), mixedVersion) {
 			continue
 		}
 
@@ -4878,22 +4858,6 @@ func isClusterVersionLessThan(
 	return clusterVersion.Less(targetVersion), nil
 }
 
-// isMixedVersionState works similarly to isClusterVersionLessThan, but without
-// specifying a version. It returns true if the cluster version is not the
-// latest, indicating a mixed-version test.
-func isMixedVersionState(ctx context.Context, tx pgx.Tx) (bool, error) {
-	return isClusterVersionLessThan(ctx, tx, clusterversion.Latest.Version())
-}
-
-func isUnsupportedBit0Type(typName string, mixedVersion bool) bool {
-	// TODO(spilchen): In mixed-version testing, declaring a BIT(0) column can cause a
-	// syntax error. Support for this type was recently added and backported, but the
-	// backport release is still pending. We need to regenerate the type until
-	// something other than BIT(0) is generated. This can be removed once 24.2.5 is
-	// publicly released.
-	return mixedVersion && strings.HasPrefix(typName, "BIT(0)")
-}
-
 func (og *operationGenerator) setSeedInDB(ctx context.Context, tx pgx.Tx) error {
 	if _, err := tx.Exec(ctx, "SELECT setseed($1)", og.randFloat64()); err != nil {
 		return err
@@ -5115,6 +5079,10 @@ func findExistingPolicy(
 		policyExists = true
 	}
 
+	if rows.Err() != nil {
+		return nil, false, rows.Err()
+	}
+
 	return &policyWithInfo, policyExists, nil
 }
 
@@ -5236,7 +5204,7 @@ func (og *operationGenerator) alterPolicy(ctx context.Context, tx pgx.Tx) (*opSt
 			usesDummyRole = true
 		}
 
-		sqlStatement.WriteString(fmt.Sprintf(" TO %s", roles))
+		sqlStatement.WriteString(fmt.Sprintf(" TO %s", lexbase.EscapeSQLIdent(roles)))
 	default: // USING and/or WITH CHECK expressions
 		// For case 2 and 3, we generate USING, WITH CHECK, or both
 		includeUsing = alterType == 2 || og.randIntn(2) == 0
@@ -5278,9 +5246,8 @@ func (og *operationGenerator) alterPolicy(ctx context.Context, tx pgx.Tx) (*opSt
 	opStmt.sql = sqlStatement.String()
 
 	opStmt.expectedExecErrors.addAll(codesWithConditions{
-		{code: pgcode.UndefinedObject, condition: !policyExists},
+		{code: pgcode.UndefinedObject, condition: !policyExists || usesDummyRole},
 		{code: pgcode.UndefinedTable, condition: !tableExists},
-		{code: pgcode.UndefinedObject, condition: usesDummyRole},
 	})
 
 	return opStmt, nil
@@ -5289,27 +5256,16 @@ func (og *operationGenerator) alterPolicy(ctx context.Context, tx pgx.Tx) (*opSt
 // randUser returns a real username from the database.
 // It returns an error if no user is found.
 func (og *operationGenerator) randUser(ctx context.Context, tx pgx.Tx) (string, error) {
-	query := "SELECT username FROM [SHOW USERS] ORDER BY random() LIMIT 1"
-	rows, err := tx.Query(ctx, query)
-	if rows.Err() != nil {
-		return "", rows.Err()
-	}
-
-	if err != nil {
+	if err := og.setSeedInDB(ctx, tx); err != nil {
 		return "", err
 	}
-	defer rows.Close()
+	query := "SELECT username FROM [SHOW USERS] ORDER BY random() LIMIT 1"
+	row := tx.QueryRow(ctx, query)
 
 	var realUser string
-	if rows.Next() {
-		if err := rows.Scan(&realUser); err != nil {
-			return "", err
-		}
-		og.LogMessage(fmt.Sprintf("Found real user: '%s'", realUser))
-		return realUser, nil
+	if err := row.Scan(&realUser); err != nil {
+		return "", err
 	}
-
-	// This should never happen in a valid CockroachDB instance.
-	// There should always be at least one user.
-	return "", errors.New("no users found in the database")
+	og.LogMessage(fmt.Sprintf("Found real user: '%s'", realUser))
+	return realUser, nil
 }

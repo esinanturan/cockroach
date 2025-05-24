@@ -973,7 +973,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	// Begin compacting the store in a separate goroutine.
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- errors.Wrap(db.Compact(), "while compacting")
+		errCh <- errors.Wrap(db.Compact(context.Background()), "while compacting")
 	}()
 
 	// Print the current LSM every minute.
@@ -1604,6 +1604,7 @@ func init() {
 	f.StringVar(&debugTimeSeriesDumpOpts.zendeskTicket, "zendesk-ticket", "", "zendesk ticket to use in datadog upload")
 	f.StringVar(&debugTimeSeriesDumpOpts.organizationName, "org-name", "", "organization name to use in datadog upload")
 	f.StringVar(&debugTimeSeriesDumpOpts.userName, "user-name", "", "name of the user to perform datadog upload")
+	f.StringVar(&debugTimeSeriesDumpOpts.storeToNodeMapYAMLFile, "store-to-node-map-file", "", "yaml file path which contains the mapping of store ID to node ID for datadog upload.")
 
 	f = debugSendKVBatchCmd.Flags()
 	f.StringVar(&debugSendKVBatchContext.traceFormat, "trace", debugSendKVBatchContext.traceFormat,
