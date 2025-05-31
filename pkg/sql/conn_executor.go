@@ -727,6 +727,11 @@ func (s *Server) GetReportedSQLStatsProvider() *sslocal.SQLStats {
 	return s.reportedStats
 }
 
+// GetSQLStatsIngester returns the sqlstats.Ingester for the current sql.Server.
+func (s *Server) GetSQLStatsIngester() *sslocal.SQLStatsIngester {
+	return s.sqlStatsIngester
+}
+
 // GetTxnIDCache returns the txnidcache.Cache for the current sql.Server.
 func (s *Server) GetTxnIDCache() *txnidcache.Cache {
 	return s.txnIDCache
@@ -3535,6 +3540,11 @@ func (ex *connExecutor) setTransactionModes(
 		level := ex.txnIsolationLevelToKV(ctx, modes.Isolation)
 		if err := ex.state.setIsolationLevel(level); err != nil {
 			return pgerror.WithCandidateCode(err, pgcode.ActiveSQLTransaction)
+		}
+		if level != isolation.Serializable {
+			// TODO(#143497): we currently only support buffered writes under
+			// serializable isolation.
+			ex.state.mu.txn.SetBufferedWritesEnabled(false)
 		}
 	}
 	rwMode := modes.ReadWriteMode

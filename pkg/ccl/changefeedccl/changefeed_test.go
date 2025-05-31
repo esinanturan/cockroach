@@ -1005,6 +1005,7 @@ func TestChangefeedMultiTable(t *testing.T) {
 func TestChangefeedCursor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	require.NoError(t, log.SetVModule("event_processing=3,blocking_buffer=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2366,7 +2367,6 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rnd, _ := randutil.NewPseudoRand()
 
 	s, db, stopServer := startTestFullServer(t, feedTestOptions{})
 	defer stopServer()
@@ -2382,6 +2382,9 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
   INSERT INTO foo (key) SELECT * FROM generate_series(1, 1000);
   ALTER TABLE foo SPLIT AT (SELECT * FROM generate_series(1, 1000, 50));
   `)
+
+	fooDesc := desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), "d", "foo")
+	tableSpan := fooDesc.PrimaryIndexSpan(s.Codec())
 
 	// Checkpoint progress frequently, allow a large enough checkpoint, and
 	// reduce the lag threshold to allow lag checkpointing to trigger
@@ -2402,25 +2405,29 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	// Rangefeed will skip some of the checkpoints to simulate lagging spans.
 	var laggingSpans roachpb.SpanGroup
 	nonLaggingSpans := make(map[string]int)
-	var numLagging, numNonLagging int
-	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *kvpb.RangeFeedCheckpoint) bool {
+	var numSpans int
+	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *kvpb.RangeFeedCheckpoint) (skip bool) {
+		// Skip spans for the whole table.
+		if checkpoint.Span.Equal(tableSpan) {
+			return true
+		}
 		// Skip spans that we already picked to be lagging.
 		if laggingSpans.Encloses(checkpoint.Span) {
-			return true /* skip */
+			return true
 		}
-		// Skip additional updates for some non-lagging spans so that we can
-		// have more than one timestamp in the checkpoint.
+		// Skip additional updates for every 3rd non-lagging span so that we have
+		// a few spans lagging at a second timestamp above the cursor.
 		if i, ok := nonLaggingSpans[checkpoint.Span.String()]; ok {
 			return i%3 == 0
 		}
-		// Ensure we have a few spans that are lagging at the cursor.
-		if numLagging == 0 || (numLagging < 5 && rnd.Int()%3 == 0) {
+		numSpans++
+		// Skip updates for every 3rd span so that we have a few spans lagging
+		// at the cursor.
+		if numSpans%3 == 0 {
 			laggingSpans.Add(checkpoint.Span)
-			numLagging++
-			return true /* skip */
+			return true
 		}
-		nonLaggingSpans[checkpoint.Span.String()] = numNonLagging
-		numNonLagging++
+		nonLaggingSpans[checkpoint.Span.String()] = len(nonLaggingSpans) + 1
 		return false
 	}
 
@@ -2469,10 +2476,16 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 		}
 	}
 
-	var rangefeedStarted bool
+	var rangefeedStartedOnce bool
 	var incorrectCheckpointErr error
 	knobs.FeedKnobs.OnRangeFeedStart = func(spans []kvcoord.SpanTimePair) {
-		rangefeedStarted = true
+		// We only need to check the first rangefeed restart since
+		// any additional restarts (likely due to transient errors)
+		// may be using newer span-level checkpoints than the one
+		// we saved after the last pause.
+		if rangefeedStartedOnce {
+			return
+		}
 
 		setErr := func(stp kvcoord.SpanTimePair, expectedTS hlc.Timestamp) {
 			incorrectCheckpointErr = errors.Newf(
@@ -2494,6 +2507,8 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 				}
 			}
 		}
+
+		rangefeedStartedOnce = true
 	}
 	knobs.FeedKnobs.ShouldSkipCheckpoint = nil
 
@@ -2513,7 +2528,7 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	waitForJobState(sqlDB, t, jobID, jobs.StatePaused)
 	// Verify the rangefeed started. This guards against the testing knob
 	// not being called, which was happening in earlier versions of the code.
-	require.True(t, rangefeedStarted)
+	require.True(t, rangefeedStartedOnce)
 	// Verify we didn't see incorrect timestamps when resuming.
 	require.NoError(t, incorrectCheckpointErr)
 }
@@ -6132,8 +6147,6 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 144912)
-
 	// Set TestingKnobs to return a known session for easier
 	// comparison.
 	adoptionInterval := 20 * time.Minute
@@ -6175,9 +6188,11 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 		// another node.
 		sqlDB.Exec(t, `UPDATE system.jobs SET claim_session_id = NULL WHERE id = $1`, jobID)
 
-		timeout := 5 * time.Second
+		timeout := (5 * time.Second) + changefeedbase.Quantize.Get(&s.Server.ClusterSettings().SV)
+
 		if util.RaceEnabled {
-			timeout = 30 * time.Second
+			// Timeout should be at least 30s to allow for race conditions.
+			timeout += 25 * time.Second
 		}
 		// Expect that the distflow fails since it can't
 		// update the checkpoint.
@@ -6561,7 +6576,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 
 	sqlDB.ExpectErrWithTimeout(
-		t, `request timestamp .* too far in future`,
+		t, `timestamp '.*' is in the future`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH cursor=$1`, timeutil.Now().Add(time.Hour),
 	)
 
@@ -7975,7 +7990,7 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 
 		// Even though checkpointing was disabled, when we drain, an attempt is
 		// made to persist up-to-date checkpoint.
-		require.NoError(t, jf.TickHighWaterMark(beforeInsert))
+		require.NoError(t, jf.WaitForHighWaterMark(beforeInsert))
 
 		// Let the retry proceed.
 		ctx, cancel = context.WithTimeout(context.Background(), time.Second*60)
@@ -11154,21 +11169,21 @@ func TestChangefeedHeadersJSONVals(t *testing.T) {
 		expected       cdctest.Headers
 		warn           string
 	}{
-		// {
-		// 	name:           "empty",
-		// 	headersJSONStr: `'{}'`,
-		// 	expected:       cdctest.Headers{},
-		// },
-		// {
-		// 	name:           "flat primitives - happy path",
-		// 	headersJSONStr: `'{"a": "b", "c": "d", "e": 42, "f": false}'`,
-		// 	expected: cdctest.Headers{
-		// 		{K: "a", V: []byte("b")},
-		// 		{K: "c", V: []byte("d")},
-		// 		{K: "e", V: []byte("42")},
-		// 		{K: "f", V: []byte("false")},
-		// 	},
-		// },
+		{
+			name:           "empty",
+			headersJSONStr: `'{}'`,
+			expected:       cdctest.Headers{},
+		},
+		{
+			name:           "flat primitives - happy path",
+			headersJSONStr: `'{"a": "b", "c": "d", "e": 42, "f": false}'`,
+			expected: cdctest.Headers{
+				{K: "a", V: []byte("b")},
+				{K: "c", V: []byte("d")},
+				{K: "e", V: []byte("42")},
+				{K: "f", V: []byte("false")},
+			},
+		},
 		{
 			name:           "some bad some good",
 			headersJSONStr: `'{"a": "b", "c": 1, "d": true, "e": null, "f": [1, 2, 3], "g": {"h": "i"}}'`,
@@ -11544,4 +11559,77 @@ func TestChangefeedAsSelectForEmptyTable(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
+}
+
+func TestChangefeedMVCCTimestampWithQueries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (key INT PRIMARY KEY);`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1);`)
+
+		feed, err := f.Feed(`CREATE CHANGEFEED WITH mvcc_timestamp, format=json, envelope=bare AS SELECT * FROM foo`)
+		require.NoError(t, err)
+		defer closeFeed(t, feed)
+
+		msgs, err := readNextMessages(ctx, feed, 1)
+		require.NoError(t, err)
+
+		var m map[string]any
+		require.NoError(t, gojson.Unmarshal(msgs[0].Value, &m))
+		ts := m["__crdb__"].(map[string]any)["mvcc_timestamp"].(string)
+		assertReasonableMVCCTimestamp(t, ts)
+	}
+
+	cdcTest(t, testFn)
+}
+
+func TestCloudstorageParallelCompression(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test only provides value under race, as it's explicitly testing for
+	// data races between feeds.
+	skip.UnlessUnderRace(t)
+
+	const numFeedsEach = 10
+
+	testutils.RunValues(t, "compression", []string{"zstd", "gzip"}, func(t *testing.T, compression string) {
+		s, cleanup := makeServer(t)
+		defer cleanup()
+
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT);`)
+		sqlDB.Exec(t, `INSERT INTO foo (a) SELECT * FROM generate_series(1, 5000);`)
+
+		t.Logf("inserted into table")
+
+		var jobIDs []int
+		for i := range numFeedsEach {
+			var jobID int
+			sqlDB.QueryRow(t, fmt.Sprintf(`CREATE CHANGEFEED FOR foo INTO 'nodelocal://1/%d-testout' WITH compression='%s', initial_scan='only', format='parquet';`, i, compression)).Scan(&jobID)
+			jobIDs = append(jobIDs, jobID)
+		}
+
+		t.Logf("created changefeeds")
+
+		const duration = 3 * time.Minute
+		const checkStatusInterval = 10 * time.Second
+
+		for start := timeutil.Now(); timeutil.Since(start) < duration; {
+			// Check the statuses of the jobs.
+			for _, jobID := range jobIDs {
+				var status string
+				sqlDB.QueryRow(t, `SELECT status FROM [SHOW JOBS] WHERE job_id = $1`, jobID).Scan(&status)
+				if status != "succeeded" && status != "running" {
+					t.Fatalf("job %d entered unknown state: %s", jobID, status)
+				}
+			}
+			time.Sleep(checkStatusInterval)
+		}
+	})
 }

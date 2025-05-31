@@ -14,9 +14,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/memstore"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/quantize"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/vecdist"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/vector"
+	"github.com/cockroachdb/cockroach/pkg/workload/vecann"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/errors/oserror"
 )
@@ -36,8 +38,9 @@ func (s *MemSearchState) Close() {
 // MemProvider implements VectorProvider using an in-memory store.
 type MemProvider struct {
 	stopper          *stop.Stopper
-	indexFileName    string
+	datasetName      string
 	dims             int
+	distanceMetric   vecdist.Metric
 	options          cspann.IndexOptions
 	store            *memstore.Store
 	index            *cspann.Index
@@ -47,14 +50,18 @@ type MemProvider struct {
 // NewMemProvider creates a new MemProvider that maintains an in-memory, indexed
 // dataset of vectors.
 func NewMemProvider(
-	stopper *stop.Stopper, datasetName string, dims int, options cspann.IndexOptions,
+	stopper *stop.Stopper,
+	datasetName string,
+	dims int,
+	distanceMetric vecdist.Metric,
+	options cspann.IndexOptions,
 ) *MemProvider {
-	indexFileName := fmt.Sprintf("%s/%s.idx", tempDir, datasetName)
 	return &MemProvider{
-		stopper:       stopper,
-		indexFileName: indexFileName,
-		dims:          dims,
-		options:       options,
+		stopper:        stopper,
+		datasetName:    datasetName,
+		dims:           dims,
+		distanceMetric: distanceMetric,
+		options:        options,
 	}
 }
 
@@ -71,7 +78,11 @@ func (m *MemProvider) Close() {
 // Load implements the VectorProvider interface.
 func (m *MemProvider) Load(ctx context.Context) (bool, error) {
 	// If no index file exists, return false.
-	_, err := os.Stat(m.indexFileName)
+	indexFileName, err := m.ensureIndexCache()
+	if err != nil {
+		return false, err
+	}
+	_, err = os.Stat(indexFileName)
 	if err != nil {
 		if oserror.IsNotExist(err) {
 			return false, nil
@@ -83,7 +94,7 @@ func (m *MemProvider) Load(ctx context.Context) (bool, error) {
 	m.Close()
 
 	// Load vectors from the index file.
-	m.store, err = loadMemStore(m.indexFileName)
+	m.store, err = loadMemStore(indexFileName)
 	if err != nil {
 		return false, err
 	}
@@ -105,7 +116,11 @@ func (m *MemProvider) New(ctx context.Context) error {
 	m.Close()
 
 	// Remove persisted index, if it exists.
-	err := os.Remove(m.indexFileName)
+	indexFileName, err := m.ensureIndexCache()
+	if err != nil {
+		return err
+	}
+	err = os.Remove(indexFileName)
 	if err != nil {
 		if !oserror.IsNotExist(err) {
 			return err
@@ -188,7 +203,12 @@ func (m *MemProvider) Save(ctx context.Context) error {
 		return err
 	}
 
-	indexFile, err := os.Create(m.indexFileName)
+	// Remove persisted index, if it exists.
+	indexFileName, err := m.ensureIndexCache()
+	if err != nil {
+		return err
+	}
+	indexFile, err := os.Create(indexFileName)
 	if err != nil {
 		return err
 	}
@@ -242,7 +262,7 @@ func (m *MemProvider) ensureIndex(ctx context.Context) error {
 		return nil
 	}
 
-	quantizer := quantize.NewRaBitQuantizer(m.dims, seed)
+	quantizer := quantize.NewRaBitQuantizer(m.dims, seed, m.distanceMetric)
 	if m.store == nil {
 		// Construct empty store if one doesn't yet exist.
 		m.store = memstore.New(quantizer, seed)
@@ -254,6 +274,16 @@ func (m *MemProvider) ensureIndex(ctx context.Context) error {
 		m.successfulSplits.Add(1)
 	})
 	return err
+}
+
+// ensureIndexCache ensures that the folder that contains the cached index file
+// has been created. It returns the name of the cached index file.
+func (m *MemProvider) ensureIndexCache() (string, error) {
+	cacheFolder, err := vecann.EnsureCacheFolder("")
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s/%s.idx", cacheFolder, m.datasetName), nil
 }
 
 // loadMemStore loads a previously saved in-memory store from disk.

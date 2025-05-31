@@ -25,11 +25,14 @@ That code uses the family ID to check that it doesn't split column families for
 the same row across ranges.
 
 Metadata KV Key:
-  Metadata keys always sort before vector keys, since Family ID 0 always
-  sorts before Level, which is >= 1.
-  ┌────────────┬──────────────┬────────────┬───────────┐
-  │Index Prefix│Prefix Columns│PartitionKey│Family ID 0│
-  └────────────┴──────────────┴────────────┴───────────┘
+  Metadata keys always sort before vector keys, since Level 0 is InvalidLevel,
+  and vector keys always have Level >= 1. Also, using Level=0 prevents the
+  metadata key from ever being a prefix of vector keys. The KV split logic does
+  not support one KV key being a prefix of another KV key (after chopping the
+  family ID, which it also does).
+  ┌────────────┬──────────────┬────────────┬───────┬───────────┐
+  │Index Prefix│Prefix Columns│PartitionKey│Level 0│Family ID 0│
+  └────────────┴──────────────┴────────────┴───────┴───────────┘
 Metadata KV Value:
   ┌─────┬─────┬───────┬───────┬──────┬─────────┬────────┐
   │Level│State│Target1│Target2│Source|Timestamp│Centroid|
@@ -58,40 +61,45 @@ func EncodeMetadataKey(
 	keyBuffer = append(keyBuffer, indexPrefix...)
 	keyBuffer = append(keyBuffer, encodedPrefixCols...)
 	keyBuffer = EncodePartitionKey(keyBuffer, partitionKey)
+	keyBuffer = EncodePartitionLevel(keyBuffer, cspann.InvalidLevel)
 	return keys.MakeFamilyKey(keyBuffer, 0)
 }
 
 // EncodeStartVectorKey constructs the KV key that precedes all the KV keys for
 // vector data records in the partition.
 func EncodeStartVectorKey(metadataKey roachpb.Key) roachpb.Key {
-	// The last byte of the metadata key is the Family ID field (always 0). Vector
-	// keys have a Level field instead. Since level values are always > 0,
-	// increment the last byte to get the starting value.
-	keyBuffer := slices.Clone(metadataKey)
-	keyBuffer[len(keyBuffer)-1]++
+	// The last two bytes of the metadata key are the Level (always 0) and the
+	// Family ID (always 0). Chop the Family ID value and increment the Level in
+	// order to get the start key.
+	n := len(metadataKey) - 1
+	keyBuffer := make(roachpb.Key, n)
+	copy(keyBuffer, metadataKey[:n])
+	keyBuffer[n-1]++
 	return keyBuffer
 }
 
 // EncodeEndVectorKey constructs the KV key that succeeds all the KV keys for
 // vector data records in the partition.
 func EncodeEndVectorKey(metadataKey roachpb.Key) roachpb.Key {
-	// Chop the last byte, which is the family ID.
-	n := len(metadataKey) - 1
+	// Chop the last two bytes, which are the Level (always 0) and the Family ID
+	// (always 0).
+	n := len(metadataKey) - 2
 	return metadataKey[:n:n].PrefixEnd()
 }
 
 // EncodePrefixVectorKey constructs the prefix that is shared by all KV keys for
 // vector data records in the partition.
 func EncodePrefixVectorKey(metadataKey roachpb.Key, level cspann.Level) roachpb.Key {
-	// Chop the last byte, which is the family ID.
-	n := len(metadataKey) - 1
+	// Chop the last two bytes, which are the Level (always 0) and the Family ID
+	// (always 0).
+	n := len(metadataKey) - 2
 	return EncodePartitionLevel(metadataKey[:n:n], level)
 }
 
 // EncodedPrefixVectorKeyLen returns the number of bytes needed to encode the
 // prefix for vector data records in the partition.
 func EncodedPrefixVectorKeyLen(metadataKey roachpb.Key, level cspann.Level) int {
-	return len(metadataKey) - 1 + EncodedPartitionLevelLen(level)
+	return len(metadataKey) - 2 + EncodedPartitionLevelLen(level)
 }
 
 // DecodedVectorKey is a deconstructed key value, as described above, minus the
@@ -205,12 +213,13 @@ func EncodeRaBitQVector(
 	return appendTo
 }
 
-// EncodeUnquantizerVector encodes an Unquantizer vector and centroid distance
-// into the given byte slice.
-func EncodeUnquantizerVector(
-	appendTo []byte, centroidDistance float32, v vector.T,
-) ([]byte, error) {
-	appendTo = encoding.EncodeUntaggedFloat32Value(appendTo, centroidDistance)
+// EncodeUnquantizerVector encodes an Unquantizer vector into the given byte
+// slice.
+func EncodeUnquantizerVector(appendTo []byte, v vector.T) ([]byte, error) {
+	// For backwards compatibility, encode a zero float32. Previously, the
+	// distance of the vector to the centroid was encoded, but that is no longer
+	// necessary.
+	appendTo = encoding.EncodeUntaggedFloat32Value(appendTo, 0)
 	return vector.Encode(appendTo, v)
 }
 
@@ -241,7 +250,7 @@ func EncodedPartitionLevelLen(level cspann.Level) int {
 // slice is expected to be the prefix shared between all KV entries for a
 // partition.
 func EncodeChildKey(appendTo []byte, key cspann.ChildKey) []byte {
-	if key.KeyBytes != nil {
+	if key.IsPrimaryIndexBytes() {
 		// The primary key is already in encoded form. That encoded form always
 		// already contains the final family ID 0 value.
 		return append(appendTo, key.KeyBytes...)
@@ -313,9 +322,11 @@ func DecodeRaBitQVectorToSet(
 	if err != nil {
 		return nil, err
 	}
+	// TODO(andyk): Also decode CentroidDotProducts once we support other distance
+	// metrics.
 	vectorSet.CodeCounts = append(vectorSet.CodeCounts, codeCount)
 	vectorSet.CentroidDistances = append(vectorSet.CentroidDistances, centroidDistance)
-	vectorSet.DotProducts = append(vectorSet.DotProducts, dotProduct)
+	vectorSet.QuantizedDotProducts = append(vectorSet.QuantizedDotProducts, dotProduct)
 	vectorSet.Codes.Data = slices.Grow(vectorSet.Codes.Data, vectorSet.Codes.Width)
 	for range vectorSet.Codes.Width {
 		var codeWord uint64
@@ -336,15 +347,13 @@ func DecodeRaBitQVectorToSet(
 func DecodeUnquantizerVectorToSet(
 	encVector []byte, vectorSet *quantize.UnQuantizedVectorSet,
 ) ([]byte, error) {
-	encVector, centroidDistance, err := encoding.DecodeUntaggedFloat32Value(encVector)
-	if err != nil {
-		return nil, err
-	}
+	// Skip past the centroid distance, which was encoded as a 4-byte float32
+	// value in a previous version.
+	encVector = encVector[4:]
 	encVector, v, err := vector.Decode(encVector)
 	if err != nil {
 		return nil, err
 	}
-	vectorSet.CentroidDistances = append(vectorSet.CentroidDistances, centroidDistance)
 	vectorSet.Vectors.Add(v)
 	return encVector, nil
 }

@@ -771,7 +771,8 @@ func (b *Builder) buildScan(
 	}
 
 	// Apply any filters required to enforce RLS policies. This must be done
-	// after projecting out virtual columns, in case any policies reference them.
+	// after adding projections for virtual columns, in case any policies
+	// reference them.
 	b.addRowLevelSecurityFilter(tabMeta, outScope, policyCommandScope)
 
 	if b.trackSchemaDeps {
@@ -1221,7 +1222,7 @@ func (b *Builder) buildSelectClause(
 	fromScope := b.buildFrom(sel.From, lockCtx, inScope)
 
 	b.processWindowDefs(sel, fromScope)
-	b.buildWhere(sel.Where, fromScope)
+	b.buildWhere(sel.Where, fromScope, nil /* colRefs */)
 
 	projectionsScope := fromScope.replace()
 
@@ -1249,7 +1250,7 @@ func (b *Builder) buildSelectClause(
 		having = b.buildHaving(havingExpr, fromScope)
 	}
 
-	b.buildProjectionList(fromScope, projectionsScope)
+	b.buildProjectionList(fromScope, projectionsScope, nil /* colRefs */)
 	b.buildOrderBy(fromScope, projectionsScope, orderByScope)
 	b.buildDistinctOnArgs(fromScope, projectionsScope, distinctOnScope)
 	b.buildLockArgs(fromScope, projectionsScope, lockScope)
@@ -1334,9 +1335,13 @@ func (b *Builder) processWindowDefs(sel *tree.SelectClause, fromScope *scope) {
 
 // buildWhere builds a set of memo groups that represent the given WHERE clause.
 //
+// colRefs is an optional output parameter that, if provided, is populated
+// with the columns referenced in the WHERE clause expression. Pass nil if the
+// referenced columns are not needed.
+//
 // See Builder.buildStmt for a description of the remaining input and return
 // values.
-func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
+func (b *Builder) buildWhere(where *tree.Where, inScope *scope, colRefs *opt.ColSet) {
 	if where == nil {
 		return
 	}
@@ -1347,6 +1352,7 @@ func (b *Builder) buildWhere(where *tree.Where, inScope *scope) {
 		exprKindWhere,
 		tree.RejectGenerators|tree.RejectWindowApplications|tree.RejectProcedures,
 		inScope,
+		colRefs,
 	)
 
 	// Wrap the filter in a FiltersOp.

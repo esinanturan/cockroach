@@ -507,7 +507,7 @@ func (s *Store) processRaftSnapshotRequest(
 		typ := removePlaceholderFailed
 		defer func() {
 			// In the typical case, handleRaftReadyRaftMuLocked calls through to
-			// applySnapshot which will apply the snapshot and also converts the
+			// applySnapshotRaftMuLocked which will apply the snapshot and also converts the
 			// placeholder entry (if any) to the now-initialized replica. However we
 			// may also error out below, or raft may also ignore the snapshot, and so
 			// the placeholder would remain.
@@ -641,7 +641,7 @@ func (s *Store) HandleRaftResponse(
 
 				repl.mu.Unlock()
 				nextReplicaID := tErr.ReplicaID + 1
-				return s.removeReplicaRaftMuLocked(ctx, repl, nextReplicaID, RemoveOptions{
+				return s.removeReplicaRaftMuLocked(ctx, repl, nextReplicaID, "received ReplicaTooOldError", RemoveOptions{
 					DestroyData: true,
 				})
 			case *kvpb.RaftGroupDeletedError:

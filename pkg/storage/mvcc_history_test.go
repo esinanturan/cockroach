@@ -92,7 +92,6 @@ var (
 // del_range_ts   [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [maxLockConflicts=<int>] [targetLockConflictBytes=<int>] k=<key> end=<key> [idempotent] [noCoveredStats]
 // del_range_pred [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [maxLockConflicts=<int>] [targetLockConflictBytes=<int>] k=<key> end=<key> [startTime=<int>,max=<int>,maxBytes=<int>,rangeThreshold=<int>]
 // increment      [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] [ambiguousReplay] [maxLockConflicts=<int>] [targetLockConflictBytes=<int>] k=<key> [inc=<val>]
-// initput        [t=<name>] [ts=<int>[,<int>]] [resolve [status=<txnstatus>]] [ambiguousReplay] [maxLockConflicts=<int>] k=<key> v=<string> [raw] [failOnTombstones]
 // put            [t=<name>] [ts=<int>[,<int>]] [localTs=<int>[,<int>]] [resolve [status=<txnstatus>]] [ambiguousReplay] [maxLockConflicts=<int>] k=<key> v=<string> [raw]
 // put_rangekey   ts=<int>[,<int>] [localTs=<int>[,<int>]] k=<key> end=<key> [syntheticBit]
 // put_blind_inline	k=<key> v=<string> [prev=<string>]
@@ -318,7 +317,7 @@ func TestMVCCHistories(t *testing.T) {
 
 		e := newEvalCtx(ctx, engine)
 		defer func() {
-			require.NoError(t, engine.Compact())
+			require.NoError(t, engine.Compact(ctx))
 			m := engine.GetMetrics().Metrics
 			if m.Keys.MissizedTombstonesCount > 0 {
 				// A missized tombstone is a Pebble DELSIZED tombstone that encodes
@@ -752,7 +751,6 @@ var commands = map[string]cmd{
 	"gc_clear_range":        {typDataUpdate, cmdGCClearRange},
 	"gc_points_clear_range": {typDataUpdate, cmdGCPointsClearRange},
 	"increment":             {typDataUpdate, cmdIncrement},
-	"initput":               {typDataUpdate, cmdInitPut},
 	"merge":                 {typDataUpdate, cmdMerge},
 	"put":                   {typDataUpdate, cmdPut},
 	"put_blind_inline":      {typDataUpdate, cmdPutBlindInline},
@@ -1215,9 +1213,9 @@ func cmdCPut(e *evalCtx) error {
 				Stats:                          e.ms,
 				ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 				MaxLockConflicts:               e.getMaxLockConflicts(),
-				OriginTimestamp:                originTimestamp,
 			},
 			AllowIfDoesNotExist: behavior,
+			OriginTimestamp:     originTimestamp,
 		}
 		acq, err := storage.MVCCConditionalPut(e.ctx, rw, key, ts, val, expVal, opts)
 		if err != nil {
@@ -1233,58 +1231,12 @@ func cmdCPut(e *evalCtx) error {
 	})
 }
 
-func cmdInitPut(e *evalCtx) error {
-	txn := e.getTxn(optional)
-	ts := e.getTs(txn)
-	localTs := hlc.ClockTimestamp(e.getTsWithName("localTs"))
-
-	key := e.getKey()
-	val := e.getVal()
-	failOnTombstones := e.hasArg("failOnTombstones")
-
-	originTimestamp := hlc.Timestamp{}
-	if e.hasArg("origin_ts") {
-		originTimestamp = e.getTsWithName("origin_ts")
-	}
-
-	resolve, resolveStatus := e.getResolve()
-
-	return e.withWriter("initput", func(rw storage.ReadWriter) error {
-		opts := storage.MVCCWriteOptions{
-			Txn:                            txn,
-			LocalTimestamp:                 localTs,
-			Stats:                          e.ms,
-			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
-			MaxLockConflicts:               e.getMaxLockConflicts(),
-			OriginTimestamp:                originTimestamp,
-		}
-		acq, err := storage.MVCCInitPut(e.ctx, rw, key, ts, val, failOnTombstones, opts)
-		if err != nil {
-			return err
-		}
-		if !acq.Empty() {
-			e.results.buf.Printf("initput: lock acquisition = %v\n", acq)
-		}
-		if resolve {
-			return e.resolveIntent(rw, key, txn, resolveStatus, hlc.ClockTimestamp{}, 0)
-		}
-		return nil
-	})
-}
-
 func cmdDelete(e *evalCtx) error {
 	txn := e.getTxn(optional)
 	key := e.getKey()
 	ts := e.getTs(txn)
 	localTs := hlc.ClockTimestamp(e.getTsWithName("localTs"))
-
-	originTimestamp := hlc.Timestamp{}
-	if e.hasArg("origin_ts") {
-		originTimestamp = e.getTsWithName("origin_ts")
-	}
-
 	resolve, resolveStatus := e.getResolve()
-
 	return e.withWriter("del", func(rw storage.ReadWriter) error {
 		opts := storage.MVCCWriteOptions{
 			Txn:                            txn,
@@ -1292,7 +1244,6 @@ func cmdDelete(e *evalCtx) error {
 			Stats:                          e.ms,
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
-			OriginTimestamp:                originTimestamp,
 		}
 		foundKey, acq, err := storage.MVCCDelete(e.ctx, rw, key, ts, opts)
 		if err == nil || errors.HasType(err, &kvpb.WriteTooOldError{}) {
@@ -1324,11 +1275,6 @@ func cmdDeleteRange(e *evalCtx) error {
 		e.scanArg("max", &max)
 	}
 
-	originTimestamp := hlc.Timestamp{}
-	if e.hasArg("origin_ts") {
-		originTimestamp = e.getTsWithName("origin_ts")
-	}
-
 	resolve, resolveStatus := e.getResolve()
 	return e.withWriter("del_range", func(rw storage.ReadWriter) error {
 		opts := storage.MVCCWriteOptions{
@@ -1337,7 +1283,6 @@ func cmdDeleteRange(e *evalCtx) error {
 			Stats:                          e.ms,
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
-			OriginTimestamp:                originTimestamp,
 		}
 		deleted, resumeSpan, num, acqs, err := storage.MVCCDeleteRange(
 			e.ctx, rw, key, endKey, int64(max), ts, opts, returnKeys)
@@ -1502,11 +1447,6 @@ func cmdIncrement(e *evalCtx) error {
 		inc = int64(incI)
 	}
 
-	originTimestamp := hlc.Timestamp{}
-	if e.hasArg("origin_ts") {
-		originTimestamp = e.getTsWithName("origin_ts")
-	}
-
 	resolve, resolveStatus := e.getResolve()
 
 	return e.withWriter("increment", func(rw storage.ReadWriter) error {
@@ -1516,7 +1456,6 @@ func cmdIncrement(e *evalCtx) error {
 			Stats:                          e.ms,
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
-			OriginTimestamp:                originTimestamp,
 		}
 		curVal, acq, err := storage.MVCCIncrement(e.ctx, rw, key, ts, opts, inc)
 		if err != nil {
@@ -1559,11 +1498,6 @@ func cmdPut(e *evalCtx) error {
 		e.scanArg("import_epoch", &importEpoch)
 	}
 
-	originTimestamp := hlc.Timestamp{}
-	if e.hasArg("origin_ts") {
-		originTimestamp = e.getTsWithName("origin_ts")
-	}
-
 	resolve, resolveStatus := e.getResolve()
 
 	return e.withWriter("put", func(rw storage.ReadWriter) error {
@@ -1574,7 +1508,6 @@ func cmdPut(e *evalCtx) error {
 			Stats:                          e.ms,
 			ReplayWriteTimestampProtection: e.getAmbiguousReplay(),
 			MaxLockConflicts:               e.getMaxLockConflicts(),
-			OriginTimestamp:                originTimestamp,
 		}
 		acq, err := storage.MVCCPut(e.ctx, rw, key, ts, val, opts)
 		if err != nil {

@@ -77,6 +77,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
@@ -1169,7 +1170,8 @@ func (n *Node) startPeriodicLivenessCompaction(
 								}.Encode()
 
 							timeBeforeCompaction := timeutil.Now()
-							if err := store.StateEngine().CompactRange(startEngineKey, endEngineKey); err != nil {
+							if err := store.StateEngine().CompactRange(
+								context.Background(), startEngineKey, endEngineKey); err != nil {
 								log.Errorf(ctx, "failed compacting liveness replica: %+v with error: %s", repl, err)
 							}
 
@@ -1194,7 +1196,7 @@ func (n *Node) startPeriodicLivenessCompaction(
 
 // updateNodeRangeCount updates the internal counter of the total ranges across
 // all stores. This value is used to make a decision on whether the node should
-// use expiration leases (see Replica.shouldUseExpirationLeaseRLocked).
+// use expiration leases (see Replica.shouldUseExpirationLease).
 func (n *Node) updateNodeRangeCount() {
 	var count int64
 	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
@@ -1513,7 +1515,7 @@ func (n *Node) writeNodeStatus(ctx context.Context, mustExist bool) error {
 			}
 			if numNodes > 1 {
 				// Avoid this warning on single-node clusters, which require special UX.
-				log.Warningf(ctx, "health alerts detected: %+v", result)
+				log.Warningf(ctx, "health alerts detected: %s", result)
 			}
 			if err := n.storeCfg.Gossip.AddInfoProto(
 				gossip.MakeNodeHealthAlertKey(n.Descriptor.NodeID), &result, 2*base.DefaultMetricsSampleInterval, /* ttl */
@@ -2107,8 +2109,26 @@ type lockedMuxStream struct {
 func (s *lockedMuxStream) SendIsThreadSafe() {}
 
 func (s *lockedMuxStream) Send(e *kvpb.MuxRangeFeedEvent) error {
+	// The threshold of 10s was borrowed from `slowDistSenderReplicaThreshold`
+	// in `dist_sender`, where it was deemed to be a reasonable latency
+	// threshold for an RPC to a single replica (as is the case here).
+	const slowMuxStreamSendThreshold = 10 * time.Second
+
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+
+	// Our intent is to provide observability into a slow client from the server node.
+	// So, we don't include the lock acquisition time, as it is confounded by other
+	// factors, e.g., the number of rangefeeds contending for the lockedMuxStream.
+	start := crtime.NowMono()
+	defer func() {
+		if dur := start.Elapsed(); dur > slowMuxStreamSendThreshold {
+			log.Infof(s.wrapped.Context(),
+				"slow send on stream %d for r%d took %s",
+				e.StreamID, e.RangeID, dur)
+		}
+	}()
+
 	return s.wrapped.Send(e)
 }
 
