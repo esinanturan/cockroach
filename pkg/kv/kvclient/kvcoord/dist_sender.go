@@ -24,7 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/multitenant"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util"
@@ -145,12 +145,18 @@ var (
 		Help:        "Number of replica-addressed RPCs sent due to per-replica errors",
 		Measurement: "RPCs",
 		Unit:        metric.Unit_COUNT,
+		Essential:   true,
+		Category:    metric.Metadata_DISTRIBUTED,
+		HowToUse:    `RPC errors do not necessarily indicate a problem. This metric tracks remote procedure calls that return a status value other than "success". A non-success status of an RPC should not be misconstrued as a network transport issue. It is database code logic executed on another cluster node. The non-success status is a result of an orderly execution of an RPC that reports a specific logical condition.`,
 	}
 	metaDistSenderNotLeaseHolderErrCount = metric.Metadata{
 		Name:        "distsender.errors.notleaseholder",
 		Help:        "Number of NotLeaseHolderErrors encountered from replica-addressed RPCs",
 		Measurement: "Errors",
 		Unit:        metric.Unit_COUNT,
+		Essential:   true,
+		Category:    metric.Metadata_DISTRIBUTED,
+		HowToUse:    `Errors of this type are normal during elastic cluster topology changes when leaseholders are actively rebalancing. They are automatically retried. However they may create occasional response time spikes. In that case, this metric may provide the explanation of the cause.`,
 	}
 	metaDistSenderInLeaseTransferBackoffsCount = metric.Metadata{
 		Name:        "distsender.errors.inleasetransferbackoffs",
@@ -1348,7 +1354,7 @@ func (ds *DistSender) sendProxyRequest(
 
 	// Use the same connection class as we normally use for this request.
 	opts := SendOptions{
-		class:   rpc.ConnectionClassForKey(ba.ProxyRangeInfo.Desc.RSpan().Key, ba.ConnectionClass),
+		class:   rpcbase.ConnectionClassForKey(ba.ProxyRangeInfo.Desc.RSpan().Key, ba.ConnectionClass),
 		metrics: &ds.metrics,
 	}
 
@@ -1682,9 +1688,19 @@ func maybeSwapErrorIndex(pErr *kvpb.Error, a, b int) {
 }
 
 // mergeErrors merges the two errors, combining their transaction state and
-// returning the error with the highest priority.
+// returning the error with the highest priority. If errors have the same
+// priority, the error with the lowest request index is preferred. This allows
+// a caller issuing multiple cputs to control which ConditionFailedError is
+// returned. Specifically, it allows returning a primary key cput failure
+// instead of a unique index conflict.
 func mergeErrors(pErr1, pErr2 *kvpb.Error) *kvpb.Error {
 	ret, drop := pErr1, pErr2
+
+	hasIndex := ret.Index != nil && drop.Index != nil
+	if hasIndex && drop.Index.Index < ret.Index.Index {
+		ret, drop = drop, ret
+	}
+
 	if kvpb.ErrPriority(drop.GoError()) > kvpb.ErrPriority(ret.GoError()) {
 		ret, drop = drop, ret
 	}
@@ -2599,7 +2615,7 @@ func (ds *DistSender) sendToReplicas(
 	// DEFAULT if the class is unknown, to handle mixed-version states gracefully.
 	// Other kinds of overrides are possible, see rpc.ConnectionClassForKey().
 	opts := SendOptions{
-		class:                  rpc.ConnectionClassForKey(desc.RSpan().Key, ba.ConnectionClass),
+		class:                  rpcbase.ConnectionClassForKey(desc.RSpan().Key, ba.ConnectionClass),
 		metrics:                &ds.metrics,
 		dontConsiderConnHealth: ds.dontConsiderConnHealth,
 	}
@@ -3121,7 +3137,7 @@ func (ds *DistSender) sendToReplicas(
 			if ambiguousError != nil {
 				err = kvpb.NewAmbiguousResultError(errors.Wrapf(ambiguousError, "context done during DistSender.Send"))
 			} else {
-				err = errors.Wrap(ctx.Err(), "aborted during DistSender.Send")
+				err = ctx.Err()
 			}
 			log.Eventf(ctx, "%v", err)
 			return nil, err

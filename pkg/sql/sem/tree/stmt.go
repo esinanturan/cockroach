@@ -209,18 +209,6 @@ func ReturnsAtMostOneRow(stmt Statement) bool {
 
 }
 
-// UnwrapExplain returns the inner statement if the outer statement is an EXPLAIN
-// or EXPLAIN ANALYZE statement. Otherwise, it just returns the original statemnt.
-func UnwrapExplain(stmt Statement) Statement {
-	switch t := stmt.(type) {
-	case *Explain:
-		return t.Statement
-	case *ExplainAnalyze:
-		return t.Statement
-	}
-	return stmt
-}
-
 // HiddenFromShowQueries is a pseudo-interface to be implemented
 // by statements that should not show up in SHOW QUERIES (and are hence
 // not cancellable using CANCEL QUERIES either). Usually implemented by
@@ -1785,6 +1773,15 @@ func (*ShowCreateAllTypes) StatementType() StatementType { return TypeDML }
 func (*ShowCreateAllTypes) StatementTag() string { return "SHOW CREATE ALL TYPES" }
 
 // StatementReturnType implements the Statement interface.
+func (*ShowCreateAllRoutines) StatementReturnType() StatementReturnType { return Rows }
+
+// StatementType implements the Statement interface.
+func (*ShowCreateAllRoutines) StatementType() StatementType { return TypeDML }
+
+// StatementTag returns a short string identifying the type of statement.
+func (*ShowCreateAllRoutines) StatementTag() string { return "SHOW CREATE ALL ROUTINES" }
+
+// StatementReturnType implements the Statement interface.
 func (*ShowCreateSchedules) StatementReturnType() StatementReturnType { return Rows }
 
 // StatementType implements the Statement interface.
@@ -2628,6 +2625,7 @@ func (n *ShowCreate) String() string                          { return AsString(
 func (n *ShowCreateAllSchemas) String() string                { return AsString(n) }
 func (n *ShowCreateAllTables) String() string                 { return AsString(n) }
 func (n *ShowCreateAllTypes) String() string                  { return AsString(n) }
+func (n *ShowCreateAllRoutines) String() string               { return AsString(n) }
 func (n *ShowCreateSchedules) String() string                 { return AsString(n) }
 func (n *ShowDatabases) String() string                       { return AsString(n) }
 func (n *ShowDatabaseIndexes) String() string                 { return AsString(n) }

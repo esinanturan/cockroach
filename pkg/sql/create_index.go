@@ -61,7 +61,9 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 
 	// Check if sql_safe_updates is enabled and this is a vector index
 	if n.Type == idxtype.VECTOR {
-		if p.EvalContext().SessionData().SafeUpdates {
+		if !p.EvalContext().Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V25_2.Version()) {
+			return nil, pgerror.Newf(pgcode.FeatureNotSupported, "cannot create a vector index until finalizing on 25.2")
+		} else if p.EvalContext().SessionData().SafeUpdates {
 			return nil, pgerror.DangerousStatementf("CREATE VECTOR INDEX will disable writes to the table while the index is being built")
 		} else {
 			p.BufferClientNotice(ctx, pgnotice.Newf("CREATE VECTOR INDEX will disable writes to the table while the index is being built"))
@@ -101,7 +103,7 @@ func (p *planner) CreateIndex(ctx context.Context, n *tree.CreateIndex) (planNod
 	}
 
 	// Disallow schema changes if this table's schema is locked.
-	if err := checkSchemaChangeIsAllowed(tableDesc, n, p.ExecCfg().Settings); err != nil {
+	if err := p.checkSchemaChangeIsAllowed(ctx, tableDesc, n); err != nil {
 		return nil, err
 	}
 
@@ -256,22 +258,15 @@ func makeIndexDescriptor(
 		}
 
 		vecCol := columns[len(columns)-1]
-		switch vecCol.OpClass {
-		case "vector_l2_ops", "":
-			// vector_l2_ops is the default operator class. This allows users to omit
-			// the operator class in index definitions.
-		case "vector_l1_ops", "vector_ip_ops", "vector_cosine_ops",
-			"bit_hamming_ops", "bit_jaccard_ops":
-			return nil, unimplemented.NewWithIssuef(144016,
-				"operator class %v is not supported", vecCol.OpClass)
-		default:
-			return nil, newUndefinedOpclassError(vecCol.OpClass)
-		}
 		column, err := catalog.MustFindColumnByTreeName(tableDesc, vecCol.Column)
 		if err != nil {
 			return nil, err
 		}
-		indexDesc.VecConfig = vecindex.MakeVecConfig(params.EvalContext(), column.GetType())
+		indexDesc.VecConfig, err = vecindex.MakeVecConfig(
+			params.ctx, params.EvalContext(), column.GetType(), vecCol.OpClass)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if n.Sharded != nil {

@@ -17,6 +17,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/errors"
 )
 
@@ -458,7 +459,7 @@ func (c *CustomFuncs) OrderingBySingleColAsc(ordering props.OrderingChoice, col 
 //  1. A vector-search operator which produces candidate PKs.
 //  2. A lookup-join to retrieve the vector column and any other needed columns.
 //  3. A projection of the distance between the vector column and query vector.
-//  3. A top-k operator to perform re-ranking.
+//  4. A top-k operator to perform re-ranking.
 //
 // Note that TryGenerateVectorSearch does not handle additional filters beyond
 // those used to constrain index prefix columns.
@@ -466,33 +467,62 @@ func (c *CustomFuncs) TryGenerateVectorSearch(
 	grp memo.RelExpr,
 	_ *physical.Required,
 	scanExpr *memo.ScanExpr,
-	filters memo.FiltersExpr,
+	originalFilters memo.FiltersExpr,
 	passthrough opt.ColSet,
 	vectorCol opt.ColumnID,
+	distOp opt.Operator,
 	queryVector opt.ScalarExpr,
 	projections memo.ProjectionsExpr,
 	limit tree.Datum,
 	limitOrd props.OrderingChoice,
 ) {
 	sp := &scanExpr.ScanPrivate
+	tab := c.e.mem.Metadata().TableMeta(sp.Table)
 
 	// Generate implicit filters from constraints and computed columns as
 	// optional filters to help constrain an index scan.
-	optionalFilters := c.checkConstraintFilters(sp.Table)
-	computedColFilters := c.ComputedColFilters(sp, filters, optionalFilters)
-	optionalFilters = append(optionalFilters, computedColFilters...)
+	originalOptionalFilters := c.checkConstraintFilters(sp.Table)
+	computedColFilters := c.ComputedColFilters(sp, originalFilters, originalOptionalFilters)
+	originalOptionalFilters = append(originalOptionalFilters, computedColFilters...)
 
 	var iter scanIndexIter
-	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, sp, filters, rejectNonVectorIndexes)
-	iter.ForEach(func(index cat.Index, _ memo.FiltersExpr, _ opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
+	iter.Init(c.e.evalCtx, c.e, c.e.mem, &c.im, sp, originalFilters, rejectNonVectorIndexes)
+	iter.ForEach(func(index cat.Index, filters memo.FiltersExpr, _ opt.ColSet, _ bool, _ memo.ProjectionsExpr) {
 		if sp.Table.ColumnID(index.VectorColumn().Ordinal()) != vectorCol {
 			// This index is for a different vector column.
 			return
 		}
+
+		var neededOp opt.Operator
+		switch index.VecConfig().DistanceMetric {
+		case vecpb.L2SquaredDistance:
+			neededOp = opt.VectorDistanceOp
+		case vecpb.CosineDistance:
+			neededOp = opt.VectorCosDistanceOp
+		case vecpb.InnerProductDistance:
+			neededOp = opt.VectorNegInnerProductOp
+		}
+		if distOp != neededOp {
+			// Index was built for a different distance metric.
+			return
+		}
+
 		var ok bool
 		var prefixConstraint *constraint.Constraint
 		prefixColumns, notNullCols := idxconstraint.IndexPrefixCols(sp.Table, index)
 		if len(prefixColumns) > 0 {
+			optionalFilters := originalOptionalFilters
+			if predScalar, isPartialIdx := tab.PartialIndexPredicate(index.Ordinal()); isPartialIdx {
+				// Include the partial index predicate in the set of optional filters.
+				pred := *predScalar.(*memo.FiltersExpr)
+				if len(optionalFilters) == 0 {
+					optionalFilters = pred
+				} else {
+					optionalFilters = make(memo.FiltersExpr, 0, len(originalOptionalFilters)+len(pred))
+					optionalFilters = append(optionalFilters, originalOptionalFilters...)
+					optionalFilters = append(optionalFilters, pred...)
+				}
+			}
 			prefixConstraint, filters, ok = idxconstraint.ConstrainIndexPrefixCols(
 				c.e.ctx, c.e.evalCtx, c.e.f, prefixColumns, notNullCols, filters,
 				optionalFilters, sp.Table, index, c.checkCancellation,

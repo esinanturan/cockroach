@@ -2608,7 +2608,6 @@ var builtinOidsArray = []string{
 	2644: `crdb_internal.range_stats_with_errors(key: bytes) -> jsonb`,
 	2645: `crdb_internal.lease_holder_with_errors(key: bytes) -> jsonb`,
 	2646: `crdb_internal.pretty_key(raw_key: bytes) -> string`,
-	2647: `crdb_internal.backup_compaction(collection_uri: string[], full_backup_path: string, encryption_opts: bytes, start_time: decimal, end_time: decimal) -> int`,
 	2648: `array_agg(arg1: jsonpath) -> jsonpath[]`,
 	2649: `array_agg(arg1: jsonpath[]) -> jsonpath[][]`,
 	2650: `percentile_disc_impl(arg1: float, arg2: jsonpath) -> jsonpath`,
@@ -2649,7 +2648,7 @@ var builtinOidsArray = []string{
 	2685: `jsonb_path_query(target: jsonb, path: jsonpath) -> jsonb`,
 	2686: `jsonb_path_query(target: jsonb, path: jsonpath, vars: jsonb) -> jsonb`,
 	2687: `jsonb_path_query(target: jsonb, path: jsonpath, vars: jsonb, silent: bool) -> jsonb`,
-	2688: `crdb_internal.backup_compaction(backup_stmt: string, full_backup_path: string, start_time: decimal, end_time: decimal) -> int`,
+	2688: `crdb_internal.backup_compaction(schedule_id: int, backup_stmt: string, full_backup_path: string, start_time: decimal, end_time: decimal) -> int`,
 	2689: `jsonb_path_exists(target: jsonb, path: jsonpath) -> bool`,
 	2690: `jsonb_path_exists(target: jsonb, path: jsonpath, vars: jsonb) -> bool`,
 	2691: `jsonb_path_exists(target: jsonb, path: jsonpath, vars: jsonb, silent: bool) -> bool`,
@@ -2663,6 +2662,8 @@ var builtinOidsArray = []string{
 	2699: `jsonb_path_match(target: jsonb, path: jsonpath) -> bool`,
 	2700: `jsonb_path_match(target: jsonb, path: jsonpath, vars: jsonb) -> bool`,
 	2701: `jsonb_path_match(target: jsonb, path: jsonpath, vars: jsonb, silent: bool) -> bool`,
+	2702: `crdb_internal.force_retry(val: int) -> int`,
+	2703: `crdb_internal.show_create_all_routines(database_name: string) -> string`,
 }
 
 var builtinOidsBySignature map[string]oid.Oid

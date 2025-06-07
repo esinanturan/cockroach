@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
+	"github.com/cockroachdb/cockroach/pkg/sql/opt/cat"
 	"github.com/cockroachdb/cockroach/pkg/sql/opt/exec/explain"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
 	"github.com/cockroachdb/cockroach/pkg/sql/parser"
@@ -74,6 +75,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
 	"github.com/lib/pq/oid"
 	"go.opentelemetry.io/otel/attribute"
@@ -386,6 +388,14 @@ func (ex *connExecutor) execStmtInOpenState(
 		stmt = makeStatement(parserStmt, queryID, stmtFingerprintFmtMask)
 	}
 
+	if len(stmt.QueryTags) > 0 {
+		tags := &logtags.Buffer{}
+		for _, tag := range stmt.QueryTags {
+			tags = tags.Add("querytag-"+tag.Key, tag.Value)
+		}
+		ctx = logtags.AddTags(ctx, tags)
+	}
+
 	var queryTimeoutTicker *time.Timer
 	var txnTimeoutTicker *time.Timer
 	queryTimedOut := false
@@ -676,6 +686,12 @@ func (ex *connExecutor) execStmtInOpenState(
 	p.semaCtx.Placeholders.Assign(pinfo, stmt.NumPlaceholders)
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 
+	if buildutil.CrdbTestBuild {
+		// Ensure that each statement is formatted regardless of logging
+		// settings.
+		_ = p.FormatAstAsRedactableString(stmt.AST, p.extendedEvalCtx.Annotations)
+	}
+
 	// This flag informs logging decisions.
 	// Some statements are not dispatched to the execution engine and need
 	// some special plan initialization for logging.
@@ -713,7 +729,7 @@ func (ex *connExecutor) execStmtInOpenState(
 		p.maybeLogStatement(
 			ctx,
 			ex.executorType,
-			int(ex.state.mu.autoRetryCounter),
+			int(ex.state.mu.autoRetryCounter)+p.autoRetryStmtCounter,
 			int(ex.extraTxnState.txnCounter.Load()),
 			rowsAffected,
 			ex.state.mu.stmtCount,
@@ -1061,6 +1077,16 @@ func (ex *connExecutor) execStmtInOpenState(
 			// region" error occurs.
 			ex.execRelease(ctx, releaseHomeRegionSavepoint, res)
 		}()
+	}
+
+	if ex.state.mu.autoRetryReason != nil {
+		p.autoRetryCounter = int(ex.state.mu.autoRetryCounter)
+		ex.sessionTracing.TraceRetryInformation(
+			ctx, "transaction", int(ex.state.mu.autoRetryCounter), ex.state.mu.autoRetryReason,
+		)
+		if ex.server.cfg.TestingKnobs.OnTxnRetry != nil {
+			ex.server.cfg.TestingKnobs.OnTxnRetry(ex.state.mu.autoRetryReason, p.EvalContext())
+		}
 	}
 
 	if ex.executorType != executorTypeInternal &&
@@ -1672,6 +1698,12 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 	p.semaCtx.Placeholders.Assign(pinfo, vars.stmt.NumPlaceholders)
 	p.extendedEvalCtx.Placeholders = &p.semaCtx.Placeholders
 
+	if buildutil.CrdbTestBuild {
+		// Ensure that each statement is formatted regardless of logging
+		// settings.
+		_ = p.FormatAstAsRedactableString(vars.stmt.AST, p.extendedEvalCtx.Annotations)
+	}
+
 	// This flag informs logging decisions.
 	// Some statements are not dispatched to the execution engine and need
 	// some special plan initialization for logging.
@@ -1720,7 +1752,7 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 		p.maybeLogStatement(
 			ctx,
 			ex.executorType,
-			int(ex.state.mu.autoRetryCounter),
+			int(ex.state.mu.autoRetryCounter)+p.autoRetryStmtCounter,
 			int(ex.extraTxnState.txnCounter.Load()),
 			rowsAffected,
 			ex.state.mu.stmtCount,
@@ -2103,6 +2135,16 @@ func (ex *connExecutor) execStmtInOpenStateWithPausablePortal(
 			// region" error occurs.
 			ex.execRelease(ctx, releaseHomeRegionSavepoint, res)
 		}()
+	}
+
+	if ex.state.mu.autoRetryReason != nil {
+		p.autoRetryCounter = int(ex.state.mu.autoRetryCounter)
+		ex.sessionTracing.TraceRetryInformation(
+			ctx, "transaction", int(ex.state.mu.autoRetryCounter), ex.state.mu.autoRetryReason,
+		)
+		if ex.server.cfg.TestingKnobs.OnTxnRetry != nil {
+			ex.server.cfg.TestingKnobs.OnTxnRetry(ex.state.mu.autoRetryReason, p.EvalContext())
+		}
 	}
 
 	if ex.executorType != executorTypeInternal &&
@@ -2680,6 +2722,17 @@ func (ex *connExecutor) rollbackSQLTransaction(
 func (ex *connExecutor) dispatchReadCommittedStmtToExecutionEngine(
 	ctx context.Context, p *planner, res RestrictedCommandResult,
 ) error {
+	getPausablePortalInfo := func() *portalPauseInfo {
+		if p != nil && p.pausablePortal != nil {
+			return p.pausablePortal.pauseInfo
+		}
+		return nil
+	}
+	if ppInfo := getPausablePortalInfo(); ppInfo != nil {
+		p.autoRetryStmtReason = ppInfo.dispatchReadCommittedStmtToExecutionEngine.autoRetryStmtReason
+		p.autoRetryStmtCounter = ppInfo.dispatchReadCommittedStmtToExecutionEngine.autoRetryStmtCounter
+	}
+
 	readCommittedSavePointToken, err := ex.state.mu.txn.CreateSavepoint(ctx)
 	if err != nil {
 		return err
@@ -2687,6 +2740,16 @@ func (ex *connExecutor) dispatchReadCommittedStmtToExecutionEngine(
 
 	maxRetries := int(ex.sessionData().MaxRetriesForReadCommitted)
 	for attemptNum := 0; ; attemptNum++ {
+		// TODO(99410): Fix the phase time for pausable portals.
+		startExecTS := crtime.NowMono()
+		ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.PlannerMostRecentStartExecStmt, startExecTS)
+		if attemptNum == 0 {
+			ex.statsCollector.PhaseTimes().SetSessionPhaseTime(sessionphase.PlannerFirstStartExecStmt, startExecTS)
+		} else {
+			ex.sessionTracing.TraceRetryInformation(
+				ctx, "statement", p.autoRetryStmtCounter, p.autoRetryStmtReason,
+			)
+		}
 		bufferPos := res.BufferedResultsLen()
 		if err = ex.dispatchToExecutionEngine(ctx, p, res); err != nil {
 			return err
@@ -2742,8 +2805,13 @@ func (ex *connExecutor) dispatchReadCommittedStmtToExecutionEngine(
 		if err := ex.state.mu.txn.Step(ctx, false /* allowReadTimestampStep */); err != nil {
 			return err
 		}
-		ex.state.mu.autoRetryCounter++
-		ex.state.mu.autoRetryReason = txnRetryErr
+		p.autoRetryStmtCounter++
+		p.autoRetryStmtReason = maybeRetriableErr
+		if ppInfo := getPausablePortalInfo(); ppInfo != nil {
+			ppInfo.dispatchReadCommittedStmtToExecutionEngine.autoRetryStmtReason = p.autoRetryStmtReason
+			ppInfo.dispatchReadCommittedStmtToExecutionEngine.autoRetryStmtCounter = p.autoRetryStmtCounter
+		}
+		ex.metrics.EngineMetrics.StatementRetryCount.Inc(1)
 	}
 	return nil
 }
@@ -2751,8 +2819,8 @@ func (ex *connExecutor) dispatchReadCommittedStmtToExecutionEngine(
 // dispatchToExecutionEngine executes the statement, writes the result to res
 // and returns an event for the connection's state machine.
 //
-// If an error is returned, the connection needs to stop processing queries.`
-// Query execution errors are written to res; they are not returned; it is`
+// If an error is returned, the connection needs to stop processing queries.
+// Query execution errors are written to res; they are not returned; it is
 // expected that the caller will inspect res and react to query errors by
 // producing an appropriate state machine event.
 func (ex *connExecutor) dispatchToExecutionEngine(
@@ -2971,10 +3039,6 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		planner.curPlan.flags.Set(planFlagPartiallyDistributed)
 	}
 
-	ex.sessionTracing.TraceRetryInformation(ctx, int(ex.state.mu.autoRetryCounter), ex.state.mu.autoRetryReason)
-	if ex.server.cfg.TestingKnobs.OnTxnRetry != nil && ex.state.mu.autoRetryReason != nil {
-		ex.server.cfg.TestingKnobs.OnTxnRetry(ex.state.mu.autoRetryReason, planner.EvalContext())
-	}
 	distribute := DistributionType(LocalDistribution)
 	if distributePlan.WillDistribute() {
 		distribute = FullDistribution
@@ -3017,15 +3081,16 @@ func (ex *connExecutor) dispatchToExecutionEngine(
 		ppInfo.dispatchToExecutionEngine.cleanup.appendFunc(func(ctx context.Context) {
 			populateQueryLevelStats(ctx, &curPlanner, ex.server.cfg, ppInfo.dispatchToExecutionEngine.queryStats, &ex.cpuStatsCollector)
 			ppInfo.dispatchToExecutionEngine.stmtFingerprintID = ex.recordStatementSummary(
-				ctx, &curPlanner,
-				int(ex.state.mu.autoRetryCounter), ppInfo.dispatchToExecutionEngine.rowsAffected, ppInfo.curRes.ErrAllowReleased(), *ppInfo.dispatchToExecutionEngine.queryStats,
+				ctx, &curPlanner, int(ex.state.mu.autoRetryCounter), planner.autoRetryStmtCounter,
+				ppInfo.dispatchToExecutionEngine.rowsAffected, ppInfo.curRes.ErrAllowReleased(),
+				*ppInfo.dispatchToExecutionEngine.queryStats,
 			)
 		})
 	} else {
 		populateQueryLevelStats(ctx, planner, ex.server.cfg, &stats, &ex.cpuStatsCollector)
 		ex.recordStatementSummary(
-			ctx, planner,
-			int(ex.state.mu.autoRetryCounter), res.RowsAffected(), res.Err(), stats,
+			ctx, planner, int(ex.state.mu.autoRetryCounter), planner.autoRetryStmtCounter,
+			res.RowsAffected(), res.Err(), stats,
 		)
 	}
 
@@ -3348,6 +3413,22 @@ func (ex *connExecutor) makeExecPlan(
 	// Include gist in error reports.
 	ih := &planner.instrumentation
 	ctx = withPlanGist(ctx, ih.planGist.String())
+	if buildutil.CrdbTestBuild && ih.planGist.String() != "" {
+		// Ensure that the gist can be decoded in test builds.
+		//
+		// In 50% cases, use nil catalog.
+		var catalog cat.Catalog
+		if ex.rng.internal.Float64() < 0.5 && !planner.SessionData().AllowRoleMembershipsToChangeDuringTransaction {
+			// For some reason, TestAllowRoleMembershipsToChangeDuringTransaction
+			// times out with non-nil catalog, so we'll keep it as nil when the
+			// session var is set to 'true' ('false' is the default).
+			catalog = planner.optPlanningCtx.catalog
+		}
+		_, err := explain.DecodePlanGistToRows(ctx, &planner.extendedEvalCtx.Context, ih.planGist.String(), catalog)
+		if err != nil {
+			return ctx, errors.NewAssertionErrorWithWrappedErrf(err, "failed to decode plan gist: %q", ih.planGist.String())
+		}
+	}
 
 	// Now that we have the plan gist, check whether we should get a bundle for
 	// it.
@@ -4063,6 +4144,8 @@ func (ex *connExecutor) enableTracing(modes []string) error {
 			traceKV = true
 		case "cluster":
 			recordingType = tracingpb.RecordingVerbose
+		case "compact":
+			// compact modifies the output format.
 		default:
 			return pgerror.Newf(pgcode.Syntax,
 				"set tracing: unknown mode %q", s)
@@ -4316,6 +4399,7 @@ func (ex *connExecutor) recordTransactionFinish(
 		ex.sessionData().Database, ex.sessionData().ApplicationName)
 	ex.metrics.EngineMetrics.SQLTxnLatency.RecordValue(elapsedTime.Nanoseconds(),
 		ex.sessionData().Database, ex.sessionData().ApplicationName)
+	ex.metrics.EngineMetrics.TxnRetryCount.Inc(int64(ex.state.mu.autoRetryCounter))
 
 	ex.txnIDCacheWriter.Record(contentionpb.ResolvedTxnID{
 		TxnID:            ev.txnID,

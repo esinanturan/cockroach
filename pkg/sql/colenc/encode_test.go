@@ -259,6 +259,10 @@ func TestEncoderEqualityRand(t *testing.T) {
 	ctx := context.Background()
 	s, db, kvdb := serverutils.StartServer(t, base.TestServerArgs{})
 	defer s.Stopper().Stop(ctx)
+	// Increase the span config limit in case we're running with multiple
+	// tenants since the loop below might create more spans than the default
+	// limit of 5k.
+	s.SQLConn(t).QueryRow("SET CLUSTER SETTING spanconfig.tenant_limit = 50000")
 	codec, sv := s.ApplicationLayer().Codec(), &s.ApplicationLayer().ClusterSettings().SV
 	rng, _ := randutil.NewTestRand()
 	for i := 0; i < 100; i++ {
@@ -615,8 +619,9 @@ func buildRowKVs(
 	p := &capturePutter{}
 	var pm row.PartialIndexUpdateHelper
 	var vh row.VectorIndexUpdateHelper
+	var oth row.OriginTimestampCPutHelper
 	for _, d := range datums {
-		if err := inserter.InsertRow(context.Background(), p, d, pm, vh, nil, row.CPutOp, true /* traceKV */); err != nil {
+		if err := inserter.InsertRow(context.Background(), p, d, pm, vh, oth, row.CPutOp, true /* traceKV */); err != nil {
 			return kvs{}, err
 		}
 	}

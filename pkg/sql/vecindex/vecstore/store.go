@@ -70,7 +70,7 @@ func NewWithColumnID(
 	ps = &Store{
 		db:             db,
 		kv:             db.KV(),
-		rootQuantizer:  quantize.NewUnQuantizer(quantizer.GetDims()),
+		rootQuantizer:  quantize.NewUnQuantizer(quantizer.GetDims(), quantizer.GetDistanceMetric()),
 		quantizer:      quantizer,
 		minConsistency: kvpb.INCONSISTENT,
 		emptyVec:       make(vector.T, quantizer.GetDims()),
@@ -175,7 +175,7 @@ func (s *Store) RunTransaction(ctx context.Context, fn func(txn cspann.Txn) erro
 // unique partition key.
 func (s *Store) MakePartitionKey() cspann.PartitionKey {
 	instanceID := s.kv.Context().NodeID.SQLInstanceID()
-	return cspann.PartitionKey(unique.GenerateUniqueInt(unique.ProcessUniqueID(instanceID)))
+	return cspann.PartitionKey(unique.GenerateUniqueUnorderedID(unique.ProcessUniqueID(instanceID)))
 }
 
 // EstimatePartitionCount is part of the cspann.Store interface. It returns an

@@ -1005,6 +1005,7 @@ func TestChangefeedMultiTable(t *testing.T) {
 func TestChangefeedCursor(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
+	require.NoError(t, log.SetVModule("event_processing=3,blocking_buffer=2"))
 
 	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
 		sqlDB := sqlutils.MakeSQLRunner(s.DB)
@@ -2366,7 +2367,6 @@ func TestChangefeedSchemaChangeNoBackfill(t *testing.T) {
 func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
-	rnd, _ := randutil.NewPseudoRand()
 
 	s, db, stopServer := startTestFullServer(t, feedTestOptions{})
 	defer stopServer()
@@ -2382,6 +2382,9 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
   INSERT INTO foo (key) SELECT * FROM generate_series(1, 1000);
   ALTER TABLE foo SPLIT AT (SELECT * FROM generate_series(1, 1000, 50));
   `)
+
+	fooDesc := desctestutils.TestingGetPublicTableDescriptor(s.DB(), s.Codec(), "d", "foo")
+	tableSpan := fooDesc.PrimaryIndexSpan(s.Codec())
 
 	// Checkpoint progress frequently, allow a large enough checkpoint, and
 	// reduce the lag threshold to allow lag checkpointing to trigger
@@ -2402,25 +2405,29 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	// Rangefeed will skip some of the checkpoints to simulate lagging spans.
 	var laggingSpans roachpb.SpanGroup
 	nonLaggingSpans := make(map[string]int)
-	var numLagging, numNonLagging int
-	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *kvpb.RangeFeedCheckpoint) bool {
+	var numSpans int
+	knobs.FeedKnobs.ShouldSkipCheckpoint = func(checkpoint *kvpb.RangeFeedCheckpoint) (skip bool) {
+		// Skip spans for the whole table.
+		if checkpoint.Span.Equal(tableSpan) {
+			return true
+		}
 		// Skip spans that we already picked to be lagging.
 		if laggingSpans.Encloses(checkpoint.Span) {
-			return true /* skip */
+			return true
 		}
-		// Skip additional updates for some non-lagging spans so that we can
-		// have more than one timestamp in the checkpoint.
+		// Skip additional updates for every 3rd non-lagging span so that we have
+		// a few spans lagging at a second timestamp above the cursor.
 		if i, ok := nonLaggingSpans[checkpoint.Span.String()]; ok {
 			return i%3 == 0
 		}
-		// Ensure we have a few spans that are lagging at the cursor.
-		if numLagging == 0 || (numLagging < 5 && rnd.Int()%3 == 0) {
+		numSpans++
+		// Skip updates for every 3rd span so that we have a few spans lagging
+		// at the cursor.
+		if numSpans%3 == 0 {
 			laggingSpans.Add(checkpoint.Span)
-			numLagging++
-			return true /* skip */
+			return true
 		}
-		nonLaggingSpans[checkpoint.Span.String()] = numNonLagging
-		numNonLagging++
+		nonLaggingSpans[checkpoint.Span.String()] = len(nonLaggingSpans) + 1
 		return false
 	}
 
@@ -2469,10 +2476,16 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 		}
 	}
 
-	var rangefeedStarted bool
+	var rangefeedStartedOnce bool
 	var incorrectCheckpointErr error
 	knobs.FeedKnobs.OnRangeFeedStart = func(spans []kvcoord.SpanTimePair) {
-		rangefeedStarted = true
+		// We only need to check the first rangefeed restart since
+		// any additional restarts (likely due to transient errors)
+		// may be using newer span-level checkpoints than the one
+		// we saved after the last pause.
+		if rangefeedStartedOnce {
+			return
+		}
 
 		setErr := func(stp kvcoord.SpanTimePair, expectedTS hlc.Timestamp) {
 			incorrectCheckpointErr = errors.Newf(
@@ -2494,6 +2507,8 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 				}
 			}
 		}
+
+		rangefeedStartedOnce = true
 	}
 	knobs.FeedKnobs.ShouldSkipCheckpoint = nil
 
@@ -2513,7 +2528,7 @@ func TestChangefeedLaggingSpanCheckpointing(t *testing.T) {
 	waitForJobState(sqlDB, t, jobID, jobs.StatePaused)
 	// Verify the rangefeed started. This guards against the testing knob
 	// not being called, which was happening in earlier versions of the code.
-	require.True(t, rangefeedStarted)
+	require.True(t, rangefeedStartedOnce)
 	// Verify we didn't see incorrect timestamps when resuming.
 	require.NoError(t, incorrectCheckpointErr)
 }
@@ -4436,6 +4451,10 @@ func TestChangefeedEnrichedSourceWithDataAvro(t *testing.T) {
 
 					sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY)`)
 					sqlDB.Exec(t, `INSERT INTO foo values (0)`)
+
+					var tableID int
+					sqlDB.QueryRow(t, `SELECT table_id FROM crdb_internal.tables WHERE name = 'foo' AND database_name = 'd'`).Scan(&tableID)
+
 					stmt := `CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source', format=avro`
 					if withMVCCTS {
 						stmt += ", mvcc_timestamp"
@@ -4473,12 +4492,13 @@ func TestChangefeedEnrichedSourceWithDataAvro(t *testing.T) {
 						var assertion string
 						assertionMap := map[string]any{
 							"source": map[string]any{
-								"changefeed_sink": map[string]any{"string": sink},
-								"cluster_id":      map[string]any{"string": clusterID},
-								"cluster_name":    map[string]any{"string": clusterName},
-								"database_name":   map[string]any{"string": "d"},
-								"db_version":      map[string]any{"string": dbVersion},
-								"job_id":          map[string]any{"string": jobIDStr},
+								"changefeed_sink":        map[string]any{"string": sink},
+								"cluster_id":             map[string]any{"string": clusterID},
+								"cluster_name":           map[string]any{"string": clusterName},
+								"crdb_internal_table_id": map[string]any{"int": tableID},
+								"database_name":          map[string]any{"string": "d"},
+								"db_version":             map[string]any{"string": dbVersion},
+								"job_id":                 map[string]any{"string": jobIDStr},
 								// Note that the field is still present in the avro schema, so it appears here as nil.
 								"mvcc_timestamp":       nil,
 								"node_id":              map[string]any{"string": nodeID},
@@ -4554,6 +4574,7 @@ func TestChangefeedEnrichedSourceWithDataJSON(t *testing.T) {
 
 					sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY)`)
 					sqlDB.Exec(t, `INSERT INTO foo values (0)`)
+
 					stmt := `CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source', format=json`
 					if withMVCCTS {
 						stmt += ", mvcc_timestamp"
@@ -4566,11 +4587,14 @@ func TestChangefeedEnrichedSourceWithDataJSON(t *testing.T) {
 
 					var jobID int64
 					var nodeName string
+					var tableID int
+
 					var sourceAssertion func(actualSource map[string]any)
 					if ef, ok := testFeed.(cdctest.EnterpriseTestFeed); ok {
 						jobID = int64(ef.JobID())
 					}
 					sqlDB.QueryRow(t, `SELECT value FROM crdb_internal.node_runtime_info where component = 'DB' and field = 'Host'`).Scan(&nodeName)
+					sqlDB.QueryRow(t, `SELECT table_id FROM crdb_internal.tables WHERE name = 'foo' AND database_name = 'd'`).Scan(&tableID)
 
 					sourceAssertion = func(actualSource map[string]any) {
 						nodeID := actualSource["node_id"]
@@ -4592,19 +4616,20 @@ func TestChangefeedEnrichedSourceWithDataJSON(t *testing.T) {
 
 						var assertion string
 						assertionMap := map[string]any{
-							"cluster_id":           clusterID,
-							"cluster_name":         clusterName,
-							"db_version":           dbVersion,
-							"job_id":               jobIDStr,
-							"node_id":              nodeID,
-							"node_name":            nodeName,
-							"origin":               "cockroachdb",
-							"changefeed_sink":      sink,
-							"source_node_locality": sourceNodeLocality,
-							"database_name":        "d",
-							"schema_name":          "public",
-							"table_name":           "foo",
-							"primary_keys":         []any{"i"},
+							"cluster_id":             clusterID,
+							"cluster_name":           clusterName,
+							"crdb_internal_table_id": tableID,
+							"db_version":             dbVersion,
+							"job_id":                 jobIDStr,
+							"node_id":                nodeID,
+							"node_name":              nodeName,
+							"origin":                 "cockroachdb",
+							"changefeed_sink":        sink,
+							"source_node_locality":   sourceNodeLocality,
+							"database_name":          "d",
+							"schema_name":            "public",
+							"table_name":             "foo",
+							"primary_keys":           []any{"i"},
 						}
 						if withMVCCTS {
 							assertReasonableMVCCTimestamp(t, actualSource["mvcc_timestamp"].(string))
@@ -4665,6 +4690,10 @@ func TestChangefeedEnrichedSourceWithDataJSONWebhook(t *testing.T) {
 
 					sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY)`)
 					sqlDB.Exec(t, `INSERT INTO foo values (0)`)
+
+					var tableID int
+					sqlDB.QueryRow(t, `SELECT table_id FROM crdb_internal.tables WHERE name = 'foo' AND database_name = 'd'`).Scan(&tableID)
+
 					stmt := `CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source', format=json`
 					if withMVCCTS {
 						stmt += ", mvcc_timestamp"
@@ -4698,19 +4727,20 @@ func TestChangefeedEnrichedSourceWithDataJSONWebhook(t *testing.T) {
 
 						var assertion string
 						assertionMap := map[string]any{
-							"cluster_id":           clusterID,
-							"cluster_name":         clusterName,
-							"db_version":           dbVersion,
-							"job_id":               jobIDStr,
-							"node_id":              nodeID,
-							"node_name":            nodeName,
-							"origin":               "cockroachdb",
-							"changefeed_sink":      sink,
-							"source_node_locality": sourceNodeLocality,
-							"database_name":        "d",
-							"schema_name":          "public",
-							"table_name":           "foo",
-							"primary_keys":         []any{"i"},
+							"cluster_id":             clusterID,
+							"cluster_name":           clusterName,
+							"crdb_internal_table_id": tableID,
+							"db_version":             dbVersion,
+							"job_id":                 jobIDStr,
+							"node_id":                nodeID,
+							"node_name":              nodeName,
+							"origin":                 "cockroachdb",
+							"changefeed_sink":        sink,
+							"source_node_locality":   sourceNodeLocality,
+							"database_name":          "d",
+							"schema_name":            "public",
+							"table_name":             "foo",
+							"primary_keys":           []any{"i"},
 						}
 						if withMVCCTS {
 							assertReasonableMVCCTimestamp(t, actualSource["mvcc_timestamp"].(string))
@@ -4782,6 +4812,9 @@ func TestChangefeedEnrichedSourceSchemaInfo(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+
+				var originalTableID int
+
 				sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
 				sqlDB.Exec(t, `CREATE TABLE foo (a INT, b STRING, c INT, PRIMARY KEY (a, b))`)
@@ -4798,11 +4831,21 @@ func TestChangefeedEnrichedSourceSchemaInfo(t *testing.T) {
 						require.Equal(t, map[string]any{"string": "public"}, actualSourceValue["schema_name"])
 						require.Equal(t, map[string]any{"string": "d"}, actualSourceValue["database_name"])
 						require.Equal(t, map[string]any{"array": []any{"a", "b"}}, actualSourceValue["primary_keys"])
+
+						num := actualSourceValue["crdb_internal_table_id"].(map[string]any)["int"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						originalTableID = int(idInt)
 					} else {
 						require.Equal(t, "foo", actualSource["table_name"])
 						require.Equal(t, "public", actualSource["schema_name"])
 						require.Equal(t, "d", actualSource["database_name"])
 						require.Equal(t, []any{"a", "b"}, actualSource["primary_keys"])
+
+						num := actualSource["crdb_internal_table_id"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						originalTableID = int(idInt)
 					}
 				}
 				assertPayloadsEnriched(t, foo, []string{testCase.expectedRow}, sourceAssertion)
@@ -4817,11 +4860,21 @@ func TestChangefeedEnrichedSourceSchemaInfo(t *testing.T) {
 						require.Equal(t, map[string]any{"string": "public"}, actualSourceValue["schema_name"])
 						require.Equal(t, map[string]any{"string": "d"}, actualSourceValue["database_name"])
 						require.Equal(t, map[string]any{"array": []any{"a", "b"}}, actualSourceValue["primary_keys"])
+
+						num := actualSourceValue["crdb_internal_table_id"].(map[string]any)["int"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						require.Equal(t, originalTableID, int(idInt))
 					} else {
 						require.Equal(t, "foo", actualSource["table_name"])
 						require.Equal(t, "public", actualSource["schema_name"])
 						require.Equal(t, "d", actualSource["database_name"])
 						require.Equal(t, []any{"a", "b"}, actualSource["primary_keys"])
+
+						num := actualSource["crdb_internal_table_id"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						require.Equal(t, originalTableID, int(idInt))
 					}
 				}
 				assertPayloadsEnriched(t, foo, testCase.expectedRowsAfterSchemaChange, sourceAssertionAfterSchemaChange)
@@ -4859,6 +4912,9 @@ func TestChangefeedEnrichedSourceSchemaInfoOnPrimaryKeyChange(t *testing.T) {
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
 			testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+
+				var originalTableID int
+
 				sqlDB := sqlutils.MakeSQLRunner(s.DB)
 
 				sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
@@ -4875,11 +4931,21 @@ func TestChangefeedEnrichedSourceSchemaInfoOnPrimaryKeyChange(t *testing.T) {
 						require.Equal(t, map[string]any{"string": "public"}, actualSourceValue["schema_name"])
 						require.Equal(t, map[string]any{"string": "d"}, actualSourceValue["database_name"])
 						require.Equal(t, map[string]any{"array": []any{"a"}}, actualSourceValue["primary_keys"])
+
+						num := actualSourceValue["crdb_internal_table_id"].(map[string]any)["int"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						originalTableID = int(idInt)
 					} else {
 						require.Equal(t, "foo", actualSource["table_name"])
 						require.Equal(t, "public", actualSource["schema_name"])
 						require.Equal(t, "d", actualSource["database_name"])
 						require.Equal(t, []any{"a"}, actualSource["primary_keys"])
+
+						num := actualSource["crdb_internal_table_id"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						originalTableID = int(idInt)
 					}
 				}
 				if testCase.format == "json" {
@@ -4899,11 +4965,21 @@ func TestChangefeedEnrichedSourceSchemaInfoOnPrimaryKeyChange(t *testing.T) {
 						require.Equal(t, map[string]any{"string": "public"}, actualSourceValue["schema_name"])
 						require.Equal(t, map[string]any{"string": "d"}, actualSourceValue["database_name"])
 						require.Equal(t, map[string]any{"array": []any{"b"}}, actualSourceValue["primary_keys"])
+
+						num := actualSourceValue["crdb_internal_table_id"].(map[string]any)["int"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						require.Equal(t, originalTableID, int(idInt))
 					} else {
 						require.Equal(t, "foo", actualSource["table_name"])
 						require.Equal(t, "public", actualSource["schema_name"])
 						require.Equal(t, "d", actualSource["database_name"])
 						require.Equal(t, []any{"b"}, actualSource["primary_keys"])
+
+						num := actualSource["crdb_internal_table_id"].(gojson.Number)
+						idInt, err := num.Int64()
+						require.NoError(t, err)
+						require.Equal(t, originalTableID, int(idInt))
 					}
 				}
 				assertPayloadsEnriched(t, foo, []string{testCase.expectedRowAfter}, sourceAssertionAfterPKChange)
@@ -4912,6 +4988,47 @@ func TestChangefeedEnrichedSourceSchemaInfoOnPrimaryKeyChange(t *testing.T) {
 			cdcTest(t, testFn, feedTestForceSink("kafka"))
 		})
 	}
+}
+
+func TestChangefeedEnrichedTableIDStableOnRename(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+
+		sqlDB.Exec(t, `CREATE TABLE foo (i INT PRIMARY KEY)`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1)`)
+
+		foo := feed(t, f, `CREATE CHANGEFEED FOR foo WITH envelope=enriched, enriched_properties='source'`)
+		defer closeFeed(t, foo)
+
+		var originalTableID int
+
+		// Capture first row (before rename)
+		sourceAssertionBefore := func(actualSource map[string]any) {
+			num := actualSource["crdb_internal_table_id"].(gojson.Number)
+			id, err := num.Int64()
+			require.NoError(t, err)
+			originalTableID = int(id)
+		}
+		assertPayloadsEnriched(t, foo, []string{`foo: {"i": 1}->{"after": {"i": 1}, "op": "c"}`}, sourceAssertionBefore)
+
+		// Rename table
+		sqlDB.Exec(t, `ALTER TABLE foo RENAME TO bar`)
+		sqlDB.Exec(t, `INSERT INTO bar VALUES (2)`)
+
+		// Capture second row (after rename)
+		sourceAssertionAfter := func(actualSource map[string]any) {
+			num := actualSource["crdb_internal_table_id"].(gojson.Number)
+			id, err := num.Int64()
+			require.NoError(t, err)
+			require.Equal(t, originalTableID, int(id))
+		}
+		assertPayloadsEnriched(t, foo, []string{`foo: {"i": 2}->{"after": {"i": 2}, "op": "c"}`}, sourceAssertionAfter)
+	}
+
+	cdcTest(t, testFn, feedTestForceSink("kafka"))
 }
 
 func TestChangefeedExpressionUsesSerializedSessionData(t *testing.T) {
@@ -6132,8 +6249,6 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
-	skip.WithIssue(t, 144912)
-
 	// Set TestingKnobs to return a known session for easier
 	// comparison.
 	adoptionInterval := 20 * time.Minute
@@ -6175,9 +6290,11 @@ func TestChangefeedJobUpdateFailsIfNotClaimed(t *testing.T) {
 		// another node.
 		sqlDB.Exec(t, `UPDATE system.jobs SET claim_session_id = NULL WHERE id = $1`, jobID)
 
-		timeout := 5 * time.Second
+		timeout := (5 * time.Second) + changefeedbase.Quantize.Get(&s.Server.ClusterSettings().SV)
+
 		if util.RaceEnabled {
-			timeout = 30 * time.Second
+			// Timeout should be at least 30s to allow for race conditions.
+			timeout += 25 * time.Second
 		}
 		// Expect that the distflow fails since it can't
 		// update the checkpoint.
@@ -6561,7 +6678,7 @@ func TestChangefeedErrors(t *testing.T) {
 	)
 
 	sqlDB.ExpectErrWithTimeout(
-		t, `request timestamp .* too far in future`,
+		t, `timestamp '.*' is in the future`,
 		`EXPERIMENTAL CHANGEFEED FOR foo WITH cursor=$1`, timeutil.Now().Add(time.Hour),
 	)
 
@@ -7975,7 +8092,7 @@ func TestChangefeedHandlesRollingRestart(t *testing.T) {
 
 		// Even though checkpointing was disabled, when we drain, an attempt is
 		// made to persist up-to-date checkpoint.
-		require.NoError(t, jf.TickHighWaterMark(beforeInsert))
+		require.NoError(t, jf.WaitForHighWaterMark(beforeInsert))
 
 		// Let the retry proceed.
 		ctx, cancel = context.WithTimeout(context.Background(), time.Second*60)
@@ -10122,7 +10239,7 @@ func TestChangefeedMultiPodTenantPlanning(t *testing.T) {
 	require.Equal(t, 2, aggregatorCount)
 }
 
-func TestChangefeedCreateTelemetryLogs(t *testing.T) {
+func TestCreateChangefeedTelemetryLogs(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	defer log.Scope(t).Close(t)
 
@@ -10173,6 +10290,44 @@ func TestChangefeedCreateTelemetryLogs(t *testing.T) {
 		require.Equal(t, 1, len(createLogs))
 		require.Equal(t, true, createLogs[0].Transformation)
 	})
+}
+
+func TestAlterChangefeedTelemetryLogs(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	cdcTest(t, func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT PRIMARY KEY, b STRING)`)
+		sqlDB.Exec(t, `CREATE TABLE bar (a INT PRIMARY KEY, b STRING)`)
+
+		beforeCreate := timeutil.Now()
+		testFeed := feed(t, f, `CREATE CHANGEFEED FOR foo, bar`)
+		defer closeFeed(t, testFeed)
+		feed := testFeed.(cdctest.EnterpriseTestFeed)
+
+		// Alter changefeed to drop bar as a target and set resolved.
+		require.NoError(t, feed.Pause())
+		sqlDB.Exec(t, `ALTER CHANGEFEED $1 DROP bar SET resolved`, feed.JobID())
+		require.NoError(t, feed.Resume())
+
+		var logs []eventpb.AlterChangefeed
+		testutils.SucceedsSoon(t, func() error {
+			logs = checkAlterChangefeedLogs(t, beforeCreate.UnixNano())
+			if len(logs) < 1 {
+				return errors.New("no logs found")
+			}
+			return nil
+		})
+
+		require.Len(t, logs, 1)
+		l := logs[0]
+		require.EqualValues(t, feed.JobID(), l.JobId)
+		require.Equal(t, `alter_changefeed`, l.EventType)
+		require.Contains(t, l.PreviousDescription, `bar`)
+		require.NotContains(t, l.Description, `bar`)
+		require.Equal(t, "yes", l.Resolved)
+	}, feedTestEnterpriseSinks)
 }
 
 // Note that closeFeed needs to be called in order for the logs to be detected
@@ -11154,21 +11309,21 @@ func TestChangefeedHeadersJSONVals(t *testing.T) {
 		expected       cdctest.Headers
 		warn           string
 	}{
-		// {
-		// 	name:           "empty",
-		// 	headersJSONStr: `'{}'`,
-		// 	expected:       cdctest.Headers{},
-		// },
-		// {
-		// 	name:           "flat primitives - happy path",
-		// 	headersJSONStr: `'{"a": "b", "c": "d", "e": 42, "f": false}'`,
-		// 	expected: cdctest.Headers{
-		// 		{K: "a", V: []byte("b")},
-		// 		{K: "c", V: []byte("d")},
-		// 		{K: "e", V: []byte("42")},
-		// 		{K: "f", V: []byte("false")},
-		// 	},
-		// },
+		{
+			name:           "empty",
+			headersJSONStr: `'{}'`,
+			expected:       cdctest.Headers{},
+		},
+		{
+			name:           "flat primitives - happy path",
+			headersJSONStr: `'{"a": "b", "c": "d", "e": 42, "f": false}'`,
+			expected: cdctest.Headers{
+				{K: "a", V: []byte("b")},
+				{K: "c", V: []byte("d")},
+				{K: "e", V: []byte("42")},
+				{K: "f", V: []byte("false")},
+			},
+		},
 		{
 			name:           "some bad some good",
 			headersJSONStr: `'{"a": "b", "c": 1, "d": true, "e": null, "f": [1, 2, 3], "g": {"h": "i"}}'`,
@@ -11544,4 +11699,77 @@ func TestChangefeedAsSelectForEmptyTable(t *testing.T) {
 	}
 
 	cdcTest(t, testFn)
+}
+
+func TestChangefeedMVCCTimestampWithQueries(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+
+	testFn := func(t *testing.T, s TestServer, f cdctest.TestFeedFactory) {
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (key INT PRIMARY KEY);`)
+		sqlDB.Exec(t, `INSERT INTO foo VALUES (1);`)
+
+		feed, err := f.Feed(`CREATE CHANGEFEED WITH mvcc_timestamp, format=json, envelope=bare AS SELECT * FROM foo`)
+		require.NoError(t, err)
+		defer closeFeed(t, feed)
+
+		msgs, err := readNextMessages(ctx, feed, 1)
+		require.NoError(t, err)
+
+		var m map[string]any
+		require.NoError(t, gojson.Unmarshal(msgs[0].Value, &m))
+		ts := m["__crdb__"].(map[string]any)["mvcc_timestamp"].(string)
+		assertReasonableMVCCTimestamp(t, ts)
+	}
+
+	cdcTest(t, testFn)
+}
+
+func TestCloudstorageParallelCompression(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// This test only provides value under race, as it's explicitly testing for
+	// data races between feeds.
+	skip.UnlessUnderRace(t)
+
+	const numFeedsEach = 10
+
+	testutils.RunValues(t, "compression", []string{"zstd", "gzip"}, func(t *testing.T, compression string) {
+		s, cleanup := makeServer(t)
+		defer cleanup()
+
+		sqlDB := sqlutils.MakeSQLRunner(s.DB)
+		sqlDB.Exec(t, `CREATE TABLE foo (a INT);`)
+		sqlDB.Exec(t, `INSERT INTO foo (a) SELECT * FROM generate_series(1, 5000);`)
+
+		t.Logf("inserted into table")
+
+		var jobIDs []int
+		for i := range numFeedsEach {
+			var jobID int
+			sqlDB.QueryRow(t, fmt.Sprintf(`CREATE CHANGEFEED FOR foo INTO 'nodelocal://1/%d-testout' WITH compression='%s', initial_scan='only', format='parquet';`, i, compression)).Scan(&jobID)
+			jobIDs = append(jobIDs, jobID)
+		}
+
+		t.Logf("created changefeeds")
+
+		const duration = 3 * time.Minute
+		const checkStatusInterval = 10 * time.Second
+
+		for start := timeutil.Now(); timeutil.Since(start) < duration; {
+			// Check the statuses of the jobs.
+			for _, jobID := range jobIDs {
+				var status string
+				sqlDB.QueryRow(t, `SELECT status FROM [SHOW JOBS] WHERE job_id = $1`, jobID).Scan(&status)
+				if status != "succeeded" && status != "running" {
+					t.Fatalf("job %d entered unknown state: %s", jobID, status)
+				}
+			}
+			time.Sleep(checkStatusInterval)
+		}
+	})
 }

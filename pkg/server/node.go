@@ -39,7 +39,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilities/tenantcapabilitieswatcher"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server/license"
 	"github.com/cockroachdb/cockroach/pkg/server/status"
 	"github.com/cockroachdb/cockroach/pkg/server/tenantsettingswatcher"
@@ -77,6 +77,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
 	"github.com/cockroachdb/cockroach/pkg/util/unique"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
+	"github.com/cockroachdb/crlib/crtime"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/pebble"
@@ -1169,7 +1170,8 @@ func (n *Node) startPeriodicLivenessCompaction(
 								}.Encode()
 
 							timeBeforeCompaction := timeutil.Now()
-							if err := store.StateEngine().CompactRange(startEngineKey, endEngineKey); err != nil {
+							if err := store.StateEngine().CompactRange(
+								context.Background(), startEngineKey, endEngineKey); err != nil {
 								log.Errorf(ctx, "failed compacting liveness replica: %+v with error: %s", repl, err)
 							}
 
@@ -1194,7 +1196,7 @@ func (n *Node) startPeriodicLivenessCompaction(
 
 // updateNodeRangeCount updates the internal counter of the total ranges across
 // all stores. This value is used to make a decision on whether the node should
-// use expiration leases (see Replica.shouldUseExpirationLeaseRLocked).
+// use expiration leases (see Replica.shouldUseExpirationLease).
 func (n *Node) updateNodeRangeCount() {
 	var count int64
 	_ = n.stores.VisitStores(func(store *kvserver.Store) error {
@@ -1513,7 +1515,7 @@ func (n *Node) writeNodeStatus(ctx context.Context, mustExist bool) error {
 			}
 			if numNodes > 1 {
 				// Avoid this warning on single-node clusters, which require special UX.
-				log.Warningf(ctx, "health alerts detected: %+v", result)
+				log.Warningf(ctx, "health alerts detected: %s", result)
 			}
 			if err := n.storeCfg.Gossip.AddInfoProto(
 				gossip.MakeNodeHealthAlertKey(n.Descriptor.NodeID), &result, 2*base.DefaultMetricsSampleInterval, /* ttl */
@@ -1865,18 +1867,10 @@ func (n *Node) Batch(ctx context.Context, args *kvpb.BatchRequest) (*kvpb.BatchR
 
 // BatchStream implements the kvpb.InternalServer interface.
 func (n *Node) BatchStream(stream kvpb.Internal_BatchStreamServer) error {
-	return n.batchStreamImpl(stream, func(ba *kvpb.BatchRequest) error {
-		return stream.RecvMsg(ba)
-	})
+	return n.batchStreamImpl(stream)
 }
 
-func (n *Node) batchStreamImpl(
-	stream interface {
-		Context() context.Context
-		Send(response *kvpb.BatchResponse) error
-	},
-	recvMsg func(*kvpb.BatchRequest) error,
-) error {
+func (n *Node) batchStreamImpl(stream kvpb.RPCKVBatch_BatchStreamStream) error {
 	ctx := stream.Context()
 	for {
 		argsAlloc := new(struct {
@@ -1886,7 +1880,7 @@ func (n *Node) batchStreamImpl(
 		args := &argsAlloc.args
 		args.Requests = argsAlloc.reqs[:0]
 
-		err := recvMsg(args)
+		err := stream.RecvMsg(args)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -1905,7 +1899,7 @@ func (n *Node) batchStreamImpl(
 	}
 }
 
-func (n *Node) AsDRPCBatchServer() kvpb.DRPCBatchServer {
+func (n *Node) AsDRPCKVBatchServer() kvpb.DRPCKVBatchServer {
 	return (*drpcNode)(n)
 }
 
@@ -1917,12 +1911,8 @@ func (n *drpcNode) Batch(
 	return (*Node)(n).Batch(ctx, request)
 }
 
-func (n *drpcNode) BatchStream(stream kvpb.DRPCBatch_BatchStreamStream) error {
-	return (*Node)(n).batchStreamImpl(stream, func(ba *kvpb.BatchRequest) error {
-		return stream.(interface {
-			RecvMsg(request *kvpb.BatchRequest) error
-		}).RecvMsg(ba)
-	})
+func (n *drpcNode) BatchStream(stream kvpb.DRPCKVBatch_BatchStreamStream) error {
+	return (*Node)(n).batchStreamImpl(stream)
 }
 
 // spanForRequest is the retval of setupSpanForIncomingRPC. It groups together a
@@ -2107,8 +2097,26 @@ type lockedMuxStream struct {
 func (s *lockedMuxStream) SendIsThreadSafe() {}
 
 func (s *lockedMuxStream) Send(e *kvpb.MuxRangeFeedEvent) error {
+	// The threshold of 10s was borrowed from `slowDistSenderReplicaThreshold`
+	// in `dist_sender`, where it was deemed to be a reasonable latency
+	// threshold for an RPC to a single replica (as is the case here).
+	const slowMuxStreamSendThreshold = 10 * time.Second
+
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
+
+	// Our intent is to provide observability into a slow client from the server node.
+	// So, we don't include the lock acquisition time, as it is confounded by other
+	// factors, e.g., the number of rangefeeds contending for the lockedMuxStream.
+	start := crtime.NowMono()
+	defer func() {
+		if dur := start.Elapsed(); dur > slowMuxStreamSendThreshold {
+			log.Infof(s.wrapped.Context(),
+				"slow send on stream %d for r%d took %s",
+				e.StreamID, e.RangeID, dur)
+		}
+	}()
+
 	return s.wrapped.Send(e)
 }
 
@@ -2356,7 +2364,7 @@ func (n *Node) ResetQuorum(
 	log.Infof(ctx, "updated meta2 entry for r%d", desc.RangeID)
 
 	// Set up connection to self. Use rpc.SystemClass to avoid throttling.
-	conn, err := n.storeCfg.NodeDialer.Dial(ctx, n.Descriptor.NodeID, rpc.SystemClass)
+	client, err := kvserver.DialMultiRaftClient(n.storeCfg.NodeDialer, ctx, n.Descriptor.NodeID, rpcbase.SystemClass)
 	if err != nil {
 		return nil, err
 	}
@@ -2369,7 +2377,7 @@ func (n *Node) ResetQuorum(
 		n.clusterID.Get(),
 		n.storeCfg.Settings,
 		n.storeCfg.Tracer(),
-		conn,
+		client,
 		n.storeCfg.Clock.Now(),
 		desc,
 		toReplicaDescriptor,

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/cockroachdb/cockroach/pkg/build"
 	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -23,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/scpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/schemachanger/screl"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/catconstants"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/catid"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlclustersettings"
@@ -970,6 +972,34 @@ func shouldSkipValidatingConstraint(
 	return skip, err
 }
 
+// maybeCleanupSchemaLocked will clean up any schema_locked elements if the
+// statement turns out to be idempotent.
+func maybeCleanupSchemaLocked(b BuildCtx, id catid.DescID) {
+	// We need to check all elements by this ID and any back references
+	// to this element.
+	elts := b.QueryByID(id)
+	backRefElts := b.BackReferences(id)
+	// Detect any non-schema locked elements for this table that are
+	// being modified. If none exists, then the schema_locked element will
+	// be added back, since it was made TRANSIENT_ABSENT inside
+	// checkTableSchemaChangePrerequisites.
+	modifiesNonSchemaLockedElements := func(elts ElementResultSet) bool {
+		return !elts.Filter(notReachedTargetYetFilter).Filter(validTargetFilter).Filter(func(current scpb.Status, target scpb.TargetStatus, e scpb.Element) bool {
+			switch e.(type) {
+			case *scpb.TableSchemaLocked:
+				return false
+			default:
+				return true
+			}
+		}).IsEmpty()
+	}
+
+	// This schema change was a no-op, so schema_locked doesn't matter.
+	if !modifiesNonSchemaLockedElements(elts) && !modifiesNonSchemaLockedElements(backRefElts) {
+		b.Add(elts.FilterTableSchemaLocked().MustGetOneElement())
+	}
+}
+
 // checkTableSchemaChangePrerequisites checks any pre-requisites before a table
 // schema change is allowed. This function panics if a schema change is not
 // allowed on this table. A schema change is disallowed if one of the following
@@ -983,8 +1013,10 @@ func shouldSkipValidatingConstraint(
 // in a transient manner, allowing it to restore after the schema change.
 func checkTableSchemaChangePrerequisites(
 	b BuildCtx, tableElements ElementResultSet, n tree.Statement,
-) {
+) (maybeCleanupSchemaLockedFn func()) {
 	schemaLocked := tableElements.FilterTableSchemaLocked().MustGetZeroOrOneElement()
+	// No-op by default unless schema_locked has been setup.
+	maybeCleanupSchemaLockedFn = func() {}
 	if schemaLocked != nil && !tree.IsSetOrResetSchemaLocked(n) {
 		// Before 25.2 we don't support auto-unsetting schema locked.
 		if !b.ClusterSettings().Version.IsActive(b, clusterversion.V25_2) {
@@ -993,6 +1025,9 @@ func checkTableSchemaChangePrerequisites(
 		}
 		// Unset schema_locked for the user.
 		b.DropTransient(schemaLocked)
+		maybeCleanupSchemaLockedFn = func() {
+			maybeCleanupSchemaLocked(b, tableElements.FilterTable().MustGetOneElement().TableID)
+		}
 	}
 	_, _, ldrJobIDs := scpb.FindLDRJobIDs(tableElements)
 	if ldrJobIDs != nil && len(ldrJobIDs.JobIDs) > 0 {
@@ -1016,6 +1051,7 @@ func checkTableSchemaChangePrerequisites(
 			panic(sqlerrors.NewDisallowedSchemaChangeOnLDRTableErr(ns.Name, ldrJobIDs.JobIDs))
 		}
 	}
+	return maybeCleanupSchemaLockedFn
 }
 
 // panicIfSystemColumn blocks alter operations on system columns.
@@ -1667,21 +1703,49 @@ func shouldRestrictAccessToSystemInterface(
 	return nil
 }
 
-func MaybeCreateOrResolveTemporarySchema(b BuildCtx) ElementResultSet {
+// resolveTemporaryStatus checks for the pg_temp naming convention from
+// Postgres, where qualifying an object name with pg_temp is equivalent to
+// explicitly specifying TEMP/TEMPORARY in the CREATE syntax.
+// resolveTemporaryStatus returns true if either(or both) of these conditions
+// are true.
+func resolveTemporaryStatus(name tree.ObjectNamePrefix, persistence tree.Persistence) bool {
+	// An explicit schema can only be provided in the CREATE TEMP statement
+	// iff it is pg_temp.
+	if persistence.IsTemporary() && name.ExplicitSchema && name.SchemaName != catconstants.PgTempSchemaName {
+		panic(pgerror.New(pgcode.InvalidTableDefinition, "cannot create temporary relation in non-temporary schema"))
+	}
+	return name.SchemaName == catconstants.PgTempSchemaName || persistence.IsTemporary()
+}
+
+// MaybeCreateOrResolveTemporarySchema attempts to resolve an existing temporary
+// schema for the current session. If one doesn't exist, it creates a new
+// temporary schema. It returns the database elements and schema elements for
+// the temporary schema. This function will panic if temporary tables are not
+// enabled.
+func MaybeCreateOrResolveTemporarySchema(
+	b BuildCtx,
+) (dbElts ElementResultSet, schemaElts ElementResultSet) {
+	if !b.EvalCtx().SessionData().TempTablesEnabled {
+		panic(errors.WithTelemetry(
+			pgerror.WithCandidateCode(
+				errors.WithHint(
+					errors.WithIssueLink(
+						errors.Newf("temporary tables are only supported experimentally"),
+						errors.IssueLink{IssueURL: build.MakeIssueURL(46260)},
+					),
+					"You can enable temporary tables by running `SET experimental_enable_temp_tables = 'on'`.",
+				),
+				pgcode.ExperimentalFeature,
+			),
+			"sql.schema.temp_tables_disabled",
+		))
+	}
 	// Attempt to resolve the existing temporary schema first.
 	schemaName := b.TemporarySchemaName()
 	prefix := tree.ObjectNamePrefix{
 		SchemaName:     tree.Name(schemaName),
 		ExplicitSchema: true,
 	}
-	schemaElts := b.ResolveSchema(prefix, ResolveParams{IsExistenceOptional: true,
-		RequireOwnership:  false,
-		RequiredPrivilege: 0})
-	if schemaElts != nil {
-		return schemaElts
-	}
-	// Temporary schema didn't resolve, so lets create a new one.
-	descID := b.GenerateUniqueDescID()
 	tempSchemaName := &tree.ObjectNamePrefix{
 		SchemaName:     tree.Name(schemaName),
 		ExplicitSchema: true,
@@ -1689,23 +1753,31 @@ func MaybeCreateOrResolveTemporarySchema(b BuildCtx) ElementResultSet {
 	// Resolve the current database, which will contain this new temporary schema
 	// in the namespace table.
 	b.ResolveDatabasePrefix(tempSchemaName)
-	dbElts := b.ResolveDatabase(tree.Name(tempSchemaName.Catalog()), ResolveParams{RequiredPrivilege: privilege.CREATE})
+	dbElts = b.ResolveDatabase(tree.Name(tempSchemaName.Catalog()), ResolveParams{RequiredPrivilege: privilege.CREATE})
 	dbElem := dbElts.FilterDatabase().MustGetOneElement()
+	schemaElts = b.ResolveSchema(prefix, ResolveParams{IsExistenceOptional: true,
+		RequireOwnership:  false,
+		RequiredPrivilege: 0})
+	if schemaElts != nil {
+		return dbElts, schemaElts
+	}
+	// Temporary schema didn't resolve, so lets create a new one.
+	schemaDescID := b.GenerateUniqueDescID()
 	b.Add(&scpb.Schema{
-		SchemaID:    descID,
+		SchemaID:    schemaDescID,
 		IsTemporary: true,
 	})
 	b.Add(&scpb.SchemaParent{
-		SchemaID:         descID,
+		SchemaID:         schemaDescID,
 		ParentDatabaseID: dbElem.DatabaseID,
 	})
 	b.Add(&scpb.Namespace{
 		DatabaseID:   dbElem.DatabaseID,
 		SchemaID:     0,
-		DescriptorID: descID,
+		DescriptorID: schemaDescID,
 		Name:         schemaName,
 	})
-	return b.QueryByID(descID)
+	return dbElts, b.QueryByID(schemaDescID)
 }
 
 func newTypeT(t *types.T) scpb.TypeT {

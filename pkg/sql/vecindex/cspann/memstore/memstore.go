@@ -14,7 +14,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/quantize"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/workspace"
-	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/container/list"
 	"github.com/cockroachdb/cockroach/pkg/util/protoutil"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
@@ -171,7 +170,7 @@ func New(quantizer quantize.Quantizer, seed int64) *Store {
 	st := &Store{
 		dims:          quantizer.GetDims(),
 		seed:          seed,
-		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims()),
+		rootQuantizer: quantize.NewUnQuantizer(quantizer.GetDims(), quantizer.GetDistanceMetric()),
 		quantizer:     quantizer,
 	}
 
@@ -600,11 +599,13 @@ func (s *Store) MarshalBinary() (data []byte, err error) {
 	}
 
 	storeProto := StoreProto{
-		Config:     vecpb.Config{Dims: int32(s.dims), Seed: s.seed},
-		Partitions: make([]PartitionProto, 0, len(s.mu.partitions)),
-		NextKey:    s.mu.nextKey,
-		Vectors:    make([]VectorProto, 0, len(s.mu.vectors)),
-		Stats:      s.mu.stats,
+		Dims:           s.dims,
+		Seed:           s.seed,
+		DistanceMetric: s.quantizer.GetDistanceMetric(),
+		Partitions:     make([]PartitionProto, 0, len(s.mu.partitions)),
+		NextKey:        s.mu.nextKey,
+		Vectors:        make([]VectorProto, 0, len(s.mu.vectors)),
+		Stats:          s.mu.stats,
 	}
 
 	// Remap partitions to protobufs.
@@ -664,10 +665,16 @@ func Load(data []byte) (*Store, error) {
 		return nil, err
 	}
 
+	raBitQuantizer := quantize.NewRaBitQuantizer(
+		storeProto.Dims, storeProto.Seed, storeProto.DistanceMetric)
+	unquantizer := quantize.NewUnQuantizer(storeProto.Dims, storeProto.DistanceMetric)
+
 	// Construct the InMemoryStore object.
 	inMemStore := &Store{
-		dims: int(storeProto.Config.Dims),
-		seed: storeProto.Config.Seed,
+		dims:          storeProto.Dims,
+		seed:          storeProto.Seed,
+		rootQuantizer: unquantizer,
+		quantizer:     raBitQuantizer,
 	}
 	inMemStore.mu.clock = 2
 	inMemStore.mu.partitions = make(map[qualifiedPartitionKey]*memPartition, len(storeProto.Partitions))
@@ -675,9 +682,6 @@ func Load(data []byte) (*Store, error) {
 	inMemStore.mu.vectors = make(map[string]vector.T, len(storeProto.Vectors))
 	inMemStore.mu.stats = storeProto.Stats
 	inMemStore.mu.pending.Init()
-
-	raBitQuantizer := quantize.NewRaBitQuantizer(int(storeProto.Config.Dims), storeProto.Config.Seed)
-	unquantizer := quantize.NewUnQuantizer(int(storeProto.Config.Dims))
 
 	// Construct the Partition objects.
 	for i := range storeProto.Partitions {
@@ -692,17 +696,20 @@ func Load(data []byte) (*Store, error) {
 
 		var quantizer quantize.Quantizer
 		var quantizedSet quantize.QuantizedVectorSet
+		var centroid vector.T
 		if partitionProto.RaBitQ != nil {
 			quantizer = raBitQuantizer
 			quantizedSet = partitionProto.RaBitQ
+			centroid = partitionProto.RaBitQ.Centroid
 		} else {
 			quantizer = unquantizer
 			quantizedSet = partitionProto.UnQuantized
+			centroid = make(vector.T, unquantizer.GetDims())
 		}
 
 		metadata := cspann.PartitionMetadata{
 			Level:    partitionProto.Metadata.Level,
-			Centroid: quantizedSet.GetCentroid(),
+			Centroid: centroid,
 			StateDetails: cspann.PartitionStateDetails{
 				State:   partitionProto.Metadata.State,
 				Target1: partitionProto.Metadata.Target1,

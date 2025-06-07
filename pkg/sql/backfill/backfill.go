@@ -404,8 +404,9 @@ func (cb *ColumnBackfiller) RunColumnBackfillChunk(
 		// VectorIndexUpdateHelper in this case.
 		var pm row.PartialIndexUpdateHelper
 		var vh row.VectorIndexUpdateHelper
+		var oth row.OriginTimestampCPutHelper
 		if _, err := ru.UpdateRow(
-			ctx, b, oldValues, updateValues, pm, vh, nil, false /* mustValidateOldPKValues */, traceKV,
+			ctx, b, oldValues, updateValues, pm, vh, oth, false /* mustValidateOldPKValues */, traceKV,
 		); err != nil {
 			return roachpb.Key{}, err
 		}
@@ -1134,6 +1135,8 @@ func (ib *IndexBackfiller) BuildIndexEntriesChunk(
 			}
 
 			if ib.rowVals[vectorIndexHelper.vectorOrd] == tree.DNull {
+				ib.vectorEncodingHelper.QuantizedVecs[indexID] = tree.DNull
+				ib.vectorEncodingHelper.PartitionKeys[indexID] = tree.DNull
 				continue
 			}
 
