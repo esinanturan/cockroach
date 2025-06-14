@@ -99,20 +99,17 @@ type poster struct {
 		opts *github.CommitsListOptions) ([]*github.RepositoryCommit, *github.Response, error)
 	listMilestones func(ctx context.Context, owner string, repo string,
 		opt *github.MilestoneListOptions) ([]*github.Milestone, *github.Response, error)
-	createProjectCard func(ctx context.Context, columnID int64,
-		opt *github.ProjectCardOptions) (*github.ProjectCard, *github.Response, error)
 }
 
 func newPoster(l Logger, client *github.Client, opts *Options) *poster {
 	return &poster{
-		Options:           opts,
-		l:                 l,
-		createIssue:       client.Issues.Create,
-		searchIssues:      client.Search.Issues,
-		createComment:     client.Issues.CreateComment,
-		listCommits:       client.Repositories.ListCommits,
-		listMilestones:    client.Issues.ListMilestones,
-		createProjectCard: client.Projects.CreateProjectCard,
+		Options:        opts,
+		l:              l,
+		createIssue:    client.Issues.Create,
+		searchIssues:   client.Search.Issues,
+		createComment:  client.Issues.CreateComment,
+		listCommits:    client.Repositories.ListCommits,
+		listMilestones: client.Issues.ListMilestones,
 	}
 }
 
@@ -252,12 +249,6 @@ type TemplateData struct {
 	ArtifactsURL string
 	// URL is the link to the failing build.
 	URL string
-	// SideEyeSnapshotURL is the URL for accessing a Side-Eye snapshot associated
-	// with this test failure. Empty if no such snapshot exists.
-	SideEyeSnapshotURL string
-	// SideEyeSnapshotMsg is a message to prepend to the link to the SideEye
-	// snapshot. Empty if SideEyeSnapshotURL is empty.
-	SideEyeSnapshotMsg string
 	// Issues that match this one, except they're on other branches.
 	RelatedIssues []github.Issue
 	// InternalLog contains information about non-critical issues encountered
@@ -273,18 +264,16 @@ func (p *poster) templateData(
 		artifactsURL = p.teamcityArtifactsURL(req.Artifacts).String()
 	}
 	return TemplateData{
-		PostRequest:        req,
-		PackageNameShort:   strings.TrimPrefix(req.PackageName, CockroachPkgPrefix),
-		Parameters:         p.parameters(req.ExtraParams),
-		CondensedMessage:   CondensedMessage(req.Message),
-		Commit:             p.SHA,
-		CommitURL:          fmt.Sprintf("https://github.com/%s/%s/commits/%s", p.Org, p.Repo, p.SHA),
-		Branch:             p.Branch,
-		ArtifactsURL:       artifactsURL,
-		URL:                p.buildURL().String(),
-		SideEyeSnapshotURL: req.SideEyeSnapshotURL,
-		SideEyeSnapshotMsg: req.SideEyeSnapshotMsg,
-		RelatedIssues:      relatedIssues,
+		PostRequest:      req,
+		PackageNameShort: strings.TrimPrefix(req.PackageName, CockroachPkgPrefix),
+		Parameters:       p.parameters(req.ExtraParams),
+		CondensedMessage: CondensedMessage(req.Message),
+		Commit:           p.SHA,
+		CommitURL:        fmt.Sprintf("https://github.com/%s/%s/commits/%s", p.Org, p.Repo, p.SHA),
+		Branch:           p.Branch,
+		ArtifactsURL:     artifactsURL,
+		URL:              p.buildURL().String(),
+		RelatedIssues:    relatedIssues,
 	}
 }
 
@@ -449,19 +438,6 @@ func (p *poster) post(
 		result.Type = TestFailureNewIssue
 		result.ID = *issue.Number
 		p.l.Printf("%s", result)
-		if req.ProjectColumnID != 0 {
-			_, _, err := p.createProjectCard(ctx, int64(req.ProjectColumnID), &github.ProjectCardOptions{
-				ContentID:   *issue.ID,
-				ContentType: "Issue",
-			})
-			if err != nil {
-				// Tough luck, keep going.
-				//
-				// TODO(tbg): retrieve the project column ID before posting, so that if
-				// it can't be found we can mention that in the issue we'll file anyway.
-				p.l.Printf("could not create GitHub project card: %v", err)
-			}
-		}
 	} else {
 		comment := github.IssueComment{Body: github.String(body)}
 		if _, _, err := p.createComment(
@@ -559,12 +535,6 @@ type PostRequest struct {
 	// A path to the test artifacts relative to the artifacts root. If nonempty,
 	// allows the poster formatter to construct a direct URL to this directory.
 	Artifacts string
-	// SideEyeSnapshotURL is the URL for accessing a Side-Eye snapshot associated
-	// with this test failure. Empty if no such snapshot exists.
-	SideEyeSnapshotURL string
-	// SideEyeSnapshotMsg is a message to prepend to the link to the SideEye
-	// snapshot. Empty if SideEyeSnapshotURL is empty.
-	SideEyeSnapshotMsg string
 	// MentionOnCreate is a slice of GitHub handles (@foo, @cockroachdb/some-team, etc)
 	// that should be mentioned in the message when creating a new issue. These are
 	// *not* mentioned when posting to an existing issue.
@@ -572,10 +542,6 @@ type PostRequest struct {
 	// A help section of the issue, for example with links to documentation or
 	// instructions on how to reproduce the issue.
 	HelpCommand func(*Renderer)
-
-	// ProjectColumnID is the id of the GitHub project column to add the issue to,
-	// or 0 if none.
-	ProjectColumnID int
 }
 
 func (r PostRequest) labels() []string {

@@ -28,6 +28,26 @@ func (m *AdminQuery) AppendJSONFields(printComma bool, b redact.RedactableBytes)
 }
 
 // AppendJSONFields implements the EventPayload interface.
+func (m *AlterChangefeed) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
+
+	printComma, b = m.CommonChangefeedEventDetails.AppendJSONFields(printComma, b)
+
+	if m.PreviousDescription != "" {
+		if printComma {
+			b = append(b, ',')
+		}
+		printComma = true
+		b = append(b, "\"PreviousDescription\":\""...)
+		b = append(b, redact.StartMarker()...)
+		b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(m.PreviousDescription)))))
+		b = append(b, redact.EndMarker()...)
+		b = append(b, '"')
+	}
+
+	return printComma, b
+}
+
+// AppendJSONFields implements the EventPayload interface.
 func (m *AlterDatabaseAddRegion) AppendJSONFields(printComma bool, b redact.RedactableBytes) (bool, redact.RedactableBytes) {
 
 	printComma, b = m.CommonEventDetails.AppendJSONFields(printComma, b)
@@ -3287,9 +3307,7 @@ func (m *HotRangesStats) AppendJSONFields(printComma bool, b redact.RedactableBy
 				b = append(b, ',')
 			}
 			b = append(b, '"')
-			b = append(b, redact.StartMarker()...)
-			b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(v)))))
-			b = append(b, redact.EndMarker()...)
+			b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), v))
 			b = append(b, '"')
 		}
 		b = append(b, ']')
@@ -3306,9 +3324,7 @@ func (m *HotRangesStats) AppendJSONFields(printComma bool, b redact.RedactableBy
 				b = append(b, ',')
 			}
 			b = append(b, '"')
-			b = append(b, redact.StartMarker()...)
-			b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(v)))))
-			b = append(b, redact.EndMarker()...)
+			b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), v))
 			b = append(b, '"')
 		}
 		b = append(b, ']')
@@ -3325,9 +3341,7 @@ func (m *HotRangesStats) AppendJSONFields(printComma bool, b redact.RedactableBy
 				b = append(b, ',')
 			}
 			b = append(b, '"')
-			b = append(b, redact.StartMarker()...)
-			b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), string(redact.EscapeMarkers([]byte(v)))))
-			b = append(b, redact.EndMarker()...)
+			b = redact.RedactableBytes(jsonbytes.EncodeString([]byte(b), v))
 			b = append(b, '"')
 		}
 		b = append(b, ']')

@@ -112,8 +112,6 @@ type LineWidthMode int
 const (
 	// DefaultLineWidth is the line width used with the default pretty-printing configuration.
 	DefaultLineWidth = 60
-	// ConsoleLineWidth is the line width used on the frontend console.
-	ConsoleLineWidth = 108
 )
 
 // keywordWithText returns a pretty.Keyword with left and/or right
@@ -1810,12 +1808,19 @@ func (node *UniqueConstraintTableDef) doc(p *PrettyCfg) pretty.Doc {
 		if node.WithoutIndex {
 			title = pretty.ConcatSpace(title, pretty.Keyword("WITHOUT INDEX"))
 		}
+		if node.FormatAsIndex {
+			title = pretty.ConcatSpace(title, pretty.Keyword("INDEX"))
+		}
+	}
+	if node.Name != "" {
+		if node.FormatAsIndex {
+			title = pretty.ConcatSpace(title, p.Doc(&node.Name))
+		} else {
+			constraint := pretty.ConcatSpace(pretty.Keyword("CONSTRAINT"), p.Doc(&node.Name))
+			title = pretty.ConcatSpace(constraint, title)
+		}
 	}
 	title = pretty.ConcatSpace(title, p.bracket("(", p.Doc(&node.Columns), ")"))
-	if node.Name != "" {
-		clauses = append(clauses, title)
-		title = pretty.ConcatSpace(pretty.Keyword("CONSTRAINT"), p.Doc(&node.Name))
-	}
 	if node.Sharded != nil {
 		clauses = append(clauses, p.Doc(node.Sharded))
 	}

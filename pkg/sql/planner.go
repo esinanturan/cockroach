@@ -289,6 +289,22 @@ type planner struct {
 
 	// datumAlloc is used when decoding datums and running subqueries.
 	datumAlloc *tree.DatumAlloc
+
+	// This is a copy of txnState.mu.autoRetryCounter from when we started the
+	// statement.
+	autoRetryCounter int
+
+	// autoRetryStmtReason records the error that caused the most recent statement
+	// retry under READ COMMITTED isolation. This is used in statement traces and
+	// other diagnostics. It's similar to txnState.mu.autoRetryReason but for
+	// statement retries.
+	autoRetryStmtReason error
+
+	// autoRetryStmtCounter keeps track of the number of per-statement retries
+	// that have occurred under READ COMMITTED isolation for the current
+	// statement. It's similar to autoRetryCounter / txnState.mu.autoRetryCounter
+	// but for statement retries.
+	autoRetryStmtCounter int
 }
 
 // hasFlowForPausablePortal returns true if the planner is for re-executing a
@@ -930,12 +946,15 @@ func (p *planner) resetPlanner(
 
 	p.cancelChecker.Reset(ctx)
 
+	utc := p.semaCtx.UnsupportedTypeChecker
 	p.semaCtx = tree.MakeSemaContext(p)
 	p.semaCtx.SearchPath = &sd.SearchPath
 	p.semaCtx.Annotations = nil
 	p.semaCtx.DateStyle = sd.GetDateStyle()
 	p.semaCtx.IntervalStyle = sd.GetIntervalStyle()
-	p.semaCtx.UnsupportedTypeChecker = eval.NewUnsupportedTypeChecker(p.execCfg.Settings.Version)
+	p.semaCtx.UnsupportedTypeChecker = eval.ResetUnsupportedTypeChecker(
+		p.execCfg.Settings.Version, utc,
+	)
 	p.semaCtx.UsePre_25_2VariadicBuiltins = sd.UsePre_25_2VariadicBuiltins
 
 	p.autoCommit = false
@@ -946,6 +965,9 @@ func (p *planner) resetPlanner(
 	p.skipDescriptorCache = false
 	p.typeResolutionDbID = descpb.InvalidID
 	p.pausablePortal = nil
+	p.autoRetryCounter = 0
+	p.autoRetryStmtReason = nil
+	p.autoRetryStmtCounter = 0
 }
 
 // GetReplicationStreamManager returns a ReplicationStreamManager.
@@ -1048,4 +1070,9 @@ func (p *planner) StartHistoryRetentionJob(
 
 func (p *planner) ExtendHistoryRetention(ctx context.Context, jobID jobspb.JobID) error {
 	return ExtendHistoryRetention(ctx, p.EvalContext(), p.InternalSQLTxn(), jobID)
+}
+
+// RetryCounter is part of the eval.Planner interface.
+func (p *planner) RetryCounter() int {
+	return p.autoRetryCounter + p.autoRetryStmtCounter
 }

@@ -25,10 +25,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ccl/utilccl/licenseccl"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/roachprodutil"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/ssh"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/vm/gce"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
-	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/syncutil"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
@@ -386,7 +386,7 @@ func (c *SyncedCluster) fetchVersion(
 	ctx context.Context, l *logger.Logger, startOpts StartOpts,
 ) (*version.Version, error) {
 	node := c.Nodes[0]
-	runVersionCmd := cockroachNodeBinary(c, node) + " version --build-tag"
+	runVersionCmd := SuppressMetamorphicConstantsEnvVar() + " " + cockroachNodeBinary(c, node) + " version --build-tag"
 
 	result, err := c.runCmdOnSingleNode(ctx, l, node, runVersionCmd, defaultCmdOpts("run-cockroach-version"))
 	if err != nil {
@@ -443,7 +443,7 @@ func (c *SyncedCluster) Start(ctx context.Context, l *logger.Logger, startOpts S
 	for _, hook := range startOpts.PreStartHooks {
 		hookCtx, cancel := context.WithTimeout(ctx, hook.Timeout)
 		l.Printf("running pre-start hook: %s", hook.Name)
-		err := panicAsError(hookCtx, l, hook.Fn)
+		err := roachprodutil.PanicAsError(hookCtx, l, hook.Fn)
 		cancel()
 		if err != nil {
 			return err
@@ -864,7 +864,10 @@ func (c *SyncedCluster) generateStartCmd(
 		EnvVars: append(append([]string{
 			fmt.Sprintf("ROACHPROD=%s", c.roachprodEnvValue(node)),
 			"GOTRACEBACK=crash",
+			// N.B. disable telemetry (see `TelemetryOptOut`).
 			"COCKROACH_SKIP_ENABLING_DIAGNOSTIC_REPORTING=1",
+			// N.B. set crash reporting URL (see `crashReportURL()`) to the empty string to disable Sentry crash reports.
+			"COCKROACH_CRASH_REPORTS=",
 		}, c.Env...), getEnvVars()...),
 		Binary:              cockroachNodeBinary(c, node),
 		Args:                args,
@@ -1699,24 +1702,4 @@ type PreStartHook struct {
 	Name    string
 	Fn      func(context.Context) error
 	Timeout time.Duration
-}
-
-// logPanicToErr logs the panic stack trace and returns an error with the
-// panic message.
-func panicAsError(
-	ctx context.Context, l *logger.Logger, f func(context.Context) error,
-) (retErr error) {
-	defer func() {
-		if r := recover(); r != nil {
-			retErr = logPanicToErr(l, r)
-		}
-	}()
-	return f(ctx)
-}
-
-// logPanicToErr logs the panic stack trace and returns an error with the
-// panic message.
-func logPanicToErr(l *logger.Logger, r interface{}) error {
-	l.Printf("panic stack trace:\n%s", debugutil.Stack())
-	return fmt.Errorf("panic (stack trace above): %v", r)
 }

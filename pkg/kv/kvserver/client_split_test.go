@@ -42,7 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/spanconfig"
@@ -1515,6 +1515,7 @@ func TestStoreZoneUpdateAndRangeSplit(t *testing.T) {
 	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.target_duration = '20ms'`)
 	tdb.Exec(t, `SET CLUSTER SETTING kv.closed_timestamp.side_transport_interval = '20ms'`)
 	tdb.Exec(t, `SET CLUSTER SETTING kv.rangefeed.closed_timestamp_refresh_interval = '20ms'`)
+	tdb.Exec(t, `SET CLUSTER SETTING kv.range_split.by_load_enabled = false`)
 	tdb.Exec(t, "CREATE TABLE t ()")
 	var descID uint32
 	tdb.QueryRow(t, "SELECT 't'::regclass::int").Scan(&descID)
@@ -2580,7 +2581,7 @@ func TestStoreRangeSplitRaceUninitializedRHS(t *testing.T) {
 						From: raftpb.PeerID(replicas[1].ReplicaID),
 						Term: term,
 					},
-				}, rpc.DefaultClass); !sent {
+				}, rpcbase.DefaultClass); !sent {
 					// SendAsync can return false, indicating the message didn't send.
 					// The most likely reason this test encounters a message failing to
 					// send is the outgoing message queue being full. The queue filling
