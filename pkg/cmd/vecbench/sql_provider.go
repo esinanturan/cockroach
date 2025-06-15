@@ -16,10 +16,10 @@ import (
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/httputil"
 	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/errors"
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -44,6 +44,7 @@ func (s *SQLSearchState) Close() {
 type SQLProvider struct {
 	datasetName string
 	dims        int
+	distMetric  vecpb.DistanceMetric
 	options     cspann.IndexOptions
 	pool        *pgxpool.Pool
 	tableName   string
@@ -53,7 +54,11 @@ type SQLProvider struct {
 // NewSQLProvider creates a new SQLProvider that connects to a CockroachDB
 // instance.
 func NewSQLProvider(
-	ctx context.Context, datasetName string, dims int, options cspann.IndexOptions,
+	ctx context.Context,
+	datasetName string,
+	dims int,
+	distMetric vecpb.DistanceMetric,
+	options cspann.IndexOptions,
 ) (*SQLProvider, error) {
 	// Create connection pool.
 	config, err := pgxpool.ParseConfig(*flagDBConnStr)
@@ -83,6 +88,7 @@ func NewSQLProvider(
 
 	return &SQLProvider{
 		datasetName: datasetName,
+		distMetric:  distMetric,
 		dims:        dims,
 		options:     options,
 		pool:        pool,
@@ -130,12 +136,20 @@ func (s *SQLProvider) New(ctx context.Context) error {
 		return errors.Wrap(err, "dropping table")
 	}
 
+	var opClass string
+	switch s.distMetric {
+	case vecpb.CosineDistance:
+		opClass = " vector_cosine_ops"
+	case vecpb.InnerProductDistance:
+		opClass = " vector_ip_ops"
+	}
+
 	_, err = s.pool.Exec(ctx, fmt.Sprintf(`
 		CREATE TABLE %s (
 			id BYTES PRIMARY KEY,
 			embedding VECTOR(%d),
-			VECTOR INDEX (embedding)
-		)`, s.tableName, s.dims))
+			VECTOR INDEX (embedding%s)
+		)`, s.tableName, s.dims, opClass))
 	return errors.Wrap(err, "creating table")
 }
 
@@ -143,28 +157,27 @@ func (s *SQLProvider) New(ctx context.Context) error {
 func (s *SQLProvider) InsertVectors(
 	ctx context.Context, keys []cspann.KeyBytes, vectors vector.Set,
 ) error {
+	// Build insert query.
+	args := make([]any, vectors.Count*2)
+	var queryBuilder strings.Builder
+	queryBuilder.Grow(100 + vectors.Count*12)
+	queryBuilder.WriteString("INSERT INTO ")
+	queryBuilder.WriteString(s.tableName)
+	queryBuilder.WriteString(" (id, embedding) VALUES")
+	for i := range vectors.Count {
+		if i > 0 {
+			queryBuilder.WriteString(", ")
+		}
+		j := i * 2
+		fmt.Fprintf(&queryBuilder, " ($%d, $%d)", j+1, j+2)
+		args[j] = keys[i]
+		args[j+1] = vectors.At(i)
+	}
+	query := queryBuilder.String()
+
 	// Retry loop.
 	for {
-		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-			// Prepare batch insert.
-			batch := &pgx.Batch{}
-
-			// Insert vectors in batches.
-			for i := range vectors.Count {
-				batch.Queue(fmt.Sprintf(
-					"INSERT INTO %s (id, embedding) VALUES ($1, $2)",
-					s.tableName),
-					keys[i],
-					vectors.At(i),
-				)
-			}
-
-			br := tx.SendBatch(ctx, batch)
-			if err := br.Close(); err != nil {
-				return errors.Wrap(err, "closing batch")
-			}
-			return nil
-		})
+		_, err := s.pool.Exec(ctx, query, args...)
 
 		var pgErr *pgconn.PgError
 		if err != nil && errors.As(err, &pgErr) {
@@ -201,13 +214,23 @@ func (s *SQLProvider) SetupSearch(
 		return nil, errors.Wrap(err, "setting vector_search_beam_size")
 	}
 
+	var op string
+	switch s.distMetric {
+	case vecpb.L2SquaredDistance:
+		op = "<->"
+	case vecpb.CosineDistance:
+		op = "<=>"
+	case vecpb.InnerProductDistance:
+		op = "<#>"
+	}
+
 	// Construct the query for vector search.
 	query := fmt.Sprintf(`
 		SELECT id
 		FROM %s
-		ORDER BY embedding <-> $1
+		ORDER BY embedding %s $1
 		LIMIT %d
-	`, s.tableName, maxResults)
+	`, s.tableName, op, maxResults)
 
 	state := &SQLSearchState{
 		conn:  conn,

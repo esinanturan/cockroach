@@ -445,6 +445,7 @@ func (b *Builder) resolveAndBuildScalar(
 	context exprKind,
 	flags tree.SemaRejectFlags,
 	inScope *scope,
+	colRefs *opt.ColSet,
 ) opt.ScalarExpr {
 	// We need to save and restore the previous value of the field in
 	// semaCtx in case we are recursively called within a subquery
@@ -454,13 +455,15 @@ func (b *Builder) resolveAndBuildScalar(
 
 	inScope.context = context
 	texpr := inScope.resolveAndRequireType(expr, requiredType)
-	return b.buildScalar(texpr, inScope, nil, nil, nil)
+	return b.buildScalar(texpr, inScope, nil, nil, colRefs)
 }
 
-// In Postgres, qualifying an object name with pg_temp is equivalent to explicitly
-// specifying TEMP/TEMPORARY in the CREATE syntax. resolveTemporaryStatus returns
-// true if either(or both) of these conditions are true.
-func resolveTemporaryStatus(name *tree.TableName, persistence tree.Persistence) bool {
+// resolveTemporaryStatus checks for the pg_temp naming convention from
+// Postgres, where qualifying an object name with pg_temp is equivalent to
+// explicitly specifying TEMP/TEMPORARY in the CREATE syntax.
+// resolveTemporaryStatus returns true if either(or both) of these conditions
+// are true.
+func resolveTemporaryStatus(name tree.ObjectNamePrefix, persistence tree.Persistence) bool {
 	// An explicit schema can only be provided in the CREATE TEMP TABLE statement
 	// iff it is pg_temp.
 	if persistence.IsTemporary() && name.ExplicitSchema && name.SchemaName != catconstants.PgTempSchemaName {
@@ -796,7 +799,7 @@ func tableOrdinals(tab cat.Table, k columnKinds) []int {
 // addBarrier adds an optimization barrier to the given scope, in order to
 // prevent side effects from being duplicated, eliminated, or reordered.
 func (b *Builder) addBarrier(s *scope) {
-	s.expr = b.factory.ConstructBarrier(s.expr)
+	s.expr = b.factory.ConstructBarrier(s.expr, false /* leakproofPermeable */)
 }
 
 // projectColWithMetadataName projects a new anonymous column with the given
@@ -847,4 +850,42 @@ func (b *Builder) makePLpgSQLRaiseFn(args memo.ScalarListExpr) opt.ScalarExpr {
 			Overload:   &overloads[0],
 		},
 	)
+}
+
+// appendOrdinaryColumnsFromTable adds all non-mutation and non-system columns
+// from the given table metadata to the given scope. References to these columns
+// will be tracked in the schema dependencies, if trackSchemaDeps is set.
+func (b *Builder) appendOrdinaryColumnsFromTable(
+	s *scope, tabMeta *opt.TableMeta, alias *tree.TableName,
+) {
+	tab := tabMeta.Table
+	if s.cols == nil {
+		s.cols = make([]scopeColumn, 0, tab.ColumnCount())
+	}
+	for i, n := 0, tab.ColumnCount(); i < n; i++ {
+		tabCol := tab.Column(i)
+		if tabCol.Kind() != cat.Ordinary {
+			continue
+		}
+		s.cols = append(s.cols, scopeColumn{
+			name:       scopeColName(tabCol.ColName()),
+			table:      *alias,
+			typ:        tabCol.DatumType(),
+			id:         tabMeta.MetaID.ColumnID(i),
+			visibility: columnVisibility(tabCol.Visibility()),
+		})
+	}
+	if b.trackSchemaDeps && b.evalCtx.SessionData().UseImprovedRoutineDependencyTracking {
+		dep := opt.SchemaDep{DataSource: tab}
+		for i, n := 0, tab.ColumnCount(); i < n; i++ {
+			if tab.Column(i).Kind() != cat.Ordinary {
+				continue
+			}
+			if dep.ColumnIDToOrd == nil {
+				dep.ColumnIDToOrd = make(map[opt.ColumnID]int)
+			}
+			dep.ColumnIDToOrd[tabMeta.MetaID.ColumnID(i)] = i
+		}
+		b.schemaDeps = append(b.schemaDeps, dep)
+	}
 }

@@ -12,7 +12,9 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/quantize"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecencoding"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/leaktest"
+	"github.com/cockroachdb/cockroach/pkg/util/num32"
 	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/stretchr/testify/require"
 )
@@ -22,8 +24,8 @@ func TestCodec(t *testing.T) {
 
 	// Create test vectors and partitions
 	dims := 4
-	rootQuantizer := quantize.NewUnQuantizer(dims)
-	nonRootQuantizer := quantize.NewRaBitQuantizer(dims, 42)
+	rootQuantizer := quantize.NewUnQuantizer(dims, vecpb.L2SquaredDistance)
+	nonRootQuantizer := quantize.NewRaBitQuantizer(dims, 42, vecpb.L2SquaredDistance)
 
 	// Create sample vectors
 	vectors := []vector.T{
@@ -41,6 +43,15 @@ func TestCodec(t *testing.T) {
 	})
 
 	t.Run("encode and decode a non-root partition", func(t *testing.T) {
+		testEncodeDecode(t, rootQuantizer, nonRootQuantizer, cspann.PartitionKey(42), vectors, nonRootCentroid)
+	})
+
+	t.Run("encode and decode a partition with alternate distance metric", func(t *testing.T) {
+		rootQuantizer = quantize.NewUnQuantizer(dims, vecpb.CosineDistance)
+		nonRootQuantizer = quantize.NewRaBitQuantizer(dims, 42, vecpb.CosineDistance)
+		for _, vec := range vectors {
+			num32.Normalize(vec)
+		}
 		testEncodeDecode(t, rootQuantizer, nonRootQuantizer, cspann.PartitionKey(42), vectors, nonRootCentroid)
 	})
 }

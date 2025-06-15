@@ -571,7 +571,11 @@ func makeCreateRegDef(typ *types.T) builtinDefinition {
 }
 
 func makeToRegOverload(typ *types.T, helpText string) builtinDefinition {
-	return makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+	return makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
+		},
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "text", Typ: types.String},
@@ -918,7 +922,10 @@ var pgBuiltins = map[string]builtinDefinition{
 	// none.
 	// https://www.postgresql.org/docs/11/functions-info.html
 	"pg_my_temp_schema": makeBuiltin(
-		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
 		tree.Overload{
 			Types:      tree.ParamTypes{},
 			ReturnType: tree.FixedReturnType(types.Oid),
@@ -951,7 +958,10 @@ var pgBuiltins = map[string]builtinDefinition{
 	// session's temporary schema.
 	// https://www.postgresql.org/docs/11/functions-info.html
 	"pg_is_other_temp_schema": makeBuiltin(
-		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),

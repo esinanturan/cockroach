@@ -31,8 +31,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/raft/raftpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
@@ -346,6 +346,8 @@ func NewTestCluster(
 			serverArgs.Settings = cluster.TestingCloneClusterSettings(serverArgs.Settings)
 		}
 
+		serverutils.TryEnableDRPCSetting(context.Background(), t, &serverArgs)
+
 		// If a reusable listener registry is provided, create reusable listeners
 		// for every server that doesn't have a custom listener provided. (Only
 		// servers with a reusable listener can be restarted).
@@ -510,7 +512,7 @@ func (tc *TestCluster) Start(t serverutils.TestFataler) {
 					dsrv.SystemLayer().AdvRPCAddr(),
 					stl.NodeID(),
 					roachpb.Locality{},
-					rpc.DefaultClass,
+					rpcbase.DefaultClass,
 				).Connect(context.TODO())
 				err = errors.CombineErrors(err, e)
 			}
@@ -1673,7 +1675,7 @@ func (tc *TestCluster) WaitForNodeStatuses(t serverutils.TestFataler) {
 			srv.AdvRPCAddr(),
 			tc.Server(0).StorageLayer().NodeID(),
 			roachpb.Locality{},
-			rpc.DefaultClass,
+			rpcbase.DefaultClass,
 		).Connect(context.TODO())
 		if err != nil {
 			return err
@@ -1952,8 +1954,8 @@ func (tc *TestCluster) RestartServerWithInspect(
 						if tc.ServerStopped(idx) {
 							continue
 						}
-						for i := 0; i < rpc.NumConnectionClasses; i++ {
-							class := rpc.ConnectionClass(i)
+						for i := 0; i < rpcbase.NumConnectionClasses; i++ {
+							class := rpcbase.ConnectionClass(i)
 							otherID := s.StorageLayer().NodeID()
 							if _, err := s.SystemLayer().NodeDialer().(*nodedialer.Dialer).Dial(ctx, id, class); err != nil {
 								return errors.Wrapf(err, "connecting n%d->n%d (class %v)", otherID, id, class)

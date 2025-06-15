@@ -98,6 +98,7 @@ func (r *logicalReplicationResumer) handleResumeError(
 	ctx context.Context, execCtx sql.JobExecContext, err error,
 ) error {
 	if err == nil {
+		r.updateStatusMessage(ctx, "")
 		return nil
 	}
 	if jobs.IsPermanentJobError(err) {
@@ -320,6 +321,15 @@ func (r *logicalReplicationResumer) ingest(
 		err := heartbeatSender.Wait()
 		return err
 	}
+
+	defer func() {
+		if l := payload.MetricsLabel; l != "" {
+			metrics.LabeledScanningRanges.Update(map[string]string{"label": l}, 0)
+			metrics.LabeledCatchupRanges.Update(map[string]string{"label": l}, 0)
+		}
+		metrics.ScanningRanges.Update(0)
+		metrics.CatchupRanges.Update(0)
+	}()
 
 	err = ctxgroup.GoAndWait(ctx, execPlan, replanner, startHeartbeat)
 	if errors.Is(err, sql.ErrPlanChanged) {

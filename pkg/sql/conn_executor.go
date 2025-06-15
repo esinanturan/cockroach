@@ -616,6 +616,8 @@ func makeMetrics(internal bool, sv *settings.Values) Metrics {
 			TransactionTimeoutCount:           metric.NewCounter(getMetricMeta(MetaTransactionTimeout, internal)),
 			FullTableOrIndexScanCount:         aggmetric.NewSQLCounter(getMetricMeta(MetaFullTableOrIndexScan, internal)),
 			FullTableOrIndexScanRejectedCount: metric.NewCounter(getMetricMeta(MetaFullTableOrIndexScanRejected, internal)),
+			TxnRetryCount:                     metric.NewCounter(getMetricMeta(MetaTxnRetry, internal)),
+			StatementRetryCount:               metric.NewCounter(getMetricMeta(MetaStatementRetry, internal)),
 		},
 		StartedStatementCounters:  makeStartedStatementCounters(internal),
 		ExecutedStatementCounters: makeExecutedStatementCounters(internal),
@@ -725,6 +727,11 @@ func (s *Server) GetLocalSQLStatsProvider() *sslocal.SQLStats {
 // sql stats sink.
 func (s *Server) GetReportedSQLStatsProvider() *sslocal.SQLStats {
 	return s.reportedStats
+}
+
+// GetSQLStatsIngester returns the sqlstats.Ingester for the current sql.Server.
+func (s *Server) GetSQLStatsIngester() *sslocal.SQLStatsIngester {
+	return s.sqlStatsIngester
 }
 
 // GetTxnIDCache returns the txnidcache.Cache for the current sql.Server.
@@ -3535,6 +3542,11 @@ func (ex *connExecutor) setTransactionModes(
 		level := ex.txnIsolationLevelToKV(ctx, modes.Isolation)
 		if err := ex.state.setIsolationLevel(level); err != nil {
 			return pgerror.WithCandidateCode(err, pgcode.ActiveSQLTransaction)
+		}
+		if level != isolation.Serializable {
+			// TODO(#143497): we currently only support buffered writes under
+			// serializable isolation.
+			ex.state.mu.txn.SetBufferedWritesEnabled(false)
 		}
 	}
 	rwMode := modes.ReadWriteMode

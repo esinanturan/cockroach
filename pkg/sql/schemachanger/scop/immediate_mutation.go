@@ -732,6 +732,24 @@ type RemoveTableColumnBackReferencesInFunctions struct {
 	FunctionIDs            []descpb.ID
 }
 
+// AddTableIndexBackReferencesInFunctions adds back-references to indexes
+// from referenced functions.
+type AddTableIndexBackReferencesInFunctions struct {
+	immediateMutationOp
+	BackReferencedTableID descpb.ID
+	BackReferencedIndexID descpb.IndexID
+	FunctionIDs           []descpb.ID
+}
+
+// RemoveTableIndexBackReferencesInFunctions removes back-references to indexes
+// from referenced functions.
+type RemoveTableIndexBackReferencesInFunctions struct {
+	immediateMutationOp
+	BackReferencedTableID descpb.ID
+	BackReferencedIndexID descpb.IndexID
+	FunctionIDs           []descpb.ID
+}
+
 // AddTriggerBackReferencesInRoutines adds back references to a trigger from
 // referenced functions.
 type AddTriggerBackReferencesInRoutines struct {
@@ -1013,10 +1031,14 @@ type UpdateFunctionRelationReferences struct {
 	FunctionReferences []descpb.ID
 }
 
+// UpdateTableBackReferencesInRelations updates the DependedOnBy metadata in
+// relation descriptors (e.g., tableDesc) for triggers. It handles both adding
+// and removing dependencies. The function relies on forward references being
+// set beforehand to determine whether a back-reference should be added or removed.
 type UpdateTableBackReferencesInRelations struct {
 	immediateMutationOp
-	TableID     descpb.ID
-	RelationIDs []descpb.ID
+	TableID            descpb.ID
+	RelationReferences []scpb.TriggerDeps_RelationReference
 }
 
 type SetObjectParentID struct {

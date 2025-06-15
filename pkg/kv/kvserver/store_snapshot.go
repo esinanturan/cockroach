@@ -34,7 +34,6 @@ import (
 	"github.com/cockroachdb/pebble/objstorage"
 	"go.opentelemetry.io/otel/attribute"
 	"golang.org/x/time/rate"
-	"google.golang.org/grpc"
 )
 
 const (
@@ -274,10 +273,8 @@ func (s *Store) throttleSnapshot(
 			if err := ctx.Err(); err != nil {
 				return nil, errors.Wrap(err, "acquiring snapshot reservation")
 			}
-			return nil, errors.Wrapf(
-				queueCtx.Err(),
-				"giving up during snapshot reservation due to cluster setting %q",
-				snapshotReservationQueueTimeoutFraction.Name(),
+			return nil, kvpb.NewSnapshotReservationTimeoutError(
+				queueCtx.Err(), string(snapshotReservationQueueTimeoutFraction.Name()),
 			)
 		case <-s.stopper.ShouldQuiesce():
 			return nil, errors.Errorf("stopped")
@@ -404,7 +401,7 @@ func (s *Store) checkSnapshotOverlapLocked(
 
 	// TODO(benesch): consider discovering and GC'ing *all* overlapping ranges,
 	// not just the first one that getOverlappingKeyRangeLocked happens to return.
-	if it := s.getOverlappingKeyRangeLocked(&desc); it.item != nil {
+	if it := s.getOverlappingKeyRangeLocked(&desc); !it.isEmpty() {
 		// We have a conflicting range, so we must block the snapshot.
 		// When such a conflict exists, it will be resolved by one range
 		// either being split or garbage collected.
@@ -468,7 +465,7 @@ func (s *Store) receiveSnapshot(
 	ctx context.Context, header *kvserverpb.SnapshotRequest_Header, stream incomingSnapshotStream,
 ) error {
 	// Draining nodes will generally not be rebalanced to (see the filtering that
-	// happens in getStoreListFromIDsLocked()), but in case they are, they should
+	// happens in getStoreListFromIDs()), but in case they are, they should
 	// reject the incoming rebalancing snapshots.
 	if s.IsDraining() {
 		switch t := header.SenderQueueName; t {
@@ -669,7 +666,7 @@ func SendEmptySnapshot(
 	clusterID uuid.UUID,
 	st *cluster.Settings,
 	tracer *tracing.Tracer,
-	cc *grpc.ClientConn,
+	mrc MultiRaftClient,
 	now hlc.Timestamp,
 	desc roachpb.RangeDescriptor,
 	to roachpb.ReplicaDescriptor,
@@ -769,7 +766,7 @@ func SendEmptySnapshot(
 		RangeKeysInOrder:   true,
 	}
 
-	stream, err := NewMultiRaftClient(cc).RaftSnapshot(ctx)
+	stream, err := mrc.RaftSnapshot(ctx)
 	if err != nil {
 		return err
 	}

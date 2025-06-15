@@ -151,8 +151,8 @@ type pendingTruncation struct {
 	//   is adjusted on this replica using SideloadStorage.Stats, but it is
 	//   possible that the truncated state of this replica is already >
 	//   expectedFirstIndex. We don't actually set isDeltaTrusted=false for this
-	//   case since we will change Replica.raftLogSizeTrusted to false after
-	//   enacting this truncation.
+	//   case since we will change replicaLogStorage.shMu.sizeTrusted to false
+	//   after enacting this truncation.
 	// - We merge pendingTruncation entries in the pendingTruncations struct. We
 	//   are making an effort to have consecutive TruncateLogRequests provide us
 	//   stats for index intervals that are adjacent and non-overlapping, but
@@ -162,7 +162,7 @@ type pendingTruncation struct {
 	// ReplicatedEvalResult.RaftLogDelta, this is <= 0.
 	logDeltaBytes  int64
 	isDeltaTrusted bool
-	// hasSideloaded is true if the truncated interval contains at least one
+	// hasSideloaded is true if the truncated interval could contain at least one
 	// sideloaded entry.
 	hasSideloaded bool
 }

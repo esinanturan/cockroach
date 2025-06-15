@@ -67,7 +67,7 @@ import (
 	"github.com/cockroachdb/pebble/tool"
 	"github.com/cockroachdb/pebble/vfs"
 	"github.com/cockroachdb/ttycolor"
-	humanize "github.com/dustin/go-humanize"
+	"github.com/dustin/go-humanize"
 	"github.com/gogo/protobuf/jsonpb"
 	"github.com/kr/pretty"
 	"github.com/spf13/cobra"
@@ -495,43 +495,49 @@ func runDebugRangeData(cmd *cobra.Command, args []string) error {
 	defer snapshot.Close()
 
 	var results int
-	return rditer.IterateReplicaKeySpans(cmd.Context(), &desc, snapshot, debugCtx.replicated,
-		rditer.ReplicatedSpansAll,
-		func(iter storage.EngineIterator, _ roachpb.Span) error {
-			for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
-				hasPoint, hasRange := iter.HasPointAndRange()
-				if hasPoint {
-					key, err := iter.UnsafeEngineKey()
-					if err != nil {
-						return err
-					}
-					v, err := iter.UnsafeValue()
-					if err != nil {
-						return err
-					}
-					print.PrintEngineKeyValue(key, v)
+	return rditer.IterateReplicaKeySpans(cmd.Context(), &desc, snapshot, rditer.SelectOpts{
+		Ranged: rditer.SelectRangedOptions{
+			SystemKeys: true,
+			LockTable:  true,
+			UserKeys:   true,
+		},
+		ReplicatedByRangeID:   true,
+		UnreplicatedByRangeID: !debugCtx.replicated,
+	}, func(iter storage.EngineIterator, _ roachpb.Span) error {
+		for ok := true; ok && err == nil; ok, err = iter.NextEngineKey() {
+			hasPoint, hasRange := iter.HasPointAndRange()
+			if hasPoint {
+				key, err := iter.UnsafeEngineKey()
+				if err != nil {
+					return err
+				}
+				v, err := iter.UnsafeValue()
+				if err != nil {
+					return err
+				}
+				print.PrintEngineKeyValue(key, v)
+				results++
+				if results == debugCtx.maxResults {
+					return iterutil.StopIteration()
+				}
+			}
+
+			if hasRange && iter.RangeKeyChanged() {
+				bounds, err := iter.EngineRangeBounds()
+				if err != nil {
+					return err
+				}
+				for _, v := range iter.EngineRangeKeys() {
+					print.PrintEngineRangeKeyValue(bounds, v)
 					results++
 					if results == debugCtx.maxResults {
 						return iterutil.StopIteration()
 					}
 				}
-
-				if hasRange && iter.RangeKeyChanged() {
-					bounds, err := iter.EngineRangeBounds()
-					if err != nil {
-						return err
-					}
-					for _, v := range iter.EngineRangeKeys() {
-						print.PrintEngineRangeKeyValue(bounds, v)
-						results++
-						if results == debugCtx.maxResults {
-							return iterutil.StopIteration()
-						}
-					}
-				}
 			}
-			return err
-		})
+		}
+		return err
+	})
 }
 
 var debugRangeDescriptorsCmd = &cobra.Command{
@@ -973,7 +979,7 @@ func runDebugCompact(cmd *cobra.Command, args []string) error {
 	// Begin compacting the store in a separate goroutine.
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- errors.Wrap(db.Compact(), "while compacting")
+		errCh <- errors.Wrap(db.Compact(context.Background()), "while compacting")
 	}()
 
 	// Print the current LSM every minute.
@@ -1031,12 +1037,13 @@ func runDebugGossipValues(cmd *cobra.Command, args []string) error {
 			return errors.Wrap(err, "failed to parse provided file as gossip.InfoStatus")
 		}
 	} else {
-		status, finish, err := getStatusClient(ctx, serverCfg)
+		conn, finish, err := newClientConn(ctx, serverCfg)
 		if err != nil {
 			return err
 		}
 		defer finish()
 
+		status := conn.NewStatusClient()
 		gossipInfo, err = status.Gossip(ctx, &serverpb.GossipRequest{})
 		if err != nil {
 			return errors.Wrap(err, "failed to retrieve gossip from server")
@@ -1559,7 +1566,7 @@ func init() {
 		"Name of the cluster to associate with the debug zip artifacts. This can be used to identify data in the upstream observability tool.")
 	f.Var(&debugZipUploadOpts.from, "from", "oldest timestamp to include (inclusive)")
 	f.Var(&debugZipUploadOpts.to, "to", "newest timestamp to include (inclusive)")
-	f.StringVar(&debugZipUploadOpts.logFormat, "log-format", "crdb-v1",
+	f.StringVar(&debugZipUploadOpts.logFormat, "log-format", "crdb-v1-zip-upload",
 		"log format of the input files")
 	// the log-format flag is depricated. It will
 	// eventually be removed completely. keeping it hidden for now incase we ever
@@ -1567,6 +1574,9 @@ func init() {
 	f.Lookup("log-format").Hidden = true
 	f.StringVar(&debugZipUploadOpts.gcpProjectID, "gcp-project-id",
 		defaultGCPProjectID, "GCP project ID to use to send debug.zip logs to GCS")
+	// --dry-run is a hidden flag that is only meant to be used for testing and diagnostics
+	f.BoolVar(&debugZipUploadOpts.dryRun, "dry-run", false, "run in dry-run mode without making any actual uploads")
+	f.Lookup("dry-run").Hidden = true
 
 	f = debugDecodeKeyCmd.Flags()
 	f.Var(&decodeKeyOptions.encoding, "encoding", "key argument encoding")
@@ -1604,6 +1614,7 @@ func init() {
 	f.StringVar(&debugTimeSeriesDumpOpts.zendeskTicket, "zendesk-ticket", "", "zendesk ticket to use in datadog upload")
 	f.StringVar(&debugTimeSeriesDumpOpts.organizationName, "org-name", "", "organization name to use in datadog upload")
 	f.StringVar(&debugTimeSeriesDumpOpts.userName, "user-name", "", "name of the user to perform datadog upload")
+	f.StringVar(&debugTimeSeriesDumpOpts.storeToNodeMapYAMLFile, "store-to-node-map-file", "", "yaml file path which contains the mapping of store ID to node ID for datadog upload.")
 
 	f = debugSendKVBatchCmd.Flags()
 	f.StringVar(&debugSendKVBatchContext.traceFormat, "trace", debugSendKVBatchContext.traceFormat,

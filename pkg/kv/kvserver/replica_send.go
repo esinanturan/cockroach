@@ -9,6 +9,7 @@ import (
 	"context"
 	"reflect"
 	"runtime/pprof"
+	"runtime/trace"
 	"time"
 
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
@@ -127,6 +128,9 @@ func (r *Replica) SendWithWriteBytes(
 		// Note: the defer statement captured the previous context.
 		ctx = pprof.WithLabels(ctx, pprof.Labels("range_str", r.rangeStr.ID()))
 		pprof.SetGoroutineLabels(ctx)
+	}
+	if trace.IsEnabled() {
+		defer trace.StartRegion(ctx, r.rangeStr.String() /* cheap */).End()
 	}
 	// Add the range log tag.
 	ctx = r.AnnotateCtx(ctx)
@@ -428,7 +432,7 @@ func (r *Replica) executeBatchWithConcurrencyRetries(
 	for {
 		// Exit loop if context has been canceled or timed out.
 		if err := ctx.Err(); err != nil {
-			return nil, nil, kvpb.NewError(errors.Wrap(err, "aborted during Replica.Send"))
+			return nil, nil, kvpb.NewError(err)
 		}
 
 		// Determine the maximal set of key spans that the batch will operate on.
@@ -986,11 +990,6 @@ func (r *Replica) executeAdminBatch(
 
 	case *kvpb.AdminScatterRequest:
 		reply, err := r.adminScatter(ctx, *tArgs)
-		pErr = kvpb.NewError(err)
-		resp = &reply
-
-	case *kvpb.AdminVerifyProtectedTimestampRequest:
-		reply, err := r.adminVerifyProtectedTimestamp(ctx, *tArgs)
 		pErr = kvpb.NewError(err)
 		resp = &reply
 

@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/fetchpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
+	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execexpr"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra/execopnode"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
 	"github.com/cockroachdb/cockroach/pkg/sql/execstats"
@@ -114,11 +115,15 @@ type joinReader struct {
 
 	// fetcher wraps the row.Fetcher used to perform lookups. This enables the
 	// joinReader to wrap the fetcher with a stat collector when necessary.
-	fetcher            rowFetcher
-	alloc              tree.DatumAlloc
-	rowAlloc           rowenc.EncDatumRowAlloc
-	shouldLimitBatches bool
-	readerType         joinReaderType
+	fetcher  rowFetcher
+	alloc    tree.DatumAlloc
+	rowAlloc rowenc.EncDatumRowAlloc
+	// parallelize, if true, indicates that the KV lookups will be parallelized
+	// across ranges when using the DistSender API. It has no influence on the
+	// behavior when using the Streamer API (when the lookups are always
+	// parallelized).
+	parallelize bool
+	readerType  joinReaderType
 
 	// txn is the transaction used by the join reader.
 	txn *kv.Txn
@@ -172,8 +177,8 @@ type joinReader struct {
 	// remoteLookupExpr contains the lookup join conditions targeting remote
 	// nodes. See comments in the spec for more details.
 	lookupCols       []uint32
-	lookupExpr       execinfrapb.ExprHelper
-	remoteLookupExpr execinfrapb.ExprHelper
+	lookupExpr       execexpr.Helper
+	remoteLookupExpr execexpr.Helper
 
 	// spansCanOverlap indicates whether the spans generated for a given input
 	// batch can overlap. It is used in the fetcher when deciding whether a newly
@@ -236,11 +241,6 @@ type joinReader struct {
 	// detailed comment in the spec). This can never be true for index joins,
 	// and requires that the spec has MaintainOrdering set to true.
 	outputGroupContinuationForLeftRow bool
-
-	// lookupBatchBytesLimit controls the TargetBytes of lookup requests. If 0, a
-	// default will be used. Regardless of this value, bytes limits aren't always
-	// used.
-	lookupBatchBytesLimit rowinfra.BytesLimit
 
 	// limitHintHelper is used in limiting batches of input rows in the presence
 	// of hard and soft limits.
@@ -330,18 +330,19 @@ func newJoinReader(
 	// in case of indexJoinReaderType, we know that there's exactly one lookup
 	// row for each input row. Similarly, in case of spec.LookupColumnsAreKey,
 	// we know that there's at most one lookup row per input row. In other
-	// cases, we use limits.
-	shouldLimitBatches := !spec.LookupColumnsAreKey && readerType == lookupJoinReaderType
+	// cases, we disable parallelism and use the TargetBytes limit.
+	parallelize := spec.LookupColumnsAreKey || readerType == indexJoinReaderType
 	if flowCtx.EvalCtx.SessionData().ParallelizeMultiKeyLookupJoinsEnabled {
-		shouldLimitBatches = false
+		parallelize = true
 	}
 	if spec.MaintainLookupOrdering {
-		// MaintainLookupOrdering indicates the output of the lookup joiner should
-		// be sorted by <inputCols>, <lookupCols>. It doesn't make sense for
-		// MaintainLookupOrdering to be true when MaintainOrdering is not.
-		// Additionally, we need to disable parallelism for the traditional fetcher
-		// in order to ensure the lookups are ordered, so set shouldLimitBatches.
-		spec.MaintainOrdering, shouldLimitBatches = true, true
+		// MaintainLookupOrdering indicates the output of the lookup joiner
+		// should be sorted by <inputCols>, <lookupCols>. It doesn't make sense
+		// for MaintainLookupOrdering to be true when MaintainOrdering is not.
+		//
+		// Additionally, we need to disable parallelism for the traditional
+		// fetcher in order to ensure the lookups are ordered.
+		spec.MaintainOrdering, parallelize = true, false
 	}
 	useStreamer, txn, err := flowCtx.UseStreamer(ctx)
 	if err != nil {
@@ -358,11 +359,10 @@ func newJoinReader(
 		input:                               input,
 		lookupCols:                          lookupCols,
 		outputGroupContinuationForLeftRow:   spec.OutputGroupContinuationForLeftRow,
-		shouldLimitBatches:                  shouldLimitBatches,
+		parallelize:                         parallelize,
 		readerType:                          readerType,
 		txn:                                 txn,
 		usesStreamer:                        useStreamer,
-		lookupBatchBytesLimit:               rowinfra.BytesLimit(spec.LookupBatchBytesLimit),
 		limitHintHelper:                     execinfra.MakeLimitHintHelper(spec.LimitHint, post),
 		errorOnLookup:                       errorOnLookup,
 		allowEnforceHomeRegionFollowerReads: flowCtx.EvalCtx.SessionData().EnforceHomeRegionFollowerReadsEnabled,
@@ -867,16 +867,15 @@ func (jr *joinReader) getBatchBytesLimit() rowinfra.BytesLimit {
 		// BatchRequests.
 		return rowinfra.NoBytesLimit
 	}
-	if !jr.shouldLimitBatches {
-		// We deem it safe to not limit the batches in order to get the
+	if jr.parallelize {
+		// We deem it safe to not use the TargetBytes limit in order to get the
 		// DistSender-level parallelism.
 		return rowinfra.NoBytesLimit
 	}
-	bytesLimit := jr.lookupBatchBytesLimit
-	if bytesLimit == 0 {
-		bytesLimit = rowinfra.GetDefaultBatchBytesLimit(jr.FlowCtx.EvalCtx.TestingKnobs.ForceProductionValues)
+	if testingLimit := jr.FlowCtx.Cfg.TestingKnobs.JoinReaderBatchBytesLimit; testingLimit != 0 {
+		return rowinfra.BytesLimit(testingLimit)
 	}
-	return bytesLimit
+	return rowinfra.GetDefaultBatchBytesLimit(jr.FlowCtx.EvalCtx.TestingKnobs.ForceProductionValues)
 }
 
 // readInput reads the next batch of input rows and starts an index scan, which
@@ -1053,11 +1052,13 @@ func (jr *joinReader) readInput() (
 	//    fetcher only accepts a limit if the spans are sorted), and
 	// b) Pebble has various optimizations for Seeks in sorted order.
 	if jr.readerType == indexJoinReaderType && jr.maintainOrdering {
-		// Assert that the index join doesn't have shouldLimitBatches set. Since we
-		// didn't sort above, the fetcher doesn't support a limit.
-		if jr.shouldLimitBatches {
+		// Assert that the index join has 'parallelize=true' set. Since we
+		// didn't sort above, the fetcher doesn't support the TargetBytes limit
+		// (which would be set via getBatchBytesLimit() if 'parallelize' was
+		// false).
+		if !jr.parallelize {
 			err := errors.AssertionFailedf("index join configured with both maintainOrdering and " +
-				"shouldLimitBatched; this shouldn't have happened as the implementation doesn't support it")
+				"parallelize=false; this shouldn't have happened as the implementation doesn't support it")
 			jr.MoveToDraining(err)
 			return jrStateUnknown, nil, jr.DrainHelper()
 		}

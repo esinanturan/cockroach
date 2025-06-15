@@ -667,6 +667,18 @@ message LocalOnlySessionData {
   // PropagateAdmissionHeaderToLeafTransactions, when true, causes leaf
   // transactions to inherit the admission header from the root transaction.
   bool propagate_admission_header_to_leaf_transactions = 169;
+  // OptimizerUseExistsFilterHoistRule, when true, causes the optimizer to apply
+  // the HoistUnboundFilterFromExistsSubquery rule to EXISTS conditions.
+  bool optimizer_use_exists_filter_hoist_rule = 170;
+  // InitialRetryBackoffForReadCommitted controls the initial backoff
+  // duration for automatic retries of statements in explicit READ COMMITTED
+  // transactions that see a transaction retry error. 0 disables backoff.
+  int64 initial_retry_backoff_for_read_committed = 171 [(gogoproto.casttype) = "time.Duration"];
+  // UseImprovedRoutineDependencyTracking, when true, causes newly-created
+  // routines to only consider user-specified target columns when determining the
+  // dependencies of an INSERT statement in a routine.
+  bool use_improved_routine_dependency_tracking = 172;
+
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //
   // be propagated to the remote nodes. If so, that parameter should live  //

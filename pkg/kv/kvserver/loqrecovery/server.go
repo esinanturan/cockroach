@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/loqrecovery/loqrecoverypb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/util/grpcutil"
@@ -33,7 +36,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 )
 
 const rangeMetadataScanChunkSize = 100
@@ -106,7 +108,7 @@ func NewServer(
 		settings:             settings,
 		stores:               stores,
 		visitAdminNodes:      makeVisitAvailableNodesInParallel(g, loc, rpcCtx),
-		visitStatusNode:      makeVisitNode(g, loc, rpcCtx),
+		visitStatusNode:      makeVisitNode(nodedialer.New(rpcCtx, gossip.AddressResolver(g))),
 		planStore:            planStore,
 		decommissionFn:       decommission,
 		metadataQueryTimeout: metadataQueryTimeout,
@@ -718,6 +720,22 @@ func makeVisitAvailableNodesInParallel(
 			return err
 		}
 
+		// Initialize a nodedialer to establish connections with nodes. We'll
+		// create a custom resolver that uses the already available node list,
+		// which is more efficient than fetching node information again. Node
+		// dialer allows us to reuse utility methods to create RPC connections.
+		resolver := func(nodeID roachpb.NodeID) (net.Addr, roachpb.Locality, error) {
+			for _, node := range nodes {
+				if node.NodeID == nodeID {
+					addr := node.AddressForLocality(loc)
+					return addr, node.Locality, nil
+				}
+			}
+			// This should not happen since the visitor visits the exact same nodes.
+			return nil, roachpb.Locality{}, errors.Newf("node n%d not found in gossip", nodeID)
+		}
+		nd := nodedialer.New(rpcCtx, resolver)
+
 		var g errgroup.Group
 		if maxConcurrency == 0 {
 			// "A value of 0 disables concurrency."
@@ -727,7 +745,7 @@ func makeVisitAvailableNodesInParallel(
 		for _, node := range nodes {
 			node := node // copy for closure
 			g.Go(func() error {
-				return visitNodeWithRetry(ctx, loc, rpcCtx, retryOpts, visitor, node)
+				return visitNodeWithRetry(ctx, nd, retryOpts, visitor, node)
 			})
 		}
 		return g.Wait()
@@ -736,21 +754,19 @@ func makeVisitAvailableNodesInParallel(
 
 func visitNodeWithRetry(
 	ctx context.Context,
-	loc roachpb.Locality,
-	rpcCtx *rpc.Context,
+	nd rpcbase.NodeDialerNoBreaker,
 	retryOpts retry.Options,
 	visitor visitNodeAdminFn,
 	node roachpb.NodeDescriptor,
 ) error {
 	var err error
+	var ac serverpb.AdminClient
 	for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
 		log.Infof(ctx, "visiting node n%d, attempt %d", node.NodeID, r.CurrentAttempt())
-		addr := node.AddressForLocality(loc)
-		var conn *grpc.ClientConn
 		// Note that we use ConnectNoBreaker here to avoid any race with probe
 		// running on current node and target node restarting. Errors from circuit
 		// breaker probes could confuse us and present node as unavailable.
-		conn, _, err = rpcCtx.GRPCDialNode(addr.String(), node.NodeID, node.Locality, rpc.DefaultClass).ConnectNoBreaker(ctx)
+		ac, err = serverpb.DialAdminClientNoBreaker(nd, ctx, node.NodeID)
 		// Nodes would contain dead nodes that we don't need to visit. We can skip
 		// them and let caller handle incomplete info.
 		if err != nil {
@@ -763,8 +779,7 @@ func visitNodeWithRetry(
 			// live.
 			continue
 		}
-		client := serverpb.NewAdminClient(conn)
-		err = visitor(node.NodeID, client)
+		err = visitor(node.NodeID, ac)
 		if err == nil {
 			return nil
 		}
@@ -788,37 +803,33 @@ func visitNodeWithRetry(
 //
 // For latter, errors marked with errMarkRetry marker are retried. It is up
 // to the visitor to mark appropriate errors are retryable.
-func makeVisitNode(g *gossip.Gossip, loc roachpb.Locality, rpcCtx *rpc.Context) visitNodeStatusFn {
+func makeVisitNode(nd rpcbase.NodeDialerNoBreaker) visitNodeStatusFn {
 	return func(ctx context.Context, nodeID roachpb.NodeID, retryOpts retry.Options,
 		visitor func(client serverpb.StatusClient) error,
 	) error {
-		node, err := g.GetNodeDescriptor(nodeID)
-		if err != nil {
-			return err
-		}
+		var err error
+		var client serverpb.StatusClient
+
 		for r := retry.StartWithCtx(ctx, retryOpts); r.Next(); {
-			log.Infof(ctx, "visiting node n%d, attempt %d", node.NodeID, r.CurrentAttempt())
-			addr := node.AddressForLocality(loc)
-			var conn *grpc.ClientConn
+			log.Infof(ctx, "visiting node n%d, attempt %d", nodeID, r.CurrentAttempt())
 			// Note that we use ConnectNoBreaker here to avoid any race with probe
 			// running on current node and target node restarting. Errors from circuit
 			// breaker probes could confuse us and present node as unavailable.
-			conn, _, err = rpcCtx.GRPCDialNode(addr.String(), node.NodeID, node.Locality, rpc.DefaultClass).ConnectNoBreaker(ctx)
+			client, err = serverpb.DialStatusClientNoBreaker(nd, ctx, nodeID, rpcbase.DefaultClass)
 			if err != nil {
 				if grpcutil.IsClosedConnection(err) {
 					log.Infof(ctx, "can't dial node n%d because connection is permanently closed: %s",
-						node.NodeID, err)
+						nodeID, err)
 					return err
 				}
 				// Retry any other transient connection flakes.
 				continue
 			}
-			client := serverpb.NewStatusClient(conn)
 			err = visitor(client)
 			if err == nil {
 				return nil
 			}
-			log.Infof(ctx, "failed calling a visitor for node n%d: %s", node.NodeID, err)
+			log.Infof(ctx, "failed calling a visitor for node n%d: %s", nodeID, err)
 			if !IsRetryableError(err) {
 				return err
 			}

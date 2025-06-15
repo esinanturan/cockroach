@@ -306,7 +306,7 @@ func computeCumStoreCompactionStats(m *pebble.Metrics) cumStoreCompactionStats {
 	var compactedWriteBytes uint64
 	baseLevel := -1
 	for i := range m.Levels {
-		compactedWriteBytes += m.Levels[i].BytesCompacted
+		compactedWriteBytes += m.Levels[i].TableBytesCompacted + m.Levels[i].BlobBytesCompacted
 		if i > 0 && m.Levels[i].TablesSize > 0 && baseLevel < 0 {
 			baseLevel = i
 		}
@@ -521,13 +521,13 @@ func (t *tokenAllocationTicker) stop() {
 
 func cumLSMIngestedBytes(m *pebble.Metrics) (ingestedBytes uint64) {
 	for i := range m.Levels {
-		ingestedBytes += m.Levels[i].BytesIngested
+		ingestedBytes += m.Levels[i].TableBytesIngested
 	}
 	return ingestedBytes
 }
 
 func replaceFlushThroughputBytesBySSTableWriteThroughput(m *pebble.Metrics) {
-	m.Flush.WriteThroughput.Bytes = int64(m.Levels[0].BytesFlushed)
+	m.Flush.WriteThroughput.Bytes = int64(m.Levels[0].TableBytesFlushed + m.Levels[0].BlobBytesFlushed)
 }
 
 // pebbleMetricsTicks is called every adjustmentInterval seconds, and decides
@@ -545,7 +545,7 @@ func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, metrics StoreMe
 			metrics.Levels[0], cumIngestBytes, metrics.DiskStats.BytesWritten, sas, false)
 		io.adjustTokensResult = adjustTokensResult{
 			ioLoadListenerState: ioLoadListenerState{
-				cumL0AddedBytes:              m.Levels[0].BytesFlushed + m.Levels[0].BytesIngested,
+				cumL0AddedBytes:              m.Levels[0].TableBytesFlushed + m.Levels[0].BlobBytesFlushed + m.Levels[0].TableBytesIngested,
 				curL0Bytes:                   m.Levels[0].TablesSize,
 				cumWriteStallCount:           metrics.WriteStallCount,
 				cumFlushWriteThroughput:      m.Flush.WriteThroughput,
@@ -572,6 +572,7 @@ func (io *ioLoadListener) pebbleMetricsTick(ctx context.Context, metrics StoreMe
 		}
 		io.diskBW.bytesRead = metrics.DiskStats.BytesRead
 		io.diskBW.bytesWritten = metrics.DiskStats.BytesWritten
+		io.diskBandwidthLimiter.unlimitedTokensOverride = true
 		io.copyAuxEtcFromPerWorkEstimator()
 
 		// Assume system starts off unloaded.
@@ -719,6 +720,7 @@ func (io *ioLoadListener) adjustTokens(ctx context.Context, metrics StoreMetrics
 	}
 	cumCompactionStats := computeCumStoreCompactionStats(metrics.Metrics)
 
+	prevDoLogFlush := io.aux.doLogFlush
 	res := io.adjustTokensInner(ctx, io.ioLoadListenerState,
 		metrics.Levels[0], metrics.WriteStallCount, cumCompactionStats,
 		metrics.WAL.Failover.SecondaryWriteDuration, wt,
@@ -745,9 +747,13 @@ func (io *ioLoadListener) adjustTokens(ctx context.Context, metrics StoreMetrics
 		io.diskReadTokens = tokens.readByteTokens
 		io.diskWriteTokensAllocated = 0
 	}
+	io.diskBandwidthLimiter.unlimitedTokensOverride = false
 	if metrics.DiskStats.ProvisionedBandwidth == 0 ||
-		!DiskBandwidthTokensForElasticEnabled.Get(&io.settings.SV) {
+		!DiskBandwidthTokensForElasticEnabled.Get(&io.settings.SV) ||
+		// Disk stats are not available, so fail open.
+		(metrics.DiskStats.BytesWritten == 0 && metrics.DiskStats.BytesRead == 0) {
 		io.diskWriteTokens = unlimitedTokens
+		io.diskBandwidthLimiter.unlimitedTokensOverride = true
 		// Currently, disk read tokens are only used to assess how many tokens were
 		// deducted from the writes bucket to account for future reads. A 0 value
 		// here represents that.
@@ -764,7 +770,11 @@ func (io *ioLoadListener) adjustTokens(ctx context.Context, metrics StoreMetrics
 	io.kvRequester.setStoreRequestEstimates(requestEstimates)
 	l0WriteLM, l0IngestLM, ingestLM, writeAmpLM := io.perWorkTokenEstimator.getModelsAtDone()
 	io.kvGranter.setLinearModels(l0WriteLM, l0IngestLM, ingestLM, writeAmpLM)
-	if io.aux.doLogFlush || io.diskBandwidthLimiter.state.diskBWUtil > 0.8 || log.V(1) {
+	// NB: we also log if prevDoLogFlush is true, since we often see a single
+	// interval of no overload sandwiched between intervals of overload and we
+	// want to know what happened in that interval.
+	if prevDoLogFlush || io.aux.doLogFlush || io.diskBandwidthLimiter.state.diskBWUtil > 0.8 ||
+		log.V(1) {
 		log.Infof(ctx, "IO overload: %s; %s", io.adjustTokensResult, io.diskBandwidthLimiter)
 	}
 }
@@ -798,9 +808,9 @@ type adjustTokensAuxComputations struct {
 	intL0AddedBytes     int64
 	intL0CompactedBytes int64
 
-	intFlushTokens      float64
-	intFlushUtilization float64
-	intWriteStalls      int64
+	intFlushTokens   float64
+	intFlushDuration time.Duration
+	intWriteStalls   int64
 
 	intWALFailover bool
 
@@ -846,7 +856,7 @@ func (io *ioLoadListener) adjustTokensInner(
 	recentUnflushedMemTableTooLarge := unflushedMemTableTooLarge || io.unflushedMemTableTooLarge
 
 	curL0Bytes := l0Metrics.TablesSize
-	cumL0AddedBytes := l0Metrics.BytesFlushed + l0Metrics.BytesIngested
+	cumL0AddedBytes := l0Metrics.TableBytesFlushed + l0Metrics.BlobBytesFlushed + l0Metrics.TableBytesIngested
 	// L0 growth over the last interval.
 	intL0AddedBytes := int64(cumL0AddedBytes) - int64(prev.cumL0AddedBytes)
 	if intL0AddedBytes < 0 {
@@ -1010,14 +1020,10 @@ func (io *ioLoadListener) adjustTokensInner(
 	// considering flush tokens is transient flush bottlenecks, and workloads
 	// where W is small.
 
-	// Compute flush utilization for this interval. A very low flush utilization
-	// will cause flush tokens to be unlimited.
-	intFlushUtilization := float64(0)
-	if flushWriteThroughput.WorkDuration > 0 {
-		intFlushUtilization = float64(flushWriteThroughput.WorkDuration) /
-			float64(flushWriteThroughput.WorkDuration+flushWriteThroughput.IdleDuration)
-	}
 	// Compute flush tokens for this interval that would cause 100% utilization.
+	//
+	// Note that this may be zero or close to zero, if we spent negligible time
+	// flushing, in which case we will not use this value below.
 	intFlushTokens := float64(flushWriteThroughput.PeakRate()) * adjustmentInterval
 	intWriteStalls := cumWriteStallCount - prev.cumWriteStallCount
 
@@ -1044,8 +1050,19 @@ func (io *ioLoadListener) adjustTokensInner(
 	// doLogFlush becomes true if something interesting is done here.
 	doLogFlush := false
 	smoothedNumFlushTokens := prev.smoothedNumFlushTokens
-	const flushUtilIgnoreThreshold = 0.1
-	if intFlushUtilization > flushUtilIgnoreThreshold && !intWALFailover {
+	// NB: we used to filter based on low flush utilization, defined as
+	// flushWriteThroughput.WorkDuration/flushWriteThroughput.WorkDuration+flushWriteThroughput.IdleDuration.
+	// However, the Pebble metric only increments idle duration when a flush
+	// finishes, and it corresponds to the idleness before the start of a flush.
+	// So it is possible to have a tiny flush that only consumed 100ms, started
+	// at the beginning of adjustmentInterval, and that was the only flush in
+	// the adjustmentInterval, that resulted in IdleDuration equal to 0 and
+	// WorkDuration equal to 100ms. Then utilization is computed to be 100%. See
+	// https://github.com/cockroachdb/cockroach/issues/148012, which is a result
+	// of smoothing based on the erroneous belief that flush utilization is
+	// high.
+	const flushDurationIgnoreThreshold = 2 * time.Second
+	if flushWriteThroughput.WorkDuration >= flushDurationIgnoreThreshold && !intWALFailover {
 		if smoothedNumFlushTokens == 0 {
 			// Initialization.
 			smoothedNumFlushTokens = intFlushTokens
@@ -1092,15 +1109,12 @@ func (io *ioLoadListener) adjustTokensInner(
 		// Else avoid overflow by using the previously set unlimitedTokens. This
 		// should not really happen.
 	}
-	// Else intFlushUtilization is too low or WAL failover is active. We
-	// don't want to make token determination based on a very low utilization,
-	// or when flushes are stalled, so we hand out unlimited
-	// tokens. Note that flush utilization has been observed to fluctuate from
-	// 0.16 to 0.9 in a single interval, when compaction tokens are not limited,
-	// hence we have set flushUtilIgnoreThreshold to a very low value. If we've
-	// erred towards it being too low, we run the risk of computing incorrect
-	// tokens. If we've erred towards being too high, we run the risk of giving
-	// out unlimitedTokens and causing write stalls.
+	// Else flush duration is too low or WAL failover is active. We don't want
+	// to make token determination based on a very low flush duration, or when
+	// flushes are stalled, so we hand out unlimited tokens. There is the risk
+	// that if we give out unlimited tokens that we will cause a write stall. We
+	// currently don't have a good way to avoid such write stalls when the
+	// workload has significant fluctuations.
 
 	// We constrain admission based on compactions, if the store is over the L0
 	// threshold.
@@ -1272,7 +1286,7 @@ func (io *ioLoadListener) adjustTokensInner(
 			intL0AddedBytes:                 intL0AddedBytes,
 			intL0CompactedBytes:             intL0CompactedBytes,
 			intFlushTokens:                  intFlushTokens,
-			intFlushUtilization:             intFlushUtilization,
+			intFlushDuration:                flushWriteThroughput.WorkDuration,
 			intWriteStalls:                  intWriteStalls,
 			intWALFailover:                  intWALFailover,
 			prevTokensUsed:                  prev.byteTokensUsed,
@@ -1336,10 +1350,14 @@ func (res adjustTokensResult) SafeFormat(p redact.SafePrinter, _ rune) {
 		res.aux.perWorkTokensAux.intL0WriteLinearModel.multiplier,
 		ib(res.aux.perWorkTokensAux.intL0WriteLinearModel.constant),
 		res.l0WriteLM.multiplier, ib(res.l0WriteLM.constant))
-	p.Printf("ingested-model %.2fx+%s (smoothed %.2fx+%s) + ",
+	p.Printf("l0-ingest-model %.2fx+%s (smoothed %.2fx+%s) + ",
 		res.aux.perWorkTokensAux.intL0IngestedLinearModel.multiplier,
 		ib(res.aux.perWorkTokensAux.intL0IngestedLinearModel.constant),
 		res.l0IngestLM.multiplier, ib(res.l0IngestLM.constant))
+	p.Printf("ingest-model %.2fx+%s (smoothed %.2fx+%s) + ",
+		res.aux.perWorkTokensAux.intIngestedLinearModel.multiplier,
+		ib(res.aux.perWorkTokensAux.intIngestedLinearModel.constant),
+		res.ingestLM.multiplier, ib(res.ingestLM.constant))
 	p.Printf("write-amp-model %.2fx+%s (smoothed %.2fx+%s) + ",
 		res.aux.perWorkTokensAux.intWriteAmpLinearModel.multiplier,
 		ib(res.aux.perWorkTokensAux.intWriteAmpLinearModel.constant),
@@ -1374,13 +1392,13 @@ func (res adjustTokensResult) SafeFormat(p redact.SafePrinter, _ rune) {
 		case flushTokenKind:
 			p.Printf(" due to memtable flush (multiplier %.3f)", res.flushUtilTargetFraction)
 		}
-		p.Printf(" (used total: %s elastic %s)", ib(res.aux.prevTokensUsed),
-			ib(res.aux.prevTokensUsedByElasticWork))
 	} else if m < unlimitedTokens {
 		p.Printf("elastic %s (rate %s/s) due to L0 growth", ib(m), ib(m/adjustmentInterval))
 	} else {
 		p.SafeString("all")
 	}
+	p.Printf(" (used total: %s elastic %s)", ib(res.aux.prevTokensUsed),
+		ib(res.aux.prevTokensUsedByElasticWork))
 	p.Printf("; write stalls %d", res.aux.intWriteStalls)
 }
 

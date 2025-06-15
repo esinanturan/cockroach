@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfopb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/apiconstants"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
@@ -113,10 +114,12 @@ type adminServer struct {
 	statsLimiter     *quotapool.IntPool
 	st               *cluster.Settings
 	serverIterator   ServerIterator
+	nd               rpcbase.NodeDialer
 	distSender       *kvcoord.DistSender
 	rpcContext       *rpc.Context
 	clock            *hlc.Clock
 	grpc             *grpcServer
+	drpc             *drpcServer
 	db               *kv.DB
 	drainServer      *drainServer
 }
@@ -156,6 +159,7 @@ func newSystemAdminServer(
 	clock *hlc.Clock,
 	distSender *kvcoord.DistSender,
 	grpc *grpcServer,
+	drpc *drpcServer,
 	drainServer *drainServer,
 	s *topLevelServer,
 ) *systemAdminServer {
@@ -172,6 +176,7 @@ func newSystemAdminServer(
 		clock,
 		distSender,
 		grpc,
+		drpc,
 		drainServer,
 	)
 	return &systemAdminServer{
@@ -199,6 +204,7 @@ func newAdminServer(
 	clock *hlc.Clock,
 	distSender *kvcoord.DistSender,
 	grpc *grpcServer,
+	drpc *drpcServer,
 	drainServer *drainServer,
 ) *adminServer {
 	server := &adminServer{
@@ -213,10 +219,12 @@ func newAdminServer(
 		),
 		st:             cs,
 		serverIterator: serverIterator,
+		nd:             &nodeDialer{si: serverIterator},
 		distSender:     distSender,
 		rpcContext:     rpcCtx,
 		clock:          clock,
 		grpc:           grpc,
+		drpc:           drpc,
 		db:             db,
 		drainServer:    drainServer,
 	}
@@ -1327,9 +1335,8 @@ func (s *adminServer) statsForSpan(
 				var spanResponse *roachpb.SpanStatsResponse
 				err := timeutil.RunWithTimeout(ctx, "request remote stats", 20*time.Second,
 					func(ctx context.Context) error {
-						conn, err := s.serverIterator.dialNode(ctx, serverID(nodeID))
+						client, err := serverpb.DialStatusClient(s.nd, ctx, nodeID)
 						if err == nil {
-							client := serverpb.NewStatusClient(conn)
 							req := roachpb.SpanStatsRequest{
 								Spans:  []roachpb.Span{span},
 								NodeID: nodeID.String(),
@@ -2100,8 +2107,16 @@ func (s *adminServer) Health(
 
 // checkReadinessForHealthCheck returns a gRPC error.
 func (s *adminServer) checkReadinessForHealthCheck(ctx context.Context) error {
+	// A gRPC server will always be running, so ensure that we check its health
+	// until it is completely removed after the DRPC to gRPC migration.
 	if err := s.grpc.health(ctx); err != nil {
 		return err
+	}
+
+	if s.drpc.enabled {
+		if err := s.drpc.health(ctx); err != nil {
+			return err
+		}
 	}
 
 	if !s.sqlServer.isReady.Load() {
@@ -2138,8 +2153,16 @@ func (s *systemAdminServer) Health(
 
 // checkReadinessForHealthCheck returns a gRPC error.
 func (s *systemAdminServer) checkReadinessForHealthCheck(ctx context.Context) error {
+	// A gRPC server will always be running, so ensure that we check its health
+	// until it is completely removed after the DRPC to gRPC migration.
 	if err := s.grpc.health(ctx); err != nil {
 		return err
+	}
+
+	if s.drpc.enabled {
+		if err := s.drpc.health(ctx); err != nil {
+			return err
+		}
 	}
 
 	status := s.nodeLiveness.GetNodeVitalityFromCache(roachpb.NodeID(s.serverIterator.getID()))
@@ -3700,11 +3723,7 @@ func (s *adminServer) queryTableID(
 func (s *adminServer) dialNode(
 	ctx context.Context, nodeID roachpb.NodeID,
 ) (serverpb.AdminClient, error) {
-	conn, err := s.serverIterator.dialNode(ctx, serverID(nodeID))
-	if err != nil {
-		return nil, err
-	}
-	return serverpb.NewAdminClient(conn), nil
+	return serverpb.DialAdminClient(s.nd, ctx, nodeID)
 }
 
 func (s *adminServer) ListTracingSnapshots(
