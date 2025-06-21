@@ -414,8 +414,9 @@ func (b *Builder) maybeAnnotateWithEstimates(node exec.Node, e memo.RelExpr) {
 				// The first stat is the most recent full one.
 				var first int
 				for first < tab.StatisticCount() &&
-					tab.Statistic(first).IsPartial() ||
-					(tab.Statistic(first).IsForecast() && !b.evalCtx.SessionData().OptimizerUseForecasts) {
+					(tab.Statistic(first).IsPartial() ||
+						(tab.Statistic(first).IsMerged() && !b.evalCtx.SessionData().OptimizerUseMergedPartialStatistics) ||
+						(tab.Statistic(first).IsForecast() && !b.evalCtx.SessionData().OptimizerUseForecasts)) {
 					first++
 				}
 
@@ -2486,9 +2487,13 @@ func (b *Builder) buildIndexJoin(
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
 	}
+	// We know that there's exactly one lookup row for each input row, so we
+	// assume it's always safe to get the DistSender-level parallelism.
+	const parallelize = true
 	var res execPlan
 	res.root, err = b.factory.ConstructIndexJoin(
-		input.root, tab, keyCols, needed, reqOrdering, locking, join.RequiredPhysical().LimitHintInt64(),
+		input.root, tab, keyCols, needed, reqOrdering, locking,
+		join.RequiredPhysical().LimitHintInt64(), parallelize,
 	)
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
@@ -2868,6 +2873,25 @@ func (b *Builder) buildLookupJoin(
 		return execPlan{}, colOrdMap{}, errors.AssertionFailedf("lookup join can't provide required ordering")
 	}
 	reverse := requiredDirection == ordering.ReverseDirection
+	// The joiner has a choice to make between getting DistSender-level
+	// parallelism for its lookup batches and setting row and memory limits (due
+	// to implementation limitations, you can't have both at the same time).
+	var parallelize bool
+	if join.LookupColsAreTableKey {
+		// We choose parallelism when we know that each lookup returns at most
+		// one row.
+		parallelize = true
+	} else if b.evalCtx.SessionData().ParallelizeMultiKeyLookupJoinsEnabled {
+		parallelize = true
+	}
+	for _, c := range reqOrdering {
+		if c.ColIdx >= numInputCols {
+			// We need to maintain lookup ordering, in which case we cannot use
+			// the DistSender-level parallelism.
+			parallelize = false
+			break
+		}
+	}
 	var res execPlan
 	res.root, err = b.factory.ConstructLookupJoin(
 		joinType,
@@ -2887,6 +2911,7 @@ func (b *Builder) buildLookupJoin(
 		join.RequiredPhysical().LimitHintInt64(),
 		join.RemoteOnlyLookups,
 		reverse,
+		parallelize,
 	)
 	if err != nil {
 		return execPlan{}, colOrdMap{}, err
@@ -3974,6 +3999,18 @@ func (b *Builder) buildVectorSearch(
 		return execPlan{}, colOrdMap{}, err
 	}
 	targetNeighborCount := uint64(search.TargetNeighborCount)
+
+	// Verify that the query vector and vector column have the same dimensions.
+	resolvedQueryVector, ok := queryVector.(*tree.DPGVector)
+	if !ok {
+		return execPlan{}, colOrdMap{}, errors.AssertionFailedf("expected vector type, got %T", queryVector)
+	}
+	queryVectorLen := int32(len(resolvedQueryVector.T))
+	vectorColumnType := index.VectorColumn().DatumType()
+	if queryVectorLen != vectorColumnType.Width() {
+		return execPlan{}, colOrdMap{}, pgerror.Newf(pgcode.DataException,
+			"different vector dimensions %d and %d", queryVectorLen, vectorColumnType.Width())
+	}
 
 	var res execPlan
 	res.root, err = b.factory.ConstructVectorSearch(

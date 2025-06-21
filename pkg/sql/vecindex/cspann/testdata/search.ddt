@@ -16,15 +16,15 @@ vec3: (4, 3)
 search
 (7, 4)
 ----
-vec2: 0 (centroid=8.06)
+vec2: 0
 3 leaf vectors, 3 vectors, 3 full vectors, 1 partitions
 
 # Search for vector with no exact match.
 search max-results=2
 (3, 5)
 ----
-vec3: 5 (centroid=5)
-vec1: 13 (centroid=2.24)
+vec3: 5
+vec1: 13
 3 leaf vectors, 3 vectors, 3 full vectors, 1 partitions
 
 # ----------------------------------------------------------------------
@@ -115,16 +115,16 @@ force-split partition-key=1
 search max-results=2 beam-size=1
 (1, 6)
 ----
-vec7: 5 (centroid=2.06)
-vec10: 10 (centroid=2.5)
+vec9: 5
+vec8: 13
 3 leaf vectors, 7 vectors, 3 full vectors, 3 partitions
 
 # Search for closest vectors with beam-size=2.
 search max-results=2 beam-size=2
 (1, 6)
 ----
-vec7: 5 (centroid=2.06)
-vec9: 5 (centroid=2.92)
+vec7: 5
+vec9: 5
 6 leaf vectors, 10 vectors, 6 full vectors, 4 partitions
 
 # ----------------------------------------------------------------------
@@ -161,10 +161,10 @@ vec6: (4, 9)
 search max-results=3
 (5, 10)
 ----
-vec1: 2 (centroid=0)
-vec2: 2 (centroid=0)
-vec3: 2 (centroid=0)
-vec4: 2 (centroid=0)
+vec1: 2
+vec2: 2
+vec3: 2
+vec4: 2
 4 leaf vectors, 7 vectors, 4 full vectors, 3 partitions
 
 # ----------------------------------------------------------------------
@@ -201,10 +201,10 @@ vec1: (-2, -2)
 search max-results=6
 (1, 1)
 ----
-vec3: 13 (centroid=1.41)
-vec1: 18 (centroid=5.52)
-vec5: 25 (centroid=1.41)
-vec4: 41 (centroid=2.92)
+vec3: 13
+vec1: 18
+vec5: 25
+vec4: 41
 4 leaf vectors, 7 vectors, 4 full vectors, 3 partitions
 
 # Do not rerank results. This may cause a different vec1 duplicate to be
@@ -212,8 +212,205 @@ vec4: 41 (centroid=2.92)
 search max-results=6 skip-rerank
 (8, 9)
 ----
-vec1: 17.8042 ±10.12 (centroid=1.58)
-vec2: 28.1958 ±10.12 (centroid=1.58)
-vec3: 45.6359 ±15.23 (centroid=1.41)
-vec5: 74.3641 ±15.23 (centroid=1.41)
+vec1: 9.4346 ± 10.12
+vec2: 36.5654 ± 10.12
+vec3: 55.698 ± 15.23
+vec5: 64.302 ± 15.23
 4 leaf vectors, 7 vectors, 0 full vectors, 3 partitions
+
+# ----------------------------------------------------------------------
+# Search tree with many deleted vectors.
+# ----------------------------------------------------------------------
+new-index min-partition-size=1 max-partition-size=4 beam-size=3
+vec1: (0, 0)
+vec2: (100, 100)
+vec3: (200, 200)
+vec4: (300, 300)
+vec5: (400, 400)
+vec6: (500, 500)
+----
+• 1 (0, 0)
+│
+├───• 5 (450, 450)
+│   │
+│   ├───• vec5 (400, 400)
+│   └───• vec6 (500, 500)
+│
+├───• 3 (50, 50)
+│   │
+│   ├───• vec2 (100, 100)
+│   └───• vec1 (0, 0)
+│
+└───• 4 (250, 250)
+    │
+    ├───• vec4 (300, 300)
+    └───• vec3 (200, 200)
+
+# Delete all but one vector.
+delete not-found
+vec1
+vec2
+vec3
+vec4
+vec5
+----
+• 1 (0, 0)
+│
+├───• 5 (450, 450)
+│   │
+│   ├───• vec5 (MISSING)
+│   └───• vec6 (500, 500)
+│
+├───• 3 (50, 50)
+│   │
+│   ├───• vec2 (MISSING)
+│   └───• vec1 (MISSING)
+│
+└───• 4 (250, 250)
+    │
+    ├───• vec4 (MISSING)
+    └───• vec3 (MISSING)
+
+# Search for the vector that's farthest from vec6, so it's last in the result
+# set. This ensures that DeletedMinCount is working as intended.
+search max-results=1
+(0, 0)
+----
+vec6: 500000
+6 leaf vectors, 9 vectors, 6 full vectors, 4 partitions
+
+# ----------------------------------------------------------------------
+# Search using Cosine distance metric.
+# ----------------------------------------------------------------------
+new-index distance-metric=Cosine min-partition-size=1 max-partition-size=4 beam-size=2
+vec1: (1, 2)
+vec2: (7, 4)
+vec3: (4, 3)
+vec4: (-4, 5)
+vec5: (1, 11)
+vec6: (1, -6)
+vec7: (0, 4)
+vec8: (-2, 8)
+vec9: (2, 8)
+vec10: (0, 3)
+vec11: (1, 1)
+vec12: (5, 4)
+vec13: (6, 2)
+----
+• 1 (0, 0)
+│
+├───• 10 (-0.0222, 0.9445)
+│   │
+│   ├───• 6 (0.3449, 0.9323)
+│   │   │
+│   │   ├───• vec9 (2, 8)
+│   │   └───• vec1 (1, 2)
+│   │
+│   ├───• 7 (0.0302, 0.9986)
+│   │   │
+│   │   ├───• vec7 (0, 4)
+│   │   ├───• vec5 (1, 11)
+│   │   └───• vec10 (0, 3)
+│   │
+│   └───• 4 (-0.4336, 0.8755)
+│       │
+│       ├───• vec8 (-2, 8)
+│       └───• vec4 (-4, 5)
+│
+└───• 11 (0.8337, 0.1081)
+    │
+    ├───• 9 (0.7627, 0.6439) [Splitting:12,13]
+    │   │
+    │   ├───• vec3 (4, 3)
+    │   ├───• vec11 (1, 1)
+    │   ├───• vec12 (5, 4)
+    │   └───• vec13 (6, 2)
+    │
+    └───• 8 (0.5163, -0.2451)
+        │
+        ├───• vec6 (1, -6)
+        └───• vec2 (7, 4)
+
+# Search for closest vectors with beam-size=1.
+search max-results=2 beam-size=1
+(1, 6)
+----
+vec5: 0.0028
+vec10: 0.0136
+3 leaf vectors, 8 vectors, 3 full vectors, 3 partitions
+
+# Search for closest vectors with beam-size=2.
+search max-results=2 beam-size=2
+(1, 6)
+----
+vec5: 0.0028
+vec9: 0.0032
+5 leaf vectors, 10 vectors, 5 full vectors, 4 partitions
+
+# ----------------------------------------------------------------------
+# Search using InnerProduct distance metric.
+# ----------------------------------------------------------------------
+new-index distance-metric=InnerProduct min-partition-size=1 max-partition-size=4 beam-size=2
+vec1: (1, 2)
+vec2: (7, 4)
+vec3: (4, 3)
+vec4: (-4, 5)
+vec5: (1, 11)
+vec6: (1, -6)
+vec7: (0, 4)
+vec8: (-2, 8)
+vec9: (2, 8)
+vec10: (0, 3)
+vec11: (1, 1)
+vec12: (5, 4)
+vec13: (6, 2)
+----
+• 1 (0, 0)
+│
+├───• 10 (-0.0254, 0.9547)
+│   │
+│   ├───• 6 (1.5, 5)
+│   │   │
+│   │   ├───• vec10 (0, 3)
+│   │   ├───• vec7 (0, 4)
+│   │   └───• vec1 (1, 2)
+│   │
+│   ├───• 7 (0.3333, 6)
+│   │   │
+│   │   ├───• vec9 (2, 8)
+│   │   └───• vec5 (1, 11)
+│   │
+│   └───• 4 (-3, 6.5)
+│       │
+│       ├───• vec8 (-2, 8)
+│       └───• vec4 (-4, 5)
+│
+└───• 11 (0.5977, -0.181)
+    │
+    ├───• 9 (5.3333, 3.6667) [Splitting:12,13]
+    │   │
+    │   ├───• vec2 (7, 4)
+    │   ├───• vec3 (4, 3)
+    │   ├───• vec12 (5, 4)
+    │   └───• vec13 (6, 2)
+    │
+    └───• 8 (1, -2.5)
+        │
+        ├───• vec11 (1, 1)
+        └───• vec6 (1, -6)
+
+# Search for closest vectors with beam-size=1.
+search max-results=2 beam-size=1
+(1, 6)
+----
+vec8: -46
+vec4: -26
+2 leaf vectors, 7 vectors, 2 full vectors, 3 partitions
+
+# Search for closest vectors with beam-size=2.
+search max-results=2 beam-size=2
+(1, 6)
+----
+vec5: -67
+vec9: -50
+4 leaf vectors, 9 vectors, 4 full vectors, 4 partitions

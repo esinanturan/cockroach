@@ -80,7 +80,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/idxtype"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
-	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/persistedsqlstats/sqlstatsutil"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlstats/sslocal"
@@ -143,6 +142,7 @@ var crdbInternal = virtualSchema{
 		catconstants.CrdbInternalClusterSettingsTableID:             crdbInternalClusterSettingsTable,
 		catconstants.CrdbInternalClusterStmtStatsTableID:            crdbInternalClusterStmtStatsTable,
 		catconstants.CrdbInternalCreateFunctionStmtsTableID:         crdbInternalCreateFunctionStmtsTable,
+		catconstants.CrdbInternalCreateTriggerStmtsTableID:          crdbInternalCreateTriggerStmtsTable,
 		catconstants.CrdbInternalCreateProcedureStmtsTableID:        crdbInternalCreateProcedureStmtsTable,
 		catconstants.CrdbInternalCreateSchemaStmtsTableID:           crdbInternalCreateSchemaStmtsTable,
 		catconstants.CrdbInternalCreateStmtsTableID:                 crdbInternalCreateStmtsTable,
@@ -957,14 +957,6 @@ CREATE TABLE crdb_internal.leases (
 	},
 }
 
-func tsOrNull(micros int64) (tree.Datum, error) {
-	if micros == 0 {
-		return tree.DNull, nil
-	}
-	ts := timeutil.Unix(0, micros*time.Microsecond.Nanoseconds())
-	return tree.MakeDTimestampTZ(ts, time.Microsecond)
-}
-
 const (
 	// systemJobsAndJobInfoBaseQuery consults both the `system.jobs` and
 	// `system.job_info` tables to return relevant information about a job.
@@ -1146,11 +1138,6 @@ func wrapPayloadUnMarshalError(err error, jobID tree.Datum) error {
 }
 
 const (
-	jobsQuery = `SELECT id, status, created::timestamptz, payload, progress, claim_session_id, claim_instance_id FROM crdb_internal.system_jobs j`
-	// Note that we are querying crdb_internal.system_jobs instead of system.jobs directly.
-	// The former has access control built in and will filter out jobs that the
-	// user is not allowed to see.
-	jobsQFrom        = ` `
 	jobIDFilter      = ` WHERE j.id = $1`
 	jobsStatusFilter = ` WHERE j.status = $1`
 	jobsTypeFilter   = ` WHERE j.job_type = $1`
@@ -1165,20 +1152,15 @@ CREATE TABLE crdb_internal.jobs (
   description           STRING,
   statement             STRING,
   user_name             STRING,
-  descriptor_ids        INT[],
   status                STRING,
   running_status        STRING,
   created               TIMESTAMPTZ,
-  started               TIMESTAMPTZ,
   finished              TIMESTAMPTZ,
   modified              TIMESTAMPTZ,
   fraction_completed    FLOAT,
   high_water_timestamp  DECIMAL,
   error                 STRING,
   coordinator_id        INT,
-  trace_id              INT,
-  execution_errors      STRING[],
-  execution_events      JSONB,
   INDEX(job_id),
   INDEX(status),
   INDEX(job_type)
@@ -1206,223 +1188,6 @@ CREATE TABLE crdb_internal.jobs (
 	},
 }
 
-var useOldJobsVTable = settings.RegisterBoolSetting(
-	settings.ApplicationLevel,
-	"sql.jobs.legacy_vtable.enabled",
-	"cause the crdb_internal.jobs vtable to be produced from the legacy payload info records",
-	false, // TODO(dt): flip this once we add permissive auth checks.
-)
-
-// makeJobsTableRows calls addRow for each job. It returns true if addRow was called
-// successfully at least once.
-func makeJobsTableRows(
-	ctx context.Context,
-	p *planner,
-	addRow func(...tree.Datum) error,
-	queryFilterSuffix string,
-	params ...interface{},
-) (matched bool, err error) {
-
-	v, err := p.InternalSQLTxn().GetSystemSchemaVersion(ctx)
-	if err != nil {
-		return false, err
-	}
-	if !v.AtLeast(clusterversion.V25_1.Version()) || useOldJobsVTable.Get(&p.EvalContext().Settings.SV) {
-		query := jobsQuery + queryFilterSuffix
-		return makeLegacyJobsTableRows(ctx, p, addRow, query, params...)
-	}
-	return makeJobBasedJobsTableRows(ctx, p, addRow, queryFilterSuffix, params...)
-}
-
-func makeLegacyJobsTableRows(
-	ctx context.Context,
-	p *planner,
-	addRow func(...tree.Datum) error,
-	query string,
-	params ...interface{},
-) (matched bool, err error) {
-	// We use QueryIteratorEx here and specify the current user
-	// instead of using InternalExecutor.QueryIterator because
-	// the latter is being deprecated for sometimes executing
-	// the query as the root user.
-	it, err := p.InternalSQLTxn().QueryIteratorEx(
-		ctx, "crdb-internal-jobs-table", p.txn,
-		sessiondata.InternalExecutorOverride{User: p.User()},
-		query, params...)
-	if err != nil {
-		return matched, err
-	}
-
-	cleanup := func(ctx context.Context) {
-		if err := it.Close(); err != nil {
-			// TODO(yuzefovich): this error should be propagated further up
-			// and not simply being logged. Fix it (#61123).
-			//
-			// Doing that as a return parameter would require changes to
-			// `planNode.Close` signature which is a bit annoying. One other
-			// possible solution is to panic here and catch the error
-			// somewhere.
-			log.Warningf(ctx, "error closing an iterator: %v", err)
-		}
-	}
-	defer cleanup(ctx)
-
-	sessionJobs := make([]*jobs.Record, 0, p.extendedEvalCtx.jobs.numToCreate())
-	uniqueJobs := make(map[*jobs.Record]struct{})
-	if err := p.extendedEvalCtx.jobs.forEachToCreate(func(job *jobs.Record) error {
-		if _, ok := uniqueJobs[job]; ok {
-			return nil
-		}
-		sessionJobs = append(sessionJobs, job)
-		uniqueJobs[job] = struct{}{}
-		return nil
-	}); err != nil {
-		return matched, err
-	}
-
-	// Loop while we need to skip a row.
-	for {
-		ok, err := it.Next(ctx)
-		if err != nil {
-			return matched, err
-		}
-		var id, status, created, payloadBytes, progressBytes, sessionIDBytes,
-			instanceID tree.Datum
-		if ok {
-			r := it.Cur()
-			id, status, created, payloadBytes, progressBytes, sessionIDBytes, instanceID =
-				r[0], r[1], r[2], r[3], r[4], r[5], r[6]
-		} else if !ok {
-			if len(sessionJobs) == 0 {
-				return matched, nil
-			}
-			job := sessionJobs[len(sessionJobs)-1]
-			sessionJobs = sessionJobs[:len(sessionJobs)-1]
-			// Convert the job into datums, where protobufs will be intentionally,
-			// marshalled.
-			id = tree.NewDInt(tree.DInt(job.JobID))
-			status = tree.NewDString(string(jobs.StatePending))
-			created = tree.MustMakeDTimestampTZ(timeutil.Unix(0, p.txn.ReadTimestamp().WallTime), time.Microsecond)
-			progressBytes, payloadBytes, err = getPayloadAndProgressFromJobsRecord(p, job)
-			if err != nil {
-				return matched, err
-			}
-			sessionIDBytes = tree.NewDBytes(tree.DBytes(p.extendedEvalCtx.SessionID.GetBytes()))
-			instanceID = tree.NewDInt(tree.DInt(p.extendedEvalCtx.ExecCfg.JobRegistry.ID()))
-		}
-
-		var jobType, description, statement, user, descriptorIDs, started, runningStatus,
-			finished, modified, fractionCompleted, highWaterTimestamp, errorStr, coordinatorID,
-			traceID, executionErrors, executionEvents = tree.DNull, tree.DNull, tree.DNull,
-			tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull,
-			tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull, tree.DNull
-
-		// Extract data from the payload.
-		payload, err := jobs.UnmarshalPayload(payloadBytes)
-		if err != nil {
-			return matched, wrapPayloadUnMarshalError(err, id)
-		}
-
-		// We filter out masked rows before we allocate all the
-		// datums. Needless allocate when not necessary.
-		sqlUsername := payload.UsernameProto.Decode()
-		if sessionID, ok := sessionIDBytes.(*tree.DBytes); ok {
-			if isAlive, err := p.EvalContext().SQLLivenessReader.IsAlive(
-				ctx, sqlliveness.SessionID(*sessionID),
-			); err != nil {
-				// Silently swallow the error for checking for liveness.
-			} else if instanceID, ok := instanceID.(*tree.DInt); ok && isAlive {
-				coordinatorID = instanceID
-			}
-		}
-
-		// TODO(jayant): we can select the job_type as a column
-		// rather than decoding the payload. This would allow us
-		// to create a virtual index on it.
-		jobType = tree.NewDString(payload.Type().String())
-		description = tree.NewDString(payload.Description)
-		statement = tree.NewDString(strings.Join(payload.Statement, "; "))
-		user = tree.NewDString(sqlUsername.Normalized())
-		descriptorIDsArr := tree.NewDArray(types.Int)
-		for _, descID := range payload.DescriptorIDs {
-			if err := descriptorIDsArr.Append(tree.NewDInt(tree.DInt(int(descID)))); err != nil {
-				return matched, err
-			}
-		}
-		descriptorIDs = descriptorIDsArr
-		started, err = tsOrNull(payload.StartedMicros)
-		if err != nil {
-			return matched, err
-		}
-		finished, err = tsOrNull(payload.FinishedMicros)
-		if err != nil {
-			return matched, err
-		}
-		errorStr = tree.NewDString(payload.Error)
-
-		// Extract data from the progress field.
-		if progressBytes != tree.DNull {
-			progress, err := jobs.UnmarshalProgress(progressBytes)
-			if err != nil {
-				baseErr := ""
-				if s, ok := errorStr.(*tree.DString); ok {
-					baseErr = string(*s)
-					if baseErr != "" {
-						baseErr += "\n"
-					}
-				}
-				errorStr = tree.NewDString(fmt.Sprintf("%serror decoding progress: %v", baseErr, err))
-			} else {
-				// Progress contains either fractionCompleted for traditional jobs,
-				// or the highWaterTimestamp for change feeds.
-				if highwater := progress.GetHighWater(); highwater != nil {
-					highWaterTimestamp = eval.TimestampToDecimalDatum(*highwater)
-				} else {
-					fractionCompleted = tree.NewDFloat(tree.DFloat(progress.GetFractionCompleted()))
-				}
-				modified, err = tsOrNull(progress.ModifiedMicros)
-				if err != nil {
-					return matched, err
-				}
-
-				if s, ok := status.(*tree.DString); ok {
-					if jobs.State(*s) == jobs.StateRunning && len(progress.StatusMessage) > 0 {
-						runningStatus = tree.NewDString(progress.StatusMessage)
-					} else if jobs.State(*s) == jobs.StatePaused && payload != nil && payload.PauseReason != "" {
-						errorStr = tree.NewDString(fmt.Sprintf("%s: %s", jobs.PauseRequestExplained, payload.PauseReason))
-					}
-				}
-				traceID = tree.NewDInt(tree.DInt(progress.TraceID))
-			}
-		}
-
-		if err = addRow(
-			id,
-			jobType,
-			description,
-			statement,
-			user,
-			descriptorIDs,
-			status,
-			runningStatus,
-			created,
-			started,
-			finished,
-			modified,
-			fractionCompleted,
-			highWaterTimestamp,
-			errorStr,
-			coordinatorID,
-			traceID,
-			executionErrors,
-			executionEvents,
-		); err != nil {
-			return matched, err
-		}
-		matched = true
-	}
-}
-
 var enablePerJobDetailedAuthLookups = settings.RegisterBoolSetting(
 	settings.ApplicationLevel,
 	"sql.jobs.legacy_per_job_access_via_details.enabled",
@@ -1432,7 +1197,7 @@ var enablePerJobDetailedAuthLookups = settings.RegisterBoolSetting(
 
 var errLegacyPerJobAuthDisabledSentinel = pgerror.Newf(pgcode.InsufficientPrivilege, "legacy job access based on details is disabled")
 
-func makeJobBasedJobsTableRows(
+func makeJobsTableRows(
 	ctx context.Context,
 	p *planner,
 	addRow func(...tree.Datum) error,
@@ -1453,8 +1218,11 @@ j.error_msg,
 j.claim_instance_id
 FROM system.public.jobs AS j
 LEFT OUTER JOIN system.public.job_progress AS p ON j.id = p.job_id
-LEFT OUTER JOIN system.public.job_status AS s ON j.id = s.job_id  
-	` + whereClause
+LEFT OUTER JOIN system.public.job_status AS s ON j.id = s.job_id
+	` + whereClause + `UNION
+	(SELECT job_id, job_type, description, user_name, 'pending',
+					NULL, now(), NULL, now(), NULL, NULL, NULL, NULL
+	FROM crdb_internal.session_pending_jobs())`
 
 	it, err := p.InternalSQLTxn().QueryIteratorEx(
 		ctx, "system-jobs-join", p.txn, sessiondata.NodeUserSessionDataOverride, query, params...)
@@ -1467,108 +1235,60 @@ LEFT OUTER JOIN system.public.job_status AS s ON j.id = s.job_id
 		}
 	}()
 
-	sessionJobs := make([]*jobs.Record, 0, p.extendedEvalCtx.jobs.numToCreate())
-	uniqueJobs := make(map[*jobs.Record]struct{})
-	if err := p.extendedEvalCtx.jobs.forEachToCreate(func(job *jobs.Record) error {
-		if _, ok := uniqueJobs[job]; ok {
-			return nil
-		}
-		sessionJobs = append(sessionJobs, job)
-		uniqueJobs[job] = struct{}{}
-		return nil
-	}); err != nil {
-		return emitted, err
-	}
-
 	// Loop while we need to skip a row.
 	for {
 		ok, err := it.Next(ctx)
+		if err != nil || !ok {
+			return emitted, err
+		}
+		r := it.Cur()
+		id, typStr, desc, ownerStr, state, status, created, finished, modified, fraction, resolved, errorMsg, instanceID :=
+			r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]
+
+		owner := username.MakeSQLUsernameFromPreNormalizedString(string(tree.MustBeDString(ownerStr)))
+		jobID := jobspb.JobID(tree.MustBeDInt(id))
+		typ, err := jobspb.TypeFromString(string(tree.MustBeDString(typStr)))
 		if err != nil {
 			return emitted, err
 		}
-		// We will read the columns from the query on joined jobs tables into a wide
-		// row, and then copy the values from read rows into named variables to then
-		// use when emitting our output row. If we need to synthesize rows for jobs
-		// pending creation in the session, we'll do so in those same named vars to
-		// keep things organized.
-		//   0,      1,    2,        3,     4,      5,       6,        7,        8,        9,       10,       11,         12
-		var id, typStr, desc, ownerStr, state, status, created, finished, modified, fraction, resolved, errorMsg, instanceID tree.Datum
 
-		if ok {
-			r := it.Cur()
-			id, typStr, desc, ownerStr, state, status, created, finished, modified, fraction, resolved, errorMsg, instanceID =
-				r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], r[11], r[12]
-
-			owner := username.MakeSQLUsernameFromPreNormalizedString(string(tree.MustBeDString(ownerStr)))
-			jobID := jobspb.JobID(tree.MustBeDInt(id))
-			typ, err := jobspb.TypeFromString(string(tree.MustBeDString(typStr)))
+		getLegacyPayloadForAuth := func(ctx context.Context) (*jobspb.Payload, error) {
+			if !enablePerJobDetailedAuthLookups.Get(&p.EvalContext().Settings.SV) {
+				return nil, errLegacyPerJobAuthDisabledSentinel
+			}
+			if p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.V25_1) {
+				log.Warningf(ctx, "extended job access control based on job-specific details is deprecated and can make SHOW JOBS less performant; consider disabling %s",
+					enablePerJobDetailedAuthLookups.Name())
+				p.BufferClientNotice(ctx,
+					pgnotice.Newf("extended job access control based on job-specific details has been deprecated and can make SHOW JOBS less performant; consider disabling %s",
+						enablePerJobDetailedAuthLookups.Name()))
+			}
+			payload := &jobspb.Payload{}
+			infoStorage := jobs.InfoStorageForJob(p.InternalSQLTxn(), jobID)
+			payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx, "getLegacyPayload-for-custom-auth")
 			if err != nil {
-				return emitted, err
+				return nil, err
 			}
+			if !exists {
+				return nil, errors.New("job payload not found in system.job_info")
+			}
+			if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
+				return nil, err
+			}
+			return payload, nil
+		}
+		if errorMsg == tree.DNull {
+			errorMsg = emptyString
+		}
 
-			getLegacyPayloadForAuth := func(ctx context.Context) (*jobspb.Payload, error) {
-				if !enablePerJobDetailedAuthLookups.Get(&p.EvalContext().Settings.SV) {
-					return nil, errLegacyPerJobAuthDisabledSentinel
-				}
-				if p.EvalContext().Settings.Version.IsActive(ctx, clusterversion.V25_1) {
-					log.Warningf(ctx, "extended job access control based on job-specific details is deprecated and can make SHOW JOBS less performant; consider disabling %s",
-						enablePerJobDetailedAuthLookups.Name())
-					p.BufferClientNotice(ctx,
-						pgnotice.Newf("extended job access control based on job-specific details has been deprecated and can make SHOW JOBS less performant; consider disabling %s",
-							enablePerJobDetailedAuthLookups.Name()))
-				}
-				payload := &jobspb.Payload{}
-				infoStorage := jobs.InfoStorageForJob(p.InternalSQLTxn(), jobID)
-				payloadBytes, exists, err := infoStorage.GetLegacyPayload(ctx, "getLegacyPayload-for-custom-auth")
-				if err != nil {
-					return nil, err
-				}
-				if !exists {
-					return nil, errors.New("job payload not found in system.job_info")
-				}
-				if err := protoutil.Unmarshal(payloadBytes, payload); err != nil {
-					return nil, err
-				}
-				return payload, nil
+		if err := jobsauth.AuthorizeAllowLegacyAuth(
+			ctx, p, jobID, getLegacyPayloadForAuth, owner, typ, jobsauth.ViewAccess, globalPrivileges,
+		); err != nil {
+			// Filter out jobs which the user is not allowed to see.
+			if IsInsufficientPrivilegeError(err) {
+				continue
 			}
-			if errorMsg == tree.DNull {
-				errorMsg = emptyString
-			}
-
-			if err := jobsauth.AuthorizeAllowLegacyAuth(
-				ctx, p, jobID, getLegacyPayloadForAuth, owner, typ, jobsauth.ViewAccess, globalPrivileges,
-			); err != nil {
-				// Filter out jobs which the user is not allowed to see.
-				if IsInsufficientPrivilegeError(err) {
-					continue
-				}
-				return emitted, err
-			}
-		} else if !ok {
-			if len(sessionJobs) == 0 {
-				return emitted, nil
-			}
-			job := sessionJobs[len(sessionJobs)-1]
-			sessionJobs = sessionJobs[:len(sessionJobs)-1]
-			payloadType, err := jobspb.DetailsType(jobspb.WrapPayloadDetails(job.Details))
-			if err != nil {
-				return emitted, err
-			}
-			// synthesize the fields we'd read from the jobs table if this job were in it.
-			id, typStr, desc, ownerStr, state, status, created, finished, modified, fraction, resolved, errorMsg, instanceID =
-				tree.NewDInt(tree.DInt(job.JobID)),
-				tree.NewDString(payloadType.String()),
-				tree.NewDString(job.Description),
-				tree.NewDString(job.Username.Normalized()),
-				tree.NewDString(string(jobs.StatePending)),
-				tree.DNull,
-				tree.MustMakeDTimestampTZ(p.txn.ReadTimestamp().GoTime(), time.Microsecond),
-				tree.DNull,
-				tree.MustMakeDTimestampTZ(p.txn.ReadTimestamp().GoTime(), time.Microsecond),
-				tree.NewDFloat(tree.DFloat(0)),
-				tree.DZeroDecimal,
-				tree.DNull,
-				tree.NewDInt(tree.DInt(p.extendedEvalCtx.ExecCfg.JobRegistry.ID()))
+			return emitted, err
 		}
 
 		if err = addRow(
@@ -1577,20 +1297,15 @@ LEFT OUTER JOIN system.public.job_status AS s ON j.id = s.job_id
 			desc,
 			desc,
 			ownerStr,
-			tree.DNull, // deperecated "descriptor_ids"
 			state,
 			status,
 			created,
-			created, // deprecated "started" field.
 			finished,
 			modified,
 			fraction,
 			resolved,
 			errorMsg,
 			instanceID,
-			tree.DNull, // deprecated "trace_id" field.
-			tree.DNull, // deprecated "executionErrors" field.
-			tree.DNull, // deprecated "executionEvents" field.
 		); err != nil {
 			return emitted, err
 		}
@@ -2983,7 +2698,7 @@ func populateQueriesTable(
 // formatActiveQuery formats a serverpb.ActiveQuery by interpolating its
 // placeholders within the string.
 func formatActiveQuery(query serverpb.ActiveQuery) string {
-	parsed, parseErr := parser.ParseOneRetainComments(query.Sql)
+	parsed, parseErr := parser.ParseOneWithOptions(query.Sql, parser.DefaultParseOptions.RetainComments())
 	if parseErr != nil {
 		// If we failed to interpolate, rather than give up just send out the
 		// SQL without interpolated placeholders. Hallelujah!
@@ -3911,6 +3626,79 @@ func createRoutinePopulate(
 	}
 }
 
+func createRoutinePopulateByFnIndex(
+	ctx context.Context,
+	unwrappedConstraint tree.Datum,
+	p *planner,
+	db catalog.DatabaseDescriptor,
+	addRow func(...tree.Datum) error,
+) (matched bool, err error) {
+	// In here, we start from the DatabaseDescriptor and a routine ID and populate the remainder of a row
+	// in the virtual table. This function, thus, is used to populate when indexing into the routine virtual tables,
+	// `crdb_internal.create_function_statements` and `crdb_internal.create_procedure_statements`, helping
+	// optimize the queries for the create statements output in `SHOW CREATE ALL ROUTINES`.
+	fnID := descpb.ID(tree.MustBeDInt(unwrappedConstraint))
+	fnDesc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Function(ctx, fnID)
+	if err != nil || fnDesc == nil {
+		if errors.Is(err, catalog.ErrDescriptorNotFound) || fnDesc == nil {
+			return false, nil
+		}
+		return false, err
+	}
+	scID := fnDesc.GetParentSchemaID()
+	sc, err := p.Descriptors().ByIDWithoutLeased(p.txn).WithoutNonPublic().Get().Schema(ctx, scID)
+	if err != nil || sc == nil {
+		return false, err
+	}
+	scName := sc.GetName()
+	dbName := db.GetName()
+	dbID := db.GetID()
+
+	treeNode, err := fnDesc.ToCreateExpr()
+	treeNode.Name.ObjectNamePrefix = tree.ObjectNamePrefix{
+		ExplicitSchema: true,
+		SchemaName:     tree.Name(scName),
+	}
+	if err != nil {
+		return false, err
+	}
+	for i := range treeNode.Options {
+		if body, ok := treeNode.Options[i].(tree.RoutineBodyStr); ok {
+			bodyStr := string(body)
+			bodyStr, err = formatFunctionQueryTypesForDisplay(ctx, p.EvalContext(), &p.semaCtx, p.SessionData(), bodyStr, fnDesc.GetLanguage())
+			if err != nil {
+				return false, err
+			}
+			bodyStr, err = formatQuerySequencesForDisplay(ctx, &p.semaCtx, bodyStr, true /* multiStmt */, fnDesc.GetLanguage())
+			if err != nil {
+				return false, err
+			}
+			bodyStr = strings.TrimSpace(bodyStr)
+			stmtStrs := strings.Split(bodyStr, "\n")
+			for i := range stmtStrs {
+				if stmtStrs[i] != "" {
+					stmtStrs[i] = "\t" + stmtStrs[i]
+				}
+			}
+			p := &treeNode.Options[i]
+			*p = tree.RoutineBodyStr("\n" + strings.Join(stmtStrs, "\n") + "\n")
+		}
+	}
+	createStatement := tree.AsString(treeNode)
+	if err := addRow(
+		tree.NewDInt(tree.DInt(dbID)),           // database_id
+		tree.NewDString(dbName),                 // database_name
+		tree.NewDInt(tree.DInt(scID)),           // schema_id
+		tree.NewDString(scName),                 // schema_name
+		tree.NewDInt(tree.DInt(fnDesc.GetID())), // function_id
+		tree.NewDString(fnDesc.GetName()),       // function_name
+		tree.NewDString(createStatement),        // create_statement
+	); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 var crdbInternalCreateFunctionStmtsTable = virtualSchemaTable{
 	comment: "CREATE statements for all user-defined functions",
 	schema: `
@@ -3921,10 +3709,15 @@ CREATE TABLE crdb_internal.create_function_statements (
   schema_name STRING,
   function_id INT,
   function_name STRING,
-  create_statement STRING
-)
-`,
+  create_statement STRING,
+  INDEX (function_id)
+)`,
 	populate: createRoutinePopulate(false /* procedure */),
+	indexes: []virtualIndex{
+		{
+			populate: createRoutinePopulateByFnIndex,
+		},
+	},
 }
 
 var crdbInternalCreateProcedureStmtsTable = virtualSchemaTable{
@@ -3937,10 +3730,113 @@ CREATE TABLE crdb_internal.create_procedure_statements (
   schema_name STRING,
   procedure_id INT,
   procedure_name STRING,
-  create_statement STRING
-)
-`,
+  create_statement STRING,
+  INDEX (procedure_id)
+)`,
 	populate: createRoutinePopulate(true /* procedure */),
+	indexes: []virtualIndex{
+		{
+			populate: createRoutinePopulateByFnIndex,
+		},
+	},
+}
+
+func createTriggerPopulate(
+	ctx context.Context, p *planner, db catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
+) error {
+	// Skip virtual tables by setting virtualOpts to hideVirtual since they do not have triggers.
+	options := forEachTableDescOptions{virtualOpts: hideVirtual}
+	return forEachTableDesc(ctx, p, db, options, func(ctx context.Context, tblCtx tableDescContext) error {
+		tbl := tblCtx.table
+		curDB := tblCtx.database
+		sc := tblCtx.schema
+
+		for _, trig := range tbl.GetTriggers() {
+			sql, err := renderCreateTriggerStatement(ctx, p, &trig, tbl)
+			if err != nil {
+				return err
+			}
+
+			err = addRow(
+				tree.NewDInt(tree.DInt(curDB.GetID())), // database_id
+				tree.NewDString(curDB.GetName()),       // database_name
+				tree.NewDInt(tree.DInt(sc.GetID())),    // schema_id
+				tree.NewDString(sc.GetName()),          // schema_name
+				tree.NewDInt(tree.DInt(tbl.GetID())),   // table_id
+				tree.NewDString(tbl.GetName()),         // table_name
+				tree.NewDInt(tree.DInt(trig.ID)),       // trigger_id
+				tree.NewDString(trig.Name),             // trigger_name
+				tree.NewDString(sql),                   // create_statement
+			)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	)
+}
+
+var crdbInternalCreateTriggerStmtsTable = virtualSchemaTable{
+	comment: "CREATE statements for all user-defined triggers.",
+	schema: `
+CREATE TABLE crdb_internal.create_trigger_statements (
+  database_id INT,
+  database_name STRING,
+  schema_id INT,
+  schema_name STRING,
+  table_id INT,
+  table_name STRING,
+  trigger_id INT,
+  trigger_name STRING,
+  create_statement STRING,
+  INDEX (table_id)
+)`,
+	populate: createTriggerPopulate,
+	indexes: []virtualIndex{
+		{
+			populate: func(
+				ctx context.Context,
+				unwrappedConstraint tree.Datum,
+				p *planner,
+				db catalog.DatabaseDescriptor,
+				addRow func(...tree.Datum) error,
+			) (matched bool, err error) {
+				tableID := descpb.ID(tree.MustBeDInt(unwrappedConstraint))
+				tableDesc, err := p.LookupTableByID(ctx, tableID)
+				if err != nil || tableDesc == nil {
+					return false, err
+				}
+				triggers := tableDesc.GetTriggers()
+				schemaID := tableDesc.GetParentSchemaID()
+				sc, err := p.LookupSchemaByID(ctx, schemaID)
+				if err != nil {
+					return false, err
+				}
+				for _, trig := range triggers {
+					sql, err := renderCreateTriggerStatement(ctx, p, &trig, tableDesc)
+					if err != nil {
+						return false, err
+					}
+					err = addRow(
+						tree.NewDInt(tree.DInt(db.GetID())),
+						tree.NewDString(db.GetName()),
+						tree.NewDInt(tree.DInt(sc.GetID())),
+						tree.NewDString(sc.GetName()),
+						tree.NewDInt(tree.DInt(tableDesc.GetID())),
+						tree.NewDString(tableDesc.GetName()),
+						tree.NewDInt(tree.DInt(trig.ID)),
+						tree.NewDString(trig.Name),
+						tree.NewDString(sql),
+					)
+					if err != nil {
+						return false, err
+					}
+				}
+				return true, nil
+			},
+		},
+	},
 }
 
 // Prepare the row populate function.
@@ -4084,7 +3980,7 @@ func showRowLevelSecurityStatements(
 	rlsStmts *tree.DArray,
 ) error {
 	// Add the row level security ALTER statements to the rls_statements column.
-	if alterRLSStatements, err := showRLSAlterStatement(tn, table, false); err != nil {
+	if alterRLSStatements, err := showRLSAlterStatement(tn, table); err != nil {
 		return err
 	} else if len(alterRLSStatements) != 0 {
 		if err = rlsStmts.Append(tree.NewDString(alterRLSStatements)); err != nil {
@@ -4094,12 +3990,10 @@ func showRowLevelSecurityStatements(
 
 	// Add the row level security policy statements to the rls_statements column.
 	for _, policy := range table.GetPolicies() {
-		if policyStatement, err := showPolicyStatement(ctx, tn, table, evalCtx, semaCtx, sessionData, policy, false); err != nil {
+		if policyStatement, err := showPolicyStatement(ctx, tn, table, evalCtx, semaCtx, sessionData, policy); err != nil {
 			return err
-		} else if len(policyStatement) != 0 {
-			if err := rlsStmts.Append(tree.NewDString(policyStatement)); err != nil {
-				return err
-			}
+		} else if err = rlsStmts.Append(tree.NewDString(policyStatement)); err != nil {
+			return err
 		}
 	}
 
@@ -5556,7 +5450,7 @@ CREATE TABLE crdb_internal.gossip_alerts (
 					tree.NewDInt(tree.DInt(result.NodeID)),
 					storeID,
 					tree.NewDString(strings.ToLower(alert.Category.String())),
-					tree.NewDString(alert.Description),
+					tree.NewDString(string(alert.SafeDescription)),
 					tree.NewDFloat(tree.DFloat(alert.Value)),
 				); err != nil {
 					return err
@@ -6391,7 +6285,7 @@ CREATE TABLE crdb_internal.invalid_objects (
 )`,
 	populate: func(
 		ctx context.Context, p *planner, dbContext catalog.DatabaseDescriptor, addRow func(...tree.Datum) error,
-	) error {
+	) (retError error) {
 		// The internalLookupContext will only have descriptors in the current
 		// database. To deal with this, we fall through.
 		c, err := p.Descriptors().GetAllFromStorageUnvalidated(ctx, p.txn)
@@ -6537,6 +6431,54 @@ CREATE TABLE crdb_internal.invalid_objects (
 				return doDescriptorValidationErrors(ctx, desc, lCtx)
 			}); err != nil {
 				return err
+			}
+
+			// Validate the system.comments table.
+			txn := p.InternalSQLTxn()
+			rows, err := txn.QueryIterator(ctx, "scan-comments-table",
+				txn.KV(), "SELECT type, object_id, sub_id FROM system.comments")
+			if err != nil {
+				return err
+			}
+			defer func() {
+				if err := rows.Close(); err != nil {
+					retError = errors.CombineErrors(retError, err)
+				}
+			}()
+			for {
+				hasMore, err := rows.Next(ctx)
+				if err != nil {
+					return err
+				}
+				if !hasMore {
+					break
+				}
+				datums := rows.Cur()
+				commentType := tree.MustBeDInt(datums[0])
+				objectID := tree.MustBeDInt(datums[1])
+				subID := tree.MustBeDInt(datums[2])
+				cmtKey := catalogkeys.MakeCommentKey(uint32(objectID), uint32(subID), catalogkeys.CommentType(commentType))
+				// Validate the objects exist for the comments.
+				desc := c.LookupDescriptor(descpb.ID(objectID))
+				if desc == nil {
+					missingDescErr := errors.AssertionFailedf("comment exists for non-existent descriptor %d", objectID)
+					if err := addRow(
+						tree.NewDInt(objectID),
+						tree.NewDString(""),
+						tree.NewDString(""),
+						tree.NewDString(""),
+						tree.NewDString(missingDescErr.Error()),
+						tree.NewDString(missingDescErr.Error())); err != nil {
+						return err
+					}
+					continue
+				}
+				// Validate the comment key is sane.
+				if validationErr := cmtKey.Validate(); validationErr != nil {
+					if err := addValidationErrorRow(desc, validationErr, lCtx); err != nil {
+						return err
+					}
+				}
 			}
 
 			return c.ForEachNamespaceEntry(func(ne nstree.NamespaceEntry) error {
@@ -8715,7 +8657,8 @@ CREATE TABLE crdb_internal.%s (
 	implicit_txn               BOOL NOT NULL,
 	cpu_sql_nanos              INT8,
 	error_code                 STRING,
-	last_error_redactable      STRING
+	last_error_redactable      STRING,
+	query_tags                 JSONB
 )`
 
 var crdbInternalClusterExecutionInsightsTable = virtualSchemaTable{
@@ -8842,6 +8785,27 @@ func populateStmtInsights(
 				}
 			}
 
+			var keys = []string{"name", "value"}
+			arrayBuilder := json.NewArrayBuilder(len(s.QueryTags))
+			for _, queryTag := range s.QueryTags {
+				builder, err := json.NewFixedKeysObjectBuilder(keys)
+				if err != nil {
+					return err
+				}
+				if err := builder.Set(keys[0], json.FromString(queryTag.Name)); err != nil {
+					return err
+				}
+				if err := builder.Set(keys[1], json.FromString(queryTag.Value)); err != nil {
+					return err
+				}
+				json, err := builder.Build()
+				if err != nil {
+					return err
+				}
+				arrayBuilder.Add(json)
+			}
+			commentsJson := arrayBuilder.Build()
+
 			err = errors.CombineErrors(err, addRow(
 				tree.NewDString(hex.EncodeToString(insight.Session.ID.GetBytes())),
 				tree.NewDUuid(tree.DUuid{UUID: insight.Transaction.ID}),
@@ -8872,6 +8836,7 @@ func populateStmtInsights(
 				tree.NewDInt(tree.DInt(s.CPUSQLNanos)),
 				errorCode,
 				errorMsg,
+				tree.NewDJSON(commentsJson),
 			))
 		}
 	}
@@ -9127,6 +9092,7 @@ FROM system.privileges;`,
 	resultColumns: resultColsFromColDescs(systemschema.SystemPrivilegeTable.TableDesc().Columns),
 }
 
+// Obsolete, so empty output.
 var crdbInternalKVFlowController = virtualSchemaTable{
 	comment: `node-level view of the kv flow controller, its active streams and available tokens state`,
 	schema: `
@@ -9143,21 +9109,6 @@ CREATE TABLE crdb_internal.kv_flow_controller (
 		}
 		if !hasRoleOption {
 			return noViewActivityOrViewActivityRedactedRoleError(p.User())
-		}
-
-		resp, err := p.extendedEvalCtx.ExecCfg.InspectzServer.KVFlowController(ctx, &kvflowinspectpb.ControllerRequest{})
-		if err != nil {
-			return err
-		}
-		for _, stream := range resp.Streams {
-			if err := addRow(
-				tree.NewDInt(tree.DInt(stream.TenantID.ToUint64())),
-				tree.NewDInt(tree.DInt(stream.StoreID)),
-				tree.NewDInt(tree.DInt(stream.AvailableEvalRegularTokens)),
-				tree.NewDInt(tree.DInt(stream.AvailableEvalElasticTokens)),
-			); err != nil {
-				return err
-			}
 		}
 		return nil
 	},
@@ -9202,6 +9153,7 @@ CREATE TABLE crdb_internal.kv_flow_controller_v2 (
 	},
 }
 
+// Obsolete, so empty output.
 var crdbInternalKVFlowHandles = virtualSchemaTable{
 	comment: `node-level view of active kv flow control handles, their underlying streams, and tracked state`,
 	schema: `
@@ -9223,16 +9175,7 @@ CREATE TABLE crdb_internal.kv_flow_control_handles (
 				if !hasRoleOption {
 					return false, noViewActivityOrViewActivityRedactedRoleError(p.User())
 				}
-
-				rangeID := roachpb.RangeID(tree.MustBeDInt(constraint))
-				resp, err := p.extendedEvalCtx.ExecCfg.InspectzServer.KVFlowHandles(
-					ctx, &kvflowinspectpb.HandlesRequest{
-						RangeIDs: []roachpb.RangeID{rangeID},
-					})
-				if err != nil {
-					return false, err
-				}
-				return true, populateFlowHandlesResponse(resp, addRow)
+				return true, nil
 			},
 		},
 	},
@@ -9244,12 +9187,7 @@ CREATE TABLE crdb_internal.kv_flow_control_handles (
 		if !hasRoleOption {
 			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
-
-		resp, err := p.extendedEvalCtx.ExecCfg.InspectzServer.KVFlowHandles(ctx, &kvflowinspectpb.HandlesRequest{})
-		if err != nil {
-			return err
-		}
-		return populateFlowHandlesResponse(resp, addRow)
+		return nil
 	},
 }
 var crdbInternalKVFlowHandlesV2 = virtualSchemaTable{
@@ -9305,28 +9243,6 @@ CREATE TABLE crdb_internal.kv_flow_control_handles_v2 (
 	},
 }
 
-func populateFlowHandlesResponse(
-	resp *kvflowinspectpb.HandlesResponse, addRow func(...tree.Datum) error,
-) error {
-	for _, handle := range resp.Handles {
-		for _, connected := range handle.ConnectedStreams {
-			totalTrackedTokens := int64(0)
-			for _, tracked := range connected.TrackedDeductions {
-				totalTrackedTokens += tracked.Tokens
-			}
-			if err := addRow(
-				tree.NewDInt(tree.DInt(handle.RangeID)),
-				tree.NewDInt(tree.DInt(connected.Stream.TenantID.ToUint64())),
-				tree.NewDInt(tree.DInt(connected.Stream.StoreID)),
-				tree.NewDInt(tree.DInt(totalTrackedTokens)),
-			); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
 func populateFlowHandlesResponseV2(
 	resp *kvflowinspectpb.HandlesResponse, addRow func(...tree.Datum) error,
 ) error {
@@ -9375,16 +9291,8 @@ CREATE TABLE crdb_internal.kv_flow_token_deductions (
 				if !hasRoleOption {
 					return false, noViewActivityOrViewActivityRedactedRoleError(p.User())
 				}
-
-				rangeID := roachpb.RangeID(tree.MustBeDInt(constraint))
-				resp, err := p.extendedEvalCtx.ExecCfg.InspectzServer.KVFlowHandles(
-					ctx, &kvflowinspectpb.HandlesRequest{
-						RangeIDs: []roachpb.RangeID{rangeID},
-					})
-				if err != nil {
-					return false, err
-				}
-				return true, populateFlowTokensResponse(resp, addRow)
+				_ = roachpb.RangeID(tree.MustBeDInt(constraint))
+				return true, nil
 			},
 		},
 	},
@@ -9396,12 +9304,7 @@ CREATE TABLE crdb_internal.kv_flow_token_deductions (
 		if !hasRoleOption {
 			return noViewActivityOrViewActivityRedactedRoleError(p.User())
 		}
-
-		resp, err := p.extendedEvalCtx.ExecCfg.InspectzServer.KVFlowHandles(ctx, &kvflowinspectpb.HandlesRequest{})
-		if err != nil {
-			return err
-		}
-		return populateFlowTokensResponse(resp, addRow)
+		return nil
 	},
 }
 

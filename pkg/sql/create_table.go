@@ -614,7 +614,8 @@ func (n *createTableNode) startExec(params runParams) error {
 				// indexes, partial, vector, or otherwise, to update.
 				var pm row.PartialIndexUpdateHelper
 				var vh row.VectorIndexUpdateHelper
-				if err := ti.row(params.ctx, rowBuffer, pm, vh, params.extendedEvalCtx.Tracing.KVTracingEnabled()); err != nil {
+				var oth row.OriginTimestampCPutHelper
+				if err := ti.row(params.ctx, rowBuffer, pm, vh, oth, params.extendedEvalCtx.Tracing.KVTracingEnabled()); err != nil {
 					return err
 				}
 			}
@@ -1420,8 +1421,7 @@ func NewTableDesc(
 	desc := tabledesc.InitTableDescriptor(
 		id, dbID, sc.GetID(), n.Table.Table(), creationTime, privileges, persistence,
 	)
-
-	setter := tablestorageparam.NewSetter(&desc)
+	setter := tablestorageparam.NewSetter(&desc, true /* isNewObject */)
 	if err := storageparam.Set(
 		ctx,
 		semaCtx,
@@ -1965,6 +1965,9 @@ func NewTableDesc(
 				}
 			}
 			if d.Type == idxtype.VECTOR {
+				if !evalCtx.Settings.Version.ActiveVersion(ctx).AtLeast(clusterversion.V25_2.Version()) {
+					return nil, pgerror.Newf(pgcode.FeatureNotSupported, "cannot create a vector index until finalizing on 25.2")
+				}
 				// Disable vector indexes by default in 25.2.
 				// TODO(andyk): Remove this check after 25.2.
 				if err := vecindex.CheckEnabled(&st.SV); err != nil {
@@ -1974,7 +1977,11 @@ func NewTableDesc(
 				if err != nil {
 					return nil, err
 				}
-				idx.VecConfig = vecindex.MakeVecConfig(evalCtx, column.GetType())
+				opClass := columns[len(columns)-1].OpClass
+				idx.VecConfig, err = vecindex.MakeVecConfig(ctx, evalCtx, column.GetType(), opClass)
+				if err != nil {
+					return nil, err
+				}
 			}
 
 			var idxPartitionBy *tree.PartitionBy
@@ -2575,7 +2582,7 @@ func newTableDesc(
 
 	// For tables set schema_locked by default if it hasn't been set, and we
 	// aren't running under an internal executor.
-	if !ret.IsView() && !ret.IsSequence() &&
+	if !ret.IsView() && !ret.IsSequence() && !ret.IsTemporary() &&
 		n.StorageParams.GetVal("schema_locked") == nil &&
 		!params.p.SessionData().Internal &&
 		params.p.SessionData().CreateTableWithSchemaLocked &&
@@ -2841,6 +2848,9 @@ func replaceLikeTableOpts(n *tree.CreateTable, params runParams) (tree.TableDefs
 					elem := tree.IndexElem{
 						Column:    tree.Name(name),
 						Direction: tree.Ascending,
+					}
+					if !indexDef.Type.HasScannablePrefix() {
+						elem.Direction = tree.DefaultDirection
 					}
 					col, err := catalog.MustFindColumnByID(td, idx.GetKeyColumnID(j))
 					if err != nil {

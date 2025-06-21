@@ -22,7 +22,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/multitenant/tenantcapabilitiespb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/desctestutils"
@@ -49,7 +49,7 @@ func runTestClusterFlow(
 	t *testing.T,
 	servers []serverutils.ApplicationLayerInterface,
 	conns []*gosql.DB,
-	clients []execinfrapb.DistSQLClient,
+	clients []execinfrapb.RPCDistSQLClient,
 ) {
 	ctx := context.Background()
 	const numRows = 100
@@ -263,13 +263,13 @@ func TestClusterFlow(t *testing.T) {
 
 	servers := make([]serverutils.ApplicationLayerInterface, numNodes)
 	conns := make([]*gosql.DB, numNodes)
-	clients := make([]execinfrapb.DistSQLClient, numNodes)
+	clients := make([]execinfrapb.RPCDistSQLClient, numNodes)
 	for i := 0; i < numNodes; i++ {
 		s := tc.Server(i).ApplicationLayer()
 		servers[i] = s
 		conns[i] = s.SQLConn(t)
 		conn := s.RPCClientConn(t, username.RootUserName())
-		clients[i] = execinfrapb.NewDistSQLClient(conn)
+		clients[i] = conn.NewDistSQLClient()
 	}
 
 	runTestClusterFlow(t, servers, conns, clients)
@@ -289,7 +289,7 @@ func TestTenantClusterFlow(t *testing.T) {
 
 	pods := make([]serverutils.ApplicationLayerInterface, numPods)
 	podConns := make([]*gosql.DB, numPods)
-	clients := make([]execinfrapb.DistSQLClient, numPods)
+	clients := make([]execinfrapb.RPCDistSQLClient, numPods)
 	tenantID := serverutils.TestTenantID()
 	for i := 0; i < numPods; i++ {
 		pods[i], podConns[i] = serverutils.StartTenant(t, tc.Server(0), base.TestTenantArgs{
@@ -300,11 +300,11 @@ func TestTenantClusterFlow(t *testing.T) {
 		})
 		defer podConns[i].Close()
 		pod := pods[i]
-		conn, err := pod.RPCContext().GRPCDialPod(pod.RPCAddr(), pod.SQLInstanceID(), pod.Locality(), rpc.DefaultClass).Connect(ctx)
+		conn, err := pod.RPCContext().GRPCDialPod(pod.RPCAddr(), pod.SQLInstanceID(), pod.Locality(), rpcbase.DefaultClass).Connect(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		clients[i] = execinfrapb.NewDistSQLClient(conn)
+		clients[i] = execinfrapb.NewGRPCDistSQLClientAdapter(conn)
 	}
 
 	runTestClusterFlow(t, pods, podConns, clients)
@@ -771,12 +771,12 @@ func BenchmarkInfrastructure(b *testing.B) {
 					}
 					reqs[0].Flow.Processors = append(reqs[0].Flow.Processors, lastProc)
 
-					var clients []execinfrapb.DistSQLClient
+					var clients []execinfrapb.RPCDistSQLClient
 
 					for i := 0; i < numNodes; i++ {
 						s := tc.Server(i)
 						conn := s.RPCClientConn(b, username.RootUserName())
-						clients = append(clients, execinfrapb.NewDistSQLClient(conn))
+						clients = append(clients, conn.NewDistSQLClient())
 					}
 
 					b.ResetTimer()

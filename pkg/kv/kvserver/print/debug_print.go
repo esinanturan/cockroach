@@ -232,7 +232,7 @@ func tryIntent(kv storage.MVCCKeyValue) (string, error) {
 	return s, nil
 }
 
-func DecodeWriteBatch(writeBatch *kvserverpb.WriteBatch) (string, error) {
+func DecodeWriteBatch(writeBatch []byte) (string, error) {
 	// Ensure that we always update this function to consider any necessary
 	// updates when a new key kind is introduced. To do this, we assert
 	// pebble.KeyKindDeleteSized is the most recent key kind, ensuring that
@@ -244,7 +244,7 @@ func DecodeWriteBatch(writeBatch *kvserverpb.WriteBatch) (string, error) {
 		return "<nil>\n", nil
 	}
 
-	r, err := storage.NewBatchReader(writeBatch.Data)
+	r, err := storage.NewBatchReader(writeBatch)
 	if err != nil {
 		return "", err
 	}
@@ -381,7 +381,7 @@ func tryRaftLogEntry(kv storage.MVCCKeyValue) (string, error) {
 	e.Data = nil
 	cmd := e.Cmd
 
-	wbStr, err := DecodeWriteBatch(cmd.WriteBatch)
+	wbStr, err := DecodeWriteBatch(cmd.WriteBatch.GetData())
 	if err != nil {
 		wbStr = "failed to decode: " + err.Error() + "\nafter:\n" + wbStr
 	}
@@ -434,6 +434,9 @@ func tryRangeIDKey(kv storage.MVCCKeyValue) (string, error) {
 	case bytes.Equal(suffix, keys.LocalRaftTruncatedStateSuffix):
 		msg = &kvserverpb.RaftTruncatedState{}
 
+	case bytes.Equal(suffix, keys.LocalRangeGCHintSuffix):
+		msg = &roachpb.GCHint{}
+
 	case bytes.Equal(suffix, keys.LocalRangeLeaseSuffix):
 		msg = &roachpb.Lease{}
 
@@ -448,6 +451,9 @@ func tryRangeIDKey(kv storage.MVCCKeyValue) (string, error) {
 
 	case bytes.Equal(suffix, keys.LocalRaftLogSuffix):
 		return tryRaftLogEntry(kv)
+
+	case bytes.Equal(suffix, keys.LocalRaftReplicaIDSuffix):
+		msg = &kvserverpb.RaftReplicaID{}
 
 	case bytes.Equal(suffix, keys.LocalRangeLastReplicaGCTimestampSuffix):
 		msg = &hlc.Timestamp{}

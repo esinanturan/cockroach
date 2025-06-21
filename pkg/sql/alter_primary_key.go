@@ -851,6 +851,11 @@ func setKeySuffixAndStoredColumnIDsFromPrimary(
 				"indexed vector column cannot be part of the primary key")
 		}
 	}
+
+	if vecIdx {
+		tabledesc.UpdateVectorIndexPrefixColDirections(toAdd, primary)
+	}
+
 	// Finally, add all the stored columns if it is not already a key or key suffix column.
 	toAddOldStoredColumnIDs := toAdd.StoreColumnIDs
 	toAddOldStoredColumnNames := toAdd.StoreColumnNames
@@ -879,7 +884,8 @@ func (p *planner) disallowDroppingPrimaryIndexReferencedInUDFOrView(
 		if tableRef.IndexID == currentPrimaryIndex.GetID() {
 			// canRemoveDependent with `DropDefault` will return the right error.
 			err := p.canRemoveDependent(
-				ctx, "index", currentPrimaryIndex.GetName(), tableDesc.ParentID, tableRef, tree.DropDefault)
+				ctx, "index", currentPrimaryIndex.GetName(), tableDesc.ID, tableDesc.ParentID, tableRef, tree.DropDefault,
+				true /* blockOnTriggerDependency */)
 			if err != nil {
 				return errors.WithDetail(err, sqlerrors.PrimaryIndexSwapDetail)
 			}

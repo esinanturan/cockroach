@@ -127,7 +127,7 @@ func (p *Partition) QuantizedSet() quantize.QuantizedVectorSet {
 // Centroid is the full-sized centroid vector for this partition.
 // NOTE: The centroid is immutable and therefore this method is thread-safe.
 func (p *Partition) Centroid() vector.T {
-	return p.quantizedSet.GetCentroid()
+	return p.metadata.Centroid
 }
 
 // ChildKeys point to the location of the full-size vectors that are quantized
@@ -157,22 +157,20 @@ func (p *Partition) Search(
 	defer w.FreeFloats(tempFloats)
 
 	// Estimate distances of the data vectors from the query vector.
-	tempSquaredDistances := tempFloats[:count]
+	tempDistances := tempFloats[:count]
 	tempErrorBounds := tempFloats[count : count*2]
-	p.quantizer.EstimateSquaredDistances(
-		w, p.quantizedSet, queryVector, tempSquaredDistances, tempErrorBounds)
-	centroidDistances := p.quantizedSet.GetCentroidDistances()
+	p.quantizer.EstimateDistances(
+		w, p.quantizedSet, queryVector, tempDistances, tempErrorBounds)
 
 	// Add candidates to the search set, which is responsible for retaining the
 	// top-k results.
-	for i := range tempSquaredDistances {
+	for i := range tempDistances {
 		searchSet.tempResult = SearchResult{
-			QuerySquaredDistance: tempSquaredDistances[i],
-			ErrorBound:           tempErrorBounds[i],
-			CentroidDistance:     centroidDistances[i],
-			ParentPartitionKey:   partitionKey,
-			ChildKey:             p.childKeys[i],
-			ValueBytes:           p.valueBytes[i],
+			QueryDistance:      tempDistances[i],
+			ErrorBound:         tempErrorBounds[i],
+			ParentPartitionKey: partitionKey,
+			ChildKey:           p.childKeys[i],
+			ValueBytes:         p.valueBytes[i],
 		}
 		searchSet.Add(&searchSet.tempResult)
 	}
@@ -273,7 +271,7 @@ func (p *Partition) Find(childKey ChildKey) int {
 // vectors that were cleared. The centroid stays the same.
 func (p *Partition) Clear() int {
 	count := len(p.childKeys)
-	p.quantizedSet.Clear(p.quantizedSet.GetCentroid())
+	p.quantizedSet.Clear(p.metadata.Centroid)
 	clear(p.childKeys)
 	p.childKeys = p.childKeys[:0]
 	clear(p.valueBytes)
@@ -284,6 +282,6 @@ func (p *Partition) Clear() int {
 // CreateEmptyPartition returns an empty partition for the given quantizer and
 // level.
 func CreateEmptyPartition(quantizer quantize.Quantizer, metadata PartitionMetadata) *Partition {
-	quantizedSet := quantizer.NewQuantizedVectorSet(0, metadata.Centroid)
+	quantizedSet := quantizer.NewSet(0, metadata.Centroid)
 	return NewPartition(metadata, quantizer, quantizedSet, []ChildKey(nil), []ValueBytes(nil))
 }

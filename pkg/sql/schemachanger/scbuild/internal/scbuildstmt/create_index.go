@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/geo/geoindex"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -45,7 +46,9 @@ import (
 func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 	// Check if sql_safe_updates is enabled and this is a vector index
 	if n.Type == idxtype.VECTOR {
-		if b.EvalCtx().SessionData().SafeUpdates {
+		if !b.EvalCtx().Settings.Version.ActiveVersion(b).AtLeast(clusterversion.V25_2.Version()) {
+			panic(pgerror.Newf(pgcode.FeatureNotSupported, "cannot create a vector index until finalizing on 25.2"))
+		} else if b.EvalCtx().SessionData().SafeUpdates {
 			panic(pgerror.DangerousStatementf("CREATE VECTOR INDEX will disable writes to the table while the index is being built"))
 		} else {
 			b.EvalCtx().ClientNoticeSender.BufferClientNotice(b, pgnotice.Newf("CREATE VECTOR INDEX will disable writes to the table while the index is being built"))
@@ -161,7 +164,7 @@ func CreateIndex(b BuildCtx, n *tree.CreateIndex) {
 			"cannot define PARTITION BY on an index if the table has a PARTITION ALL BY definition",
 		))
 	}
-	checkTableSchemaChangePrerequisites(b, relationElements, n)
+	defer checkTableSchemaChangePrerequisites(b, relationElements, n)()
 
 	if !n.Type.SupportsSharding() && n.Sharded != nil {
 		panic(pgerror.Newf(pgcode.InvalidSQLStatementName,
@@ -338,6 +341,10 @@ func processColNodeType(
 		panic(pgerror.New(pgcode.DatatypeMismatch,
 			"operator classes are only allowed for the last column of an inverted or vector index"))
 	}
+	if !n.Type.HasScannablePrefix() && columnNode.Direction != tree.DefaultDirection {
+		panic(pgerror.Newf(pgcode.FeatureNotSupported,
+			"%s does not support the %s option", idxtype.ErrorText(n.Type), columnNode.Direction))
+	}
 	// Disallow descending last column in inverted and vector indexes because they
 	// have no linear ordering.
 	if !n.Type.HasLinearOrdering() && columnNode.Direction == tree.Descending && lastColIdx {
@@ -394,17 +401,13 @@ func processColNodeType(
 			invertedKind = catpb.InvertedIndexColumnKind_TRIGRAM
 			b.IncrementSchemaChangeIndexCounter("trigram_inverted")
 		case types.PGVectorFamily:
-			switch columnNode.OpClass {
-			case "vector_l2_ops", "":
-			// vector_l2_ops is the default operator class. This allows users to omit
-			// the operator class in index definitions.
-			case "vector_l1_ops", "vector_ip_ops", "vector_cosine_ops",
-				"bit_hamming_ops", "bit_jaccard_ops":
-				panic(unimplemented.NewWithIssuef(144016,
-					"operator class %v is not supported", columnNode.OpClass))
-			default:
-				panic(newUndefinedOpclassError(columnNode.OpClass))
+			// Create config for vector index, using the number of dimensions from
+			// the vector column.
+			cfg, err := vecindex.MakeVecConfig(b, b.EvalCtx(), columnType.Type, columnNode.OpClass)
+			if err != nil {
+				panic(err)
 			}
+			indexSpec.secondary.VecConfig = &cfg
 		}
 		relationElts := b.QueryByID(indexSpec.secondary.TableID)
 		scpb.ForEachIndexColumn(relationElts, func(current scpb.Status, target scpb.TargetStatus, e *scpb.IndexColumn) {
@@ -638,10 +641,27 @@ func addColumnsForSecondaryIndex(
 	scpb.ForEachIndexColumn(relationElements, func(
 		current scpb.Status, target scpb.TargetStatus, e *scpb.IndexColumn,
 	) {
-		if e.IndexID != idxSpec.secondary.SourceIndexID || keyColIDs.Contains(e.ColumnID) ||
+		if e.IndexID != idxSpec.secondary.SourceIndexID {
+			return
+		}
+
+		// Vector index prefix columns that overlap with the primary key must match
+		// the primary key direction.
+		if n.Type == idxtype.VECTOR {
+			for i, keyCol := range idxSpec.columns {
+				if keyCol.ColumnID != e.ColumnID {
+					continue
+				}
+				idxSpec.columns[i].Direction = e.Direction
+				break
+			}
+		}
+
+		if keyColIDs.Contains(e.ColumnID) ||
 			e.Kind != scpb.IndexColumn_KEY {
 			return
 		}
+
 		// Check if the column name was duplicated from the STORING clause, in which
 		// case this isn't allowed.
 		// Note: The column IDs for the key suffix columns are derived by finding
@@ -931,22 +951,6 @@ func maybeAddIndexPredicate(b BuildCtx, n *tree.CreateIndex, idxSpec *indexSpec)
 
 // maybeApplyStorageParameters apply any storage parameters into the index spec.
 func maybeApplyStorageParameters(b BuildCtx, storageParams tree.StorageParams, idxSpec *indexSpec) {
-	// Create config for vector index.
-	if idxSpec.secondary != nil && idxSpec.secondary.Type == idxtype.VECTOR {
-		// Get number of dimensions from the vector column in the index (always
-		// the last key column).
-		for i := len(idxSpec.columns) - 1; i >= 0; i-- {
-			if idxSpec.columns[i].Kind != scpb.IndexColumn_KEY {
-				continue
-			}
-			lastKeyCol := idxSpec.columns[i].ColumnID
-			typeElem := mustRetrieveColumnTypeElem(b, idxSpec.secondary.TableID, lastKeyCol)
-			cfg := vecindex.MakeVecConfig(b.EvalCtx(), typeElem.Type)
-			idxSpec.secondary.VecConfig = &cfg
-			break
-		}
-	}
-
 	if len(storageParams) == 0 {
 		return
 	}

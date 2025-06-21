@@ -512,13 +512,6 @@ func TestTenantLogic_create_index(
 	runLogicTest(t, "create_index")
 }
 
-func TestTenantLogic_create_statements(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "create_statements")
-}
-
 func TestTenantLogic_create_table(
 	t *testing.T,
 ) {
@@ -1933,6 +1926,13 @@ func TestTenantLogic_show_create(
 	runLogicTest(t, "show_create")
 }
 
+func TestTenantLogic_show_create_all_routines(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_all_routines")
+}
+
 func TestTenantLogic_show_create_all_schemas(
 	t *testing.T,
 ) {
@@ -1952,6 +1952,13 @@ func TestTenantLogic_show_create_all_tables_builtin(
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "show_create_all_tables_builtin")
+}
+
+func TestTenantLogic_show_create_all_triggers(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "show_create_all_triggers")
 }
 
 func TestTenantLogic_show_create_all_types(
@@ -2360,18 +2367,25 @@ func TestTenantLogic_udf_fk(
 	runLogicTest(t, "udf_fk")
 }
 
-func TestTenantLogic_udf_in_column_defaults(
-	t *testing.T,
-) {
-	defer leaktest.AfterTest(t)()
-	runLogicTest(t, "udf_in_column_defaults")
-}
-
 func TestTenantLogic_udf_in_constraints(
 	t *testing.T,
 ) {
 	defer leaktest.AfterTest(t)()
 	runLogicTest(t, "udf_in_constraints")
+}
+
+func TestTenantLogic_udf_in_index(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_index")
+}
+
+func TestTenantLogic_udf_in_table(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runLogicTest(t, "udf_in_table")
 }
 
 func TestTenantLogic_udf_insert(
@@ -2724,6 +2738,13 @@ func TestTenantLogicCCL_cluster_locks_tenant(
 	runCCLLogicTest(t, "cluster_locks_tenant")
 }
 
+func TestTenantLogicCCL_cluster_locks_tenant_write_buffering(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "cluster_locks_tenant_write_buffering")
+}
+
 func TestTenantLogicCCL_crdb_internal_tenant(
 	t *testing.T,
 ) {
@@ -2946,6 +2967,13 @@ func TestTenantLogicCCL_triggers(
 ) {
 	defer leaktest.AfterTest(t)()
 	runCCLLogicTest(t, "triggers")
+}
+
+func TestTenantLogicCCL_txn_retry(
+	t *testing.T,
+) {
+	defer leaktest.AfterTest(t)()
+	runCCLLogicTest(t, "txn_retry")
 }
 
 func TestTenantLogicCCL_udf_params(

@@ -169,6 +169,8 @@ const (
 
 	// FmtShortenConstants shortens long lists in tuples, VALUES and array
 	// expressions. FmtHideConstants takes precedence over it.
+	//
+	// It also affects printing the tuple type when FmtShowTypes is set.
 	FmtShortenConstants
 
 	// FmtCollapseLists instructs the pretty-printer to shorten lists
@@ -464,6 +466,17 @@ func (ctx *FmtCtx) WithoutConstantRedaction(fn func()) {
 	fn()
 }
 
+// WithAnnotations modifies FmtCtx to use the provided Annotations, calls fn,
+// then restores the original ones.
+func (ctx *FmtCtx) WithAnnotations(ann *Annotations, fn func()) {
+	defer func(oldAnn *Annotations) {
+		ctx.ann = oldAnn
+	}(ctx.ann)
+	ctx.ann = ann
+
+	fn()
+}
+
 // HasFlags returns true iff all of the given flags are set in the formatter
 // context.
 func (ctx *FmtCtx) HasFlags(f FmtFlags) bool {
@@ -599,6 +612,8 @@ func (ctx *FmtCtx) FormatURI(uri Expr) {
 // FormatNode recurses into a node for pretty-printing.
 // Flag-driven special cases can hook into this.
 func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
+	// TODO(yuzefovich): consider adding a panic-catcher here and propagating
+	// the caught panics as return parameters.
 	f := ctx.flags
 	if f.HasFlags(FmtShowTypes) {
 		if te, ok := n.(TypedExpr); ok {
@@ -618,7 +633,32 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 				// further.
 				ctx.Printf("??? %v", te)
 			} else {
-				ctx.WriteString(rt.String())
+				if len(rt.TupleContents()) > numElementsForShortenedList && f.HasFlags(FmtShortenConstants) {
+					// If we have a tuple with more than 3 elements, and we are
+					// requested to shorten the constants, we'll also shorten
+					// the tuple type description in the same fashion (showing
+					// the first two and the last element types).
+					//
+					// Note that for simplicity we'll omit tuple labels that are
+					// printed in types.T.String() when present.
+					contents := rt.TupleContents()
+					var buf bytes.Buffer
+					buf.WriteString("tuple")
+					if len(contents) != 0 && !types.IsWildcardTupleType(rt) {
+						buf.WriteByte('{')
+						for _, element := range contents[:numElementsForShortenedList-1] {
+							buf.WriteString(element.String())
+							buf.WriteString(", ")
+						}
+						buf.WriteString(arityString(len(contents) - numElementsForShortenedList))
+						buf.WriteString(", ")
+						buf.WriteString(contents[len(contents)-1].String())
+						buf.WriteByte('}')
+					}
+					ctx.WriteString(buf.String())
+				} else {
+					ctx.WriteString(rt.String())
+				}
 			}
 			ctx.WriteByte(']')
 			return
@@ -675,7 +715,7 @@ func (ctx *FmtCtx) FormatNode(n NodeFormatter) {
 // number of characters to be printed.
 func (ctx *FmtCtx) formatLimitLength(n NodeFormatter, maxLength int) {
 	temp := NewFmtCtx(ctx.flags)
-	temp.FormatNodeSummary(n)
+	temp.formatNodeSummary(n)
 	s := temp.CloseAndGetString()
 	if len(s) > maxLength {
 		truncated := s[:maxLength] + "..."
@@ -731,7 +771,7 @@ func (ctx *FmtCtx) formatSummaryInsert(node *Insert) {
 	expr := rows.Select
 	if _, ok := expr.(*SelectClause); ok {
 		ctx.WriteByte(' ')
-		ctx.FormatNodeSummary(rows)
+		ctx.formatNodeSummary(rows)
 	} else if node.Columns != nil {
 		ctx.WriteByte('(')
 		ctx.formatLimitLength(&node.Columns, ColumnLimit)
@@ -754,8 +794,8 @@ func (ctx *FmtCtx) formatSummaryUpdate(node *Update) {
 	}
 }
 
-// FormatNodeSummary recurses into a node for pretty-printing a summarized version.
-func (ctx *FmtCtx) FormatNodeSummary(n NodeFormatter) {
+// formatNodeSummary recurses into a node for pretty-printing a summarized version.
+func (ctx *FmtCtx) formatNodeSummary(n NodeFormatter) {
 	switch node := n.(type) {
 	case *Insert:
 		ctx.formatSummaryInsert(node)
@@ -775,7 +815,7 @@ func (ctx *FmtCtx) FormatNodeSummary(n NodeFormatter) {
 func AsStringWithFlags(n NodeFormatter, fl FmtFlags, opts ...FmtCtxOption) string {
 	ctx := NewFmtCtx(fl, opts...)
 	if fl.HasFlags(FmtSummary) {
-		ctx.FormatNodeSummary(n)
+		ctx.formatNodeSummary(n)
 	} else {
 		ctx.FormatNode(n)
 	}

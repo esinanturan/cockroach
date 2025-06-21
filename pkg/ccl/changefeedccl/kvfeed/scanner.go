@@ -18,7 +18,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/kv/kvclient/kvcoord"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
-	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/covering"
@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
 )
 
@@ -56,6 +57,9 @@ type scanRequestScanner struct {
 var _ kvScanner = (*scanRequestScanner)(nil)
 
 func (p *scanRequestScanner) Scan(ctx context.Context, sink kvevent.Writer, cfg scanConfig) error {
+	ctx, sp := tracing.ChildSpan(ctx, "changefeed.kvfeed.scanner.scan")
+	defer sp.Finish()
+
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -173,6 +177,9 @@ func (p *scanRequestScanner) exportSpan(
 	sink kvevent.Writer,
 	knobs TestingKnobs,
 ) error {
+	ctx, sp := tracing.ChildSpan(ctx, "changefeed.kvfeed.scanner.export_span")
+	defer sp.Finish()
+
 	txn := p.db.NewTxn(ctx, "changefeed backfill")
 	if log.V(2) {
 		log.Infof(ctx, `sending ScanRequest %s at %s`, span, ts)
@@ -189,7 +196,7 @@ func (p *scanRequestScanner) exportSpan(
 		r := kvpb.NewScan(remaining.Key, remaining.EndKey).(*kvpb.ScanRequest)
 		r.ScanFormat = kvpb.BATCH_RESPONSE
 		b.Header.TargetBytes = targetBytesPerScan
-		b.Header.ConnectionClass = rpc.RangefeedClass
+		b.Header.ConnectionClass = rpcbase.RangefeedClass
 		b.AdmissionHeader = kvpb.AdmissionHeader{
 			// TODO(irfansharif): Make this configurable if we want system table
 			// scanners or support "high priority" changefeeds to run at higher

@@ -171,7 +171,9 @@ CREATE TABLE system.eventlog (
   "reportingID" INT8       NOT NULL,
   info          STRING,
   "uniqueID"    BYTES      DEFAULT uuid_v4(),
-  CONSTRAINT "primary" PRIMARY KEY (timestamp, "uniqueID")
+  payload       JSONB,
+  CONSTRAINT "primary" PRIMARY KEY (timestamp, "uniqueID"),
+  INDEX event_type_idx ("eventType", timestamp DESC)
 );`
 
 	// rangelog is currently envisioned as a wide table; many different event
@@ -1357,14 +1359,6 @@ const (
 	// in the hash sharded primary key in the sql stats tables, this value needs to
 	// be updated.
 	SQLStatsHashShardBucketCount = 8
-
-	// StmtStatsHashColumnName is the name of the hash column of
-	// system.statement_statistics.
-	StmtStatsHashColumnName = "crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_plan_hash_transaction_fingerprint_id_shard_8"
-
-	// TxnStatsHashColumnName is the name of the hash column of
-	// system.transaction_statistics.
-	TxnStatsHashColumnName = "crdb_internal_aggregated_ts_app_name_fingerprint_id_node_id_shard_8"
 )
 
 // SystemDatabaseName is the name of the system database.
@@ -1376,7 +1370,7 @@ const SystemDatabaseName = catconstants.SystemDatabaseName
 // release version).
 //
 // NB: Don't set this to clusterversion.Latest; use a specific version instead.
-var SystemDatabaseSchemaBootstrapVersion = clusterversion.V25_2_AddUsernameToStmtDiagRequest.Version()
+var SystemDatabaseSchemaBootstrapVersion = clusterversion.V25_3_AddEventLogColumnAndIndex.Version()
 
 // MakeSystemDatabaseDesc constructs a copy of the system database
 // descriptor.
@@ -1743,11 +1737,11 @@ var (
 		),
 		func(tbl *descpb.TableDescriptor) {
 			tbl.SequenceOpts = &descpb.TableDescriptor_SequenceOpts{
-				Increment: 1,
-				MinValue:  1,
-				MaxValue:  math.MaxInt64,
-				Start:     1,
-				CacheSize: 1,
+				Increment:        1,
+				MinValue:         1,
+				MaxValue:         math.MaxInt64,
+				Start:            1,
+				SessionCacheSize: 1,
 			}
 			tbl.NextColumnID = 0
 			tbl.NextFamilyID = 0
@@ -1787,11 +1781,11 @@ var (
 		),
 		func(tbl *descpb.TableDescriptor) {
 			opts := &descpb.TableDescriptor_SequenceOpts{
-				Increment: 1,
-				MinValue:  100,
-				MaxValue:  math.MaxInt32,
-				Start:     100,
-				CacheSize: 1,
+				Increment:        1,
+				MinValue:         100,
+				MaxValue:         math.MaxInt32,
+				Start:            100,
+				SessionCacheSize: 1,
 			}
 			tbl.SequenceOpts = opts
 			tbl.NextColumnID = 0
@@ -1832,11 +1826,11 @@ var (
 		),
 		func(tbl *descpb.TableDescriptor) {
 			tbl.SequenceOpts = &descpb.TableDescriptor_SequenceOpts{
-				Increment: 1,
-				MinValue:  1,
-				MaxValue:  math.MaxInt64,
-				Start:     1,
-				CacheSize: 1,
+				Increment:        1,
+				MinValue:         1,
+				MaxValue:         math.MaxInt64,
+				Start:            1,
+				SessionCacheSize: 1,
 			}
 			tbl.NextColumnID = 0
 			tbl.NextFamilyID = 0
@@ -1958,6 +1952,7 @@ var (
 				{Name: "reportingID", ID: 4, Type: types.Int},
 				{Name: "info", ID: 5, Type: types.String, Nullable: true},
 				{Name: "uniqueID", ID: 6, Type: types.Bytes, DefaultExpr: &uuidV4String},
+				{Name: "payload", ID: 7, Type: types.Jsonb, Nullable: true},
 			},
 			[]descpb.ColumnFamilyDescriptor{
 				{Name: "primary", ID: 0, ColumnNames: []string{"timestamp", "uniqueID"}, ColumnIDs: []descpb.ColumnID{1, 6}},
@@ -1965,6 +1960,7 @@ var (
 				{Name: "fam_3_targetID", ID: 3, ColumnNames: []string{"targetID"}, ColumnIDs: []descpb.ColumnID{3}, DefaultColumnID: 3},
 				{Name: "fam_4_reportingID", ID: 4, ColumnNames: []string{"reportingID"}, ColumnIDs: []descpb.ColumnID{4}, DefaultColumnID: 4},
 				{Name: "fam_5_info", ID: 5, ColumnNames: []string{"info"}, ColumnIDs: []descpb.ColumnID{5}, DefaultColumnID: 5},
+				{Name: "fam_7_payload", ID: 7, ColumnNames: []string{"payload"}, ColumnIDs: []descpb.ColumnID{7}, DefaultColumnID: 7},
 			},
 			descpb.IndexDescriptor{
 				Name:                "primary",
@@ -1973,6 +1969,15 @@ var (
 				KeyColumnNames:      []string{"timestamp", "uniqueID"},
 				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_ASC},
 				KeyColumnIDs:        []descpb.ColumnID{1, 6},
+			}, descpb.IndexDescriptor{
+				Name:                "event_type_idx",
+				ID:                  2,
+				Unique:              false,
+				KeyColumnNames:      []string{"eventType", "timestamp"},
+				KeyColumnDirections: []catenumpb.IndexColumn_Direction{catenumpb.IndexColumn_ASC, catenumpb.IndexColumn_DESC},
+				KeyColumnIDs:        []descpb.ColumnID{2, 1},
+				KeySuffixColumnIDs:  []descpb.ColumnID{6},
+				Version:             descpb.StrictIndexColumnIDGuaranteesVersion,
 			},
 		))
 

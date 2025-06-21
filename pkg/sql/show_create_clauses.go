@@ -616,10 +616,9 @@ func ShowCreateSequence(
 	if opts.Virtual {
 		f.Printf(" VIRTUAL")
 	}
-	if opts.CacheSize > 1 {
-		f.Printf(" CACHE %d", opts.CacheSize)
-	}
-	if opts.CacheSize == 1 && opts.NodeCacheSize > 0 {
+	if opts.SessionCacheSize > 1 {
+		f.Printf(" PER SESSION CACHE %d", opts.SessionCacheSize)
+	} else if opts.NodeCacheSize > 1 {
 		f.Printf(" PER NODE CACHE %d", opts.NodeCacheSize)
 	}
 	return f.CloseAndGetString(), nil
@@ -826,6 +825,12 @@ func showConstraintClause(
 		if e.IsHashShardingConstraint() && !e.IsConstraintUnvalidated() {
 			continue
 		}
+		// Don't include the constraint if it's in the process of being dropped. If
+		// the column is being dropped with the constraint, it might not even have a
+		// valid name.
+		if e.GetConstraintValidity() == descpb.ConstraintValidity_Dropping {
+			continue
+		}
 		f.WriteString(",\n\t")
 		if len(e.GetName()) > 0 {
 			f.WriteString("CONSTRAINT ")
@@ -837,7 +842,7 @@ func showConstraintClause(
 			ctx, desc, e.GetExpr(), evalCtx, semaCtx, sessionData, exprFmtFlags,
 		)
 		if err != nil {
-			return err
+			return errors.Wrapf(err, "failed to format check constraint for table %s", desc.GetName())
 		}
 		f.WriteString(expr)
 		f.WriteString(")")
@@ -846,6 +851,9 @@ func showConstraintClause(
 		}
 	}
 	for _, c := range desc.UniqueConstraintsWithoutIndex() {
+		if c.GetConstraintValidity() == descpb.ConstraintValidity_Dropping {
+			continue
+		}
 		f.WriteString(",\n\t")
 		if len(c.GetName()) > 0 {
 			f.WriteString("CONSTRAINT ")
@@ -865,7 +873,7 @@ func showConstraintClause(
 				ctx, desc, c.GetPredicate(), evalCtx, semaCtx, sessionData, exprFmtFlags,
 			)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "failed to format unique constraint without index for table %s", desc.GetName())
 			}
 			f.WriteString(pred)
 		}

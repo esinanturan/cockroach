@@ -24,6 +24,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -51,6 +52,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlinstance"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecstore"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -173,7 +175,7 @@ func NewDistSQLPlanner(
 	gw gossip.OptionalGossip,
 	stopper *stop.Stopper,
 	isAvailable func(base.SQLInstanceID) bool,
-	connHealthCheckerSystem func(roachpb.NodeID, rpc.ConnectionClass) error, // will only be used by the system tenant
+	connHealthCheckerSystem func(roachpb.NodeID, rpcbase.ConnectionClass) error, // will only be used by the system tenant
 	instanceConnHealthChecker func(base.SQLInstanceID, string) error,
 	sqlInstanceDialer *nodedialer.Dialer,
 	codec keys.SQLCodec,
@@ -1372,7 +1374,7 @@ func MakeSpanPartitionWithRangeCount(
 type distSQLNodeHealth struct {
 	gossip             gossip.OptionalGossip
 	isAvailable        func(base.SQLInstanceID) bool
-	connHealthSystem   func(roachpb.NodeID, rpc.ConnectionClass) error
+	connHealthSystem   func(roachpb.NodeID, rpcbase.ConnectionClass) error
 	connHealthInstance func(base.SQLInstanceID, string) error
 }
 
@@ -1387,7 +1389,7 @@ func (h *distSQLNodeHealth) checkSystem(
 		// artifact of rpcContext's reconnection mechanism at the time of
 		// writing). This is better than having it used in 100% of cases
 		// (until the liveness check below kicks in).
-		if err := h.connHealthSystem(roachpb.NodeID(sqlInstanceID), rpc.DefaultClass); err != nil {
+		if err := h.connHealthSystem(roachpb.NodeID(sqlInstanceID), rpcbase.DefaultClass); err != nil {
 			// This host isn't known to be healthy. Don't use it (use the gateway
 			// instead). Note: this can never happen for our sqlInstanceID (which
 			// always has its address in the nodeMap).
@@ -2466,9 +2468,6 @@ func (dsp *DistSQLPlanner) planTableReaders(
 		}
 
 		tr.Parallelize = info.parallelize
-		if !tr.Parallelize {
-			tr.BatchBytesLimit = dsp.distSQLSrv.TestingKnobs.TableReaderBatchBytesLimit
-		}
 		tr.IgnoreMisplannedRanges = ignoreMisplannedRanges
 		p.TotalEstimatedScannedRows += info.estimatedRowCount
 
@@ -3337,6 +3336,10 @@ func (dsp *DistSQLPlanner) planIndexJoin(
 	// planning is done.
 	p.AddProjection(pkCols, execinfrapb.Ordering{}, planInfo.finalizeLastStageCb)
 
+	if buildutil.CrdbTestBuild && !planInfo.parallelize {
+		return errors.AssertionFailedf("index join should always have parallelize=true")
+	}
+
 	joinReaderSpec := execinfrapb.JoinReaderSpec{
 		Type:              descpb.InnerJoin,
 		LockingStrength:   planInfo.fetch.lockingStrength,
@@ -3344,6 +3347,7 @@ func (dsp *DistSQLPlanner) planIndexJoin(
 		LockingDurability: planInfo.fetch.lockingDurability,
 		MaintainOrdering:  len(planInfo.reqOrdering) > 0,
 		LimitHint:         planInfo.limitHint,
+		Parallelize:       planInfo.parallelize,
 	}
 
 	fetchColIDs := make([]descpb.ColumnID, len(planInfo.fetch.catalogCols))
@@ -3427,6 +3431,9 @@ func (dsp *DistSQLPlanner) planLookupJoin(
 		if planInfo.reqOrdering[i].ColIdx >= numInputCols {
 			// We need to maintain the index ordering on each lookup.
 			maintainLookupOrdering = true
+			if planInfo.parallelize {
+				return errors.AssertionFailedf("parallelization should have been disabled")
+			}
 			break
 		}
 	}
@@ -3443,10 +3450,10 @@ func (dsp *DistSQLPlanner) planLookupJoin(
 		MaintainLookupOrdering:            maintainLookupOrdering,
 		LeftJoinWithPairedJoiner:          planInfo.isSecondJoinInPairedJoiner,
 		OutputGroupContinuationForLeftRow: planInfo.isFirstJoinInPairedJoiner,
-		LookupBatchBytesLimit:             dsp.distSQLSrv.TestingKnobs.JoinReaderBatchBytesLimit,
 		LimitHint:                         planInfo.limitHint,
 		RemoteOnlyLookups:                 planInfo.remoteOnlyLookups,
 		ReverseScans:                      planInfo.reverseScans,
+		Parallelize:                       planInfo.parallelize,
 	}
 
 	fetchColIDs := make([]descpb.ColumnID, len(planInfo.fetch.catalogCols))
@@ -4596,6 +4603,16 @@ func (dsp *DistSQLPlanner) planVectorSearch(
 		return err
 	}
 
+	if err := vecstore.InitGetFullVectorsFetchSpec(
+		&spec.GetFullVectorsFetchSpec,
+		planCtx.EvalContext(),
+		planInfo.table,
+		planInfo.index,
+		planInfo.table.GetPrimaryIndex(),
+	); err != nil {
+		return err
+	}
+
 	// Execute the vector search on the gateway node.
 	corePlacement := []physicalplan.ProcessorCorePlacement{{
 		SQLInstanceID: dsp.gatewaySQLInstanceID,
@@ -4665,6 +4682,16 @@ func (dsp *DistSQLPlanner) planVectorMutationSearch(
 		planInfo.table,
 		planInfo.index,
 		fetchCols,
+	); err != nil {
+		return err
+	}
+
+	if err := vecstore.InitGetFullVectorsFetchSpec(
+		&spec.GetFullVectorsFetchSpec,
+		planCtx.EvalContext(),
+		planInfo.table,
+		planInfo.index,
+		planInfo.table.GetPrimaryIndex(),
 	); err != nil {
 		return err
 	}
