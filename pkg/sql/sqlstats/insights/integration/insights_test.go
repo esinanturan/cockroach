@@ -8,6 +8,7 @@ package integration
 import (
 	"context"
 	gosql "database/sql"
+	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
@@ -195,6 +196,77 @@ func TestInsightsIntegration(t *testing.T) {
 		}
 
 		return nil
+	})
+}
+
+// TestRetainCommentsInInsights tests that when the sql.sqlcommenter.enabled
+// setting is enabled / disabled, querying crdb_internal.cluster_execution_insights and
+// crdb_internal.node_execution_insights will / won't return query tags, respectively.
+func TestRetainCommentsInInsights(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	// Start the server.
+	ctx := context.Background()
+	srv, conn, _ := serverutils.StartServer(t, base.TestServerArgs{})
+	defer srv.Stopper().Stop(ctx)
+	sv := &srv.ApplicationLayer().ClusterSettings().SV
+
+	// Set a low latency threshold to ensure our queries are captured
+	insights.LatencyThreshold.Override(ctx, sv, 10*time.Millisecond)
+
+	const queryWithComments = `SELECT pg_sleep(0.02)/* key='This is a test comment' */`
+
+	type Comment struct {
+		Name  string `json:"name"`
+		Value string `json:"value"`
+	}
+
+	testutils.RunTrueAndFalse(t, "withComments", func(t *testing.T, withComments bool) {
+		appName := fmt.Sprintf("TestRetainCommentsInInsights_%t", withComments)
+		// Set the application name for our test
+		_, err := conn.ExecContext(ctx, "SET SESSION application_name=$1", appName)
+		require.NoError(t, err)
+
+		_, err = conn.ExecContext(ctx, fmt.Sprintf("SET CLUSTER SETTING sql.sqlcommenter.enabled = %t", withComments))
+		require.NoError(t, err)
+
+		_, err = conn.ExecContext(ctx, queryWithComments)
+		require.NoError(t, err)
+
+		// Verify that the comments are present in the cluster_execution_insights table
+		testutils.RunValues(t, "table", []string{"cluster_execution_insights", "node_execution_insights"}, func(t *testing.T, table string) {
+			query := fmt.Sprintf(`
+			SELECT query_tags
+			FROM crdb_internal.%s
+			WHERE query = 'SELECT pg_sleep(_)' AND app_name = $1
+		`, table)
+			testutils.SucceedsSoon(t, func() error {
+				var comments []Comment
+				var commentsRaw []byte
+				row := conn.QueryRowContext(ctx, query, appName)
+
+				if err := row.Scan(&commentsRaw); err != nil {
+					return err
+				}
+
+				if err := json.Unmarshal(commentsRaw, &comments); err != nil {
+					return err
+				}
+				if withComments {
+					if len(comments) != 1 || comments[0].Value != "This is a test comment" || comments[0].Name != "key" {
+						return fmt.Errorf("expected comment to contain `key='This is a test comment'`, but got: %s", comments)
+					}
+
+					return nil
+				} else {
+					if len(comments) == 1 {
+						return fmt.Errorf("expected no comments, but got: %s", comments)
+					}
+					return nil
+				}
+			})
+		})
 	})
 }
 
@@ -415,7 +487,7 @@ func TestTransactionInsightsFailOnCommit(t *testing.T) {
 	}
 
 	ctx := context.Background()
-	conflictingTxns := make([]txnInConflict, 0, 4)
+	var conflictingTxns []txnInConflict
 
 	// Start the server. (One node is sufficient; the outliers system is
 	// currently in-memory only.)
@@ -443,19 +515,34 @@ func TestTransactionInsightsFailOnCommit(t *testing.T) {
 	conn2 := sqlutils.MakeSQLRunner(srv.ApplicationLayer().SQLConn(t))
 
 	connDefault.Exec(t, "SET CLUSTER SETTING sql.contention.event_store.resolution_interval = '100ms'")
+	// Disable write buffering since this test assumes that
+	// kvpb.TransactionRetryWithProtoRefreshError.ConflictingTxn
+	// is populated which is only the case for some retry reasons
+	// (like REASON_INTENT during a refresh) that doesn't happen
+	// with write buffering.
+	//
+	// Write buffering produces a different error than the
+	// non-buffered case because of #146732.
+	//
+	// Despite #146732, however, we should be able to annotate the
+	// error received in this test with conflicting txn
+	// information.
+	//
+	// TODO(#146732, #146734): Allow write buffering in this test
+	// once one of the two bugs are fixed.
+	connDefault.Exec(t, "SET CLUSTER SETTING kv.transaction.write_buffering.enabled = false")
 
 	// Set up myUsers table with 2 users.
-	connDefault.Exec(t, "CREATE TABLE myUsers (name STRING, city STRING)")
-	connDefault.Exec(t, "INSERT INTO myUsers VALUES ('WENDY', 'NYC'), ('NOVI', 'TORONTO')")
+	connDefault.Exec(t, "CREATE TABLE myUsers (k INT PRIMARY KEY, name STRING, city STRING)")
+	connDefault.Exec(t, "INSERT INTO myUsers VALUES (1, 'WENDY', 'NYC'), (2, 'NOVI', 'TORONTO')")
 
 	conn1.Exec(t, "SET SESSION application_name=$1", appName)
 	conn2.Exec(t, "SET SESSION application_name=$1", appName)
 
-	// The first 2 recorded txns are setting the session name.
-	conflictingTxns = conflictingTxns[2:]
-
 	testutils.RunTrueAndFalse(t, "enable recording SERIALIZATION_CONFLICT events", func(t *testing.T, enabled bool) {
 		contention.EnableSerializationConflictEvents.Override(ctx, &srv.ApplicationLayer().ClusterSettings().SV, enabled)
+		// Ignore any recorded txns before the test begins.
+		conflictingTxns = conflictingTxns[:0]
 		// We will simulate a 40001 transaction retry error due to conflicting locks.
 		// Transaction 1 will fail on COMMIT.
 		tx1 := conn1.Begin(t)
@@ -518,6 +605,7 @@ AND query = 'SELECT * FROM myusers WHERE city = _ ; UPDATE myusers SET name = _ 
 		var txRetryErr *kvpb.TransactionRetryWithProtoRefreshError
 		require.Error(t, conflictingTxns[0].err)
 		require.ErrorAs(t, conflictingTxns[0].err, &txRetryErr)
+		require.NotNil(t, txRetryErr.ConflictingTxn)
 		conflictingTxnID := txRetryErr.ConflictingTxn.ID
 
 		if enabled {
@@ -557,8 +645,6 @@ WHERE contention_type = 'SERIALIZATION_CONFLICT'`)
 			require.NoError(t, err)
 			require.False(t, rows.Next())
 		}
-
-		conflictingTxns = make([]txnInConflict, 0, 2)
 	})
 }
 

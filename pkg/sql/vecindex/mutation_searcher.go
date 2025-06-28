@@ -10,9 +10,11 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/kv"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann"
 	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecstore"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecstore/vecstorepb"
 	"github.com/cockroachdb/cockroach/pkg/util/vector"
 )
 
@@ -29,6 +31,7 @@ type MutationSearcher struct {
 	idxCtx       cspann.Context
 	partitionKey tree.Datum
 	encoded      tree.Datum
+	evalCtx      *eval.Context
 }
 
 // Init wraps the given KV transaction in a C-SPANN transaction and initializes
@@ -36,10 +39,19 @@ type MutationSearcher struct {
 //
 // NOTE: The index is expected to come from a call to Manager.Get, and therefore
 // using a vecstore.Store instance.
-func (s *MutationSearcher) Init(idx *cspann.Index, txn *kv.Txn) {
+//
+// tableDesc is expected to be leased such that its lifetime is at least as long
+// as txn.
+func (s *MutationSearcher) Init(
+	evalCtx *eval.Context,
+	idx *cspann.Index,
+	txn *kv.Txn,
+	getFullVectorsFetchSpec *vecstorepb.GetFullVectorsFetchSpec,
+) {
 	s.idx = idx
-	s.txn.Init(idx.Store().(*vecstore.Store), txn)
+	s.txn.Init(evalCtx, idx.Store().(*vecstore.Store), txn, getFullVectorsFetchSpec)
 	s.idxCtx.Init(&s.txn)
+	s.evalCtx = evalCtx
 
 	// If the index is deterministic, then synchronously run the background worker
 	// to process any pending fixups.
@@ -51,6 +63,9 @@ func (s *MutationSearcher) Init(idx *cspann.Index, txn *kv.Txn) {
 // SearchForInsert triggers a search for the partition in which to insert the
 // input vector. The partition's key is returned by PartitionKey() and the
 // input vector's quantized and encoded form is returned by EncodedVector().
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
 func (s *MutationSearcher) SearchForInsert(
 	ctx context.Context, prefix roachpb.Key, vec vector.T,
 ) error {
@@ -79,6 +94,9 @@ func (s *MutationSearcher) SearchForInsert(
 // SearchForDelete triggers a search for the partition which contains the vector
 // to be deleted, identified by its primary key. If the input vector is found,
 // its partition is returned by PartitionKey().
+//
+// NOTE: The caller is assumed to own the memory for all parameters and can
+// reuse the memory after the call returns.
 func (s *MutationSearcher) SearchForDelete(
 	ctx context.Context, prefix roachpb.Key, vec vector.T, key cspann.KeyBytes,
 ) error {

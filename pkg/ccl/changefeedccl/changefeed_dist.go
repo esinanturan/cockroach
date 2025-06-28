@@ -82,6 +82,7 @@ func distChangefeedFlow(
 	description string,
 	localState *cachedState,
 	resultsCh chan<- tree.Datums,
+	onTracingEvent func(ctx context.Context, meta *execinfrapb.TracingAggregatorEvents),
 ) error {
 	opts := changefeedbase.MakeStatementOptions(details.Opts)
 	progress := localState.progress
@@ -135,7 +136,7 @@ func distChangefeedFlow(
 		}
 	}
 	return startDistChangefeed(
-		ctx, execCtx, jobID, schemaTS, details, description, initialHighWater, localState, resultsCh)
+		ctx, execCtx, jobID, schemaTS, details, description, initialHighWater, localState, resultsCh, onTracingEvent)
 }
 
 func fetchTableDescriptors(
@@ -234,6 +235,7 @@ func startDistChangefeed(
 	initialHighWater hlc.Timestamp,
 	localState *cachedState,
 	resultsCh chan<- tree.Datums,
+	onTracingEvent func(ctx context.Context, meta *execinfrapb.TracingAggregatorEvents),
 ) error {
 	execCfg := execCtx.ExecCfg()
 	tableDescs, err := fetchTableDescriptors(ctx, execCfg, AllTargets(details), schemaTS)
@@ -259,16 +261,33 @@ func startDistChangefeed(
 	dsp := execCtx.DistSQLPlanner()
 
 	//lint:ignore SA1019 deprecated usage
-	var checkpoint *jobspb.ChangefeedProgress_Checkpoint
+	var legacyCheckpoint *jobspb.ChangefeedProgress_Checkpoint
 	if progress := localState.progress.GetChangefeed(); progress != nil && progress.Checkpoint != nil {
-		checkpoint = progress.Checkpoint
+		legacyCheckpoint = progress.Checkpoint
 	}
 	var spanLevelCheckpoint *jobspb.TimestampSpansMap
 	if progress := localState.progress.GetChangefeed(); progress != nil && progress.SpanLevelCheckpoint != nil {
 		spanLevelCheckpoint = progress.SpanLevelCheckpoint
 	}
+	if legacyCheckpoint != nil && spanLevelCheckpoint != nil {
+		if legacyCheckpoint.Timestamp.After(spanLevelCheckpoint.MinTimestamp()) {
+			// We should never be writing the legacy checkpoint again once we
+			// start writing the new checkpoint format. If we do, that signals
+			// a missing or incorrect version gate check somewhere.
+			return errors.AssertionFailedf("both legacy and current checkpoint set on " +
+				"changefeed job progress and legacy checkpoint has later timestamp")
+		}
+		// This should be an assertion failure but unfortunately due to a bug
+		// that was included in earlier versions of 25.2 (#148620), we may fail
+		// to clear the legacy checkpoint when we start writing the new one.
+		// We instead discard the legacy checkpoint here and it will eventually be
+		// cleared once the cluster is running a newer patch release with the fix.
+		log.Warningf(ctx, "both legacy and current checkpoint set on changefeed job progress; "+
+			"discarding legacy checkpoint")
+		legacyCheckpoint = nil
+	}
 	p, planCtx, err := makePlan(execCtx, jobID, details, description, initialHighWater,
-		trackedSpans, checkpoint, spanLevelCheckpoint, localState.drainingNodes)(ctx, dsp)
+		trackedSpans, legacyCheckpoint, spanLevelCheckpoint, localState.drainingNodes)(ctx, dsp)
 	if err != nil {
 		return err
 	}
@@ -291,6 +310,9 @@ func startDistChangefeed(
 						localState.drainingNodes = append(localState.drainingNodes, meta.Changefeed.DrainInfo.NodeID)
 					}
 					localState.aggregatorFrontier = append(localState.aggregatorFrontier, meta.Changefeed.Checkpoint...)
+				}
+				if meta.AggregatorEvents != nil && onTracingEvent != nil {
+					onTracingEvent(ctx, meta.AggregatorEvents)
 				}
 				return nil
 			},

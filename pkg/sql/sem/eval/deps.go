@@ -448,6 +448,9 @@ type Planner interface {
 
 	// ClearTableStatsCache removes all entries from the node's table stats cache.
 	ClearTableStatsCache()
+
+	// RetryCounter is the number of times this statement has been retried.
+	RetryCounter() int
 }
 
 // InternalRows is an iterator interface that's exposed by the internal
@@ -524,9 +527,17 @@ type SessionAccessor interface {
 	// CheckPrivilege verifies that the current user has `privilege` on `descriptor`.
 	CheckPrivilege(ctx context.Context, privilegeObject privilege.Object, privilege privilege.Kind) error
 
+	// HasViewAccessToJob checks if the current user has access to a job owned by the specified owner.
+	HasViewAccessToJob(ctx context.Context, owner username.SQLUsername) bool
+
 	// HasViewActivityOrViewActivityRedactedRole returns true iff the current session user has the
 	// VIEWACTIVITY or VIEWACTIVITYREDACTED permission.
 	HasViewActivityOrViewActivityRedactedRole(ctx context.Context) (bool, bool, error)
+
+	// ForEachSessionPendingJob calls the provided function for each pending job
+	// created in the session (hidden behind the generic interface{} to avoid
+	// circular dependencies, but the caller can cast it to jobs.Record).
+	ForEachSessionPendingJob(fn func(record jobspb.PendingJob) error) error
 }
 
 // PreparedStatementState is a limited interface that exposes metadata about
@@ -657,7 +668,7 @@ type ChangefeedState interface {
 	SetHighwater(frontier hlc.Timestamp)
 
 	// SetCheckpoint sets the checkpoint for the changefeed.
-	SetCheckpoint(checkpoint *jobspb.TimestampSpansMap)
+	SetCheckpoint(checkpoint *jobspb.TimestampSpansMap) error
 }
 
 // TenantOperator is capable of interacting with tenant state, allowing SQL

@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/fs"
 	"log"
 	"math/rand"
 	"net"
@@ -32,7 +31,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/DataExMachina-dev/side-eye-go/sideeyeclient"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachprod/grafana"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/cluster"
 	"github.com/cockroachdb/cockroach/pkg/cmd/roachtest/option"
@@ -44,6 +42,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachprod"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/cloud"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/config"
+	"github.com/cockroachdb/cockroach/pkg/roachprod/failureinjection/failures"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/install"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/logger"
 	"github.com/cockroachdb/cockroach/pkg/roachprod/prometheus"
@@ -55,10 +54,6 @@ import (
 	_ "github.com/lib/pq"
 	"golang.org/x/sys/unix"
 )
-
-func init() {
-	_ = roachprod.InitProviders()
-}
 
 //go:embed tsdump-run.sh
 var tsdumpRunSh string
@@ -102,6 +97,8 @@ func validateBinaryFormat(path string, arch vm.CPUArch, checkEA bool) (string, e
 	} else if arch == vm.ArchAMD64 && !strings.Contains(fileFormat, "x86-64") && !strings.Contains(fileFormat, "x86_64") {
 		// Otherwise, we expect a binary that was built for amd64.
 		return "", errors.Newf("%s has incompatible architecture; want: %q, got: %q", abspath, arch, fileFormat)
+	} else if arch == vm.ArchS390x && !strings.Contains(fileFormat, "ibm s/390") {
+		return "", errors.Newf("%s has incompabile architecture; want: %q, got: %q", abspath, arch, fileFormat)
 	}
 	if arch == vm.ArchFIPS && strings.HasSuffix(abspath, "cockroach") {
 		// Check that the binary is patched to use OpenSSL FIPS.
@@ -279,6 +276,8 @@ func initBinariesAndLibraries() {
 		if string(defaultArch) != runtime.GOARCH {
 			fmt.Printf("WARN: local cluster's architecture (%q) differs from default (%q)\n", runtime.GOARCH, defaultArch)
 		}
+	} else if roachtestflags.Cloud == spec.IBM {
+		defaultArch = vm.ArchS390x
 	}
 	fmt.Printf("Locating and verifying binaries for os=%q, arch=%q\n", defaultOSName, defaultArch)
 
@@ -357,7 +356,7 @@ func initBinariesAndLibraries() {
 
 	// In v20.2 or higher, optionally expect certain library files to exist.
 	// Since they may not be found in older versions, do not hard error if they are not found.
-	for _, arch := range []vm.CPUArch{vm.ArchAMD64, vm.ArchARM64, vm.ArchFIPS} {
+	for _, arch := range []vm.CPUArch{vm.ArchAMD64, vm.ArchARM64, vm.ArchFIPS, vm.ArchS390x} {
 		if roachtestflags.ARM64Probability == 0 && defaultArch != vm.ArchARM64 && arch == vm.ArchARM64 {
 			// arm64 isn't used, skip finding libs for it.
 			continue
@@ -542,7 +541,7 @@ func makeClusterName(name string) string {
 	return vm.DNSSafeName(name)
 }
 
-// MachineTypeToCPUs returns a CPU count for GCE, AWS, and Azure machine types.
+// MachineTypeToCPUs returns a CPU count for GCE, AWS, Azure and IBM machine types.
 // -1 is returned for unknown machine types.
 func MachineTypeToCPUs(s string) int {
 	{
@@ -561,6 +560,23 @@ func MachineTypeToCPUs(s string) int {
 			return v
 		}
 		if _, err := fmt.Sscanf(s, "n2-highmem-%d", &v); err == nil {
+			return v
+		}
+	}
+
+	{
+		// IBM machine types.
+		var v int
+		// bz2 is the balanced IBM Z machine type family.
+		if _, err := fmt.Sscanf(s, "bz2-%dx", &v); err == nil {
+			return v
+		}
+		// bz2 is the compute optimized IBM Z machine type family.
+		if _, err := fmt.Sscanf(s, "cz2-%dx", &v); err == nil {
+			return v
+		}
+		// bz2 is the memory optimized IBM Z machine type family.
+		if _, err := fmt.Sscanf(s, "mx2-%dx", &v); err == nil {
 			return v
 		}
 	}
@@ -681,23 +697,10 @@ type clusterImpl struct {
 	grafanaTags               []string
 	disableGrafanaAnnotations atomic.Bool
 
-	// sideEyeClient, if set, is the client used to communicate with the Side-Eye
-	// debugging service.
-	sideEyeClient *sideeyeclient.SideEyeClient
-
 	// preStartHooks contains registered preStartHook(s).
 	preStartHooks []install.PreStartHook
 	// preStartVirtualClusterHooks contains registered preStartVirtualClusterHook(s).
 	preStartVirtualClusterHooks []install.PreStartHook
-
-	// State that can be accessed concurrently (in particular, read from the UI
-	// HTML generator).
-	mu struct {
-		syncutil.Mutex
-		// sideEyeEnvName is the name of the environment used by the Side-Eye agents
-		// running on this cluster. Empty if the Side-Eye integration is not active.
-		sideEyeEnvName string
-	}
 }
 
 // Name returns the cluster name, i.e. something like `teamcity-....`
@@ -723,20 +726,6 @@ func (c *clusterImpl) workerStatus(args ...interface{}) {
 	if impl, ok := c.t.(*testImpl); ok {
 		impl.WorkerStatus(args...)
 	}
-}
-
-// sideEyeEnvName is the name of the environment used by the Side-Eye agents
-// running on this cluster. Empty if the Side-Eye integration is not active.
-func (c *clusterImpl) sideEyeEnvName() string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.mu.sideEyeEnvName
-}
-
-func (c *clusterImpl) setSideEyeEnvName(newEnv string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.mu.sideEyeEnvName = newEnv
 }
 
 func (c *clusterImpl) String() string {
@@ -792,14 +781,6 @@ type clusterConfig struct {
 	arch vm.CPUArch
 	// Specifies the OS which may require a custom AMI and cockroach binary.
 	os string
-	// sideEyeToken, if not empty, is the token used to authenticate with the
-	// Side-Eye. If set, each node in the cluster will run the Side-Eye agent.
-	// These agents are configured to allow monitoring of cockroach processes.
-	// app.side-eye.io will list all currently-running clusters. The test runner's
-	// Side-Eye client can be used to programmatically take snapshots of this
-	// cluster using the cluster's name; snapshots are taken when the test times
-	// out.
-	sideEyeToken string
 }
 
 // clusterFactory is a creator of clusters.
@@ -816,18 +797,10 @@ type clusterFactory struct {
 	// sem is a semaphore throttling the creation of clusters (because AWS has
 	// ridiculous API calls limits).
 	sem chan struct{}
-	// sideEyeClient, if set, is the client used to communicate with the Side-Eye
-	// debugging service.
-	sideEyeClient *sideeyeclient.SideEyeClient
 }
 
 func newClusterFactory(
-	user string,
-	clustersID string,
-	artifactsDir string,
-	r *clusterRegistry,
-	concurrentCreations int,
-	sideEyeClient *sideeyeclient.SideEyeClient,
+	user string, clustersID string, artifactsDir string, r *clusterRegistry, concurrentCreations int,
 ) *clusterFactory {
 	secs := timeutil.Now().Unix()
 	var prefix string
@@ -837,11 +810,10 @@ func newClusterFactory(
 		prefix = fmt.Sprintf("%s-%d-", user, secs)
 	}
 	return &clusterFactory{
-		sem:           make(chan struct{}, concurrentCreations),
-		namePrefix:    prefix,
-		artifactsDir:  artifactsDir,
-		r:             r,
-		sideEyeClient: sideEyeClient,
+		sem:          make(chan struct{}, concurrentCreations),
+		namePrefix:   prefix,
+		artifactsDir: artifactsDir,
+		r:            r,
 	}
 }
 
@@ -1015,8 +987,7 @@ func (f *clusterFactory) newCluster(
 			destroyState: destroyState{
 				owned: true,
 			},
-			sideEyeClient: f.sideEyeClient,
-			l:             l,
+			l: l,
 		}
 		c.status("creating cluster")
 
@@ -1033,13 +1004,6 @@ func (f *clusterFactory) newCluster(
 		}
 		err = create(ctx, l, cfg.username, opts...)
 		if err == nil {
-			// Start the Side-Eye agents on all the nodes if we are configured to do so. Side-Eye
-			// doesn't currently support ARM64, so skip those clusters.
-			if cfg.sideEyeToken != "" && !cfg.localCluster && c.arch != vm.ArchARM64 {
-				if err := c.StartSideEyeAgents(ctx, l, cfg.sideEyeToken); err != nil {
-					l.Errorf("failed to start Side-Eye agents. Continuing without them.\nError: %s", err)
-				}
-			}
 			if err := f.r.registerCluster(c); err != nil {
 				return nil, nil, err
 			}
@@ -1144,6 +1108,12 @@ func (c *clusterImpl) Save(ctx context.Context, msg string, l *logger.Logger) {
 	c.destroyState.mu.saved = true
 	c.destroyState.mu.savedMsg = msg
 	c.destroyState.mu.Unlock()
+}
+
+func (c *clusterImpl) saved() bool {
+	c.destroyState.mu.Lock()
+	defer c.destroyState.mu.Unlock()
+	return c.destroyState.mu.saved
 }
 
 var errClusterNotFound = errors.New("cluster not found")
@@ -1889,6 +1859,12 @@ func (c *clusterImpl) doDestroy(ctx context.Context, l *logger.Logger) <-chan st
 	return ch
 }
 
+func (c *clusterImpl) Reset(
+	ctx context.Context, l *logger.Logger, nodes option.NodeListOption,
+) error {
+	return roachprod.Reset(l, c.MakeNodes(nodes))
+}
+
 func (c *clusterImpl) addLabels(labels map[string]string) error {
 	// N.B. we must sanitize the values; e.g., some test names can exceed the maximum length (63 chars in GCE).
 	// N.B. we don't sanitize the keys; unlike values, they are typically _not_ (dynamically) generated.
@@ -2165,6 +2141,9 @@ func (c *clusterImpl) StartE(
 	defer c.clearStatusForClusterOpt(startOpts.RoachtestOpts.Worker)
 
 	startOpts.RoachprodOpts.EncryptedStores = c.encAtRest
+	if c.t.Spec().(*registry.TestSpec).Benchmark {
+		startOpts.RoachprodOpts.ScheduleBackups = false
+	}
 
 	// Needed for backward-compat on crdb_internal.ranges{_no_leases}.
 	// Remove in v23.2.
@@ -2203,6 +2182,7 @@ func (c *clusterImpl) StartE(
 	// Do not refetch certs if that step already happened once (i.e., we
 	// are restarting a node).
 	if settings.Secure && c.localCertsDir == "" {
+		// Get the certs from the first node.
 		if err := c.RefetchCertsFromNode(ctx, 1); err != nil {
 			return err
 		}
@@ -2241,7 +2221,10 @@ func (c *clusterImpl) StartE(
 			return errors.Wrap(err, "failed to wait for replication after starting cockroach")
 		}
 	}
-
+	// If starting the cluster was successful, mark the nodes as healthy. N.B. we must wait
+	// until cluster startup succeeds as we may have tests that purposely inject failures into
+	// cluster startup.
+	c.t.Monitor().ExpectProcessAlive(nodes)
 	return nil
 }
 
@@ -2279,9 +2262,19 @@ func (c *clusterImpl) StartServiceForVirtualClusterE(
 	}
 
 	if settings.Secure {
+		// Get the certs from the first node.
 		if err := c.RefetchCertsFromNode(ctx, 1); err != nil {
 			return err
 		}
+	}
+
+	// If we are starting a separate process virtual cluster, we need to
+	// mark each SQL instance as healthy.
+	if len(startOpts.SeparateProcessNodes) > 0 {
+		nodes := startOpts.SeparateProcessNodes
+		virtualClusterName := startOpts.RoachprodOpts.VirtualClusterName
+		sqlInstance := startOpts.RoachprodOpts.SQLInstance
+		c.t.Monitor().ExpectProcessAlive(nodes, option.VirtualClusterName(virtualClusterName), option.SQLInstance(sqlInstance))
 	}
 	return nil
 }
@@ -2309,6 +2302,9 @@ func (c *clusterImpl) StopServiceForVirtualClusterE(
 	nodes := c.All()
 	if len(stopOpts.SeparateProcessNodes) > 0 {
 		nodes = stopOpts.SeparateProcessNodes
+		virtualClusterName := stopOpts.RoachprodOpts.VirtualClusterName
+		sqlInstance := stopOpts.RoachprodOpts.SQLInstance
+		c.t.Monitor().ExpectProcessDead(nodes, option.VirtualClusterName(virtualClusterName), option.SQLInstance(sqlInstance))
 	}
 
 	return roachprod.StopServiceForVirtualCluster(
@@ -2336,20 +2332,7 @@ func (c *clusterImpl) RefetchCertsFromNode(ctx context.Context, node int) error 
 	// certs. Bypass that distinction (which should be fixed independently, but
 	// that might cause fallout) by using a non-existing dir here.
 	c.localCertsDir = filepath.Join(c.localCertsDir, install.CockroachNodeCertsDir)
-	// Get the certs from the first node.
-	if err := c.Get(ctx, c.l, fmt.Sprintf("./%s", install.CockroachNodeCertsDir), c.localCertsDir, c.Node(node)); err != nil {
-		return errors.Wrap(err, "cluster.StartE")
-	}
-	// Need to prevent world readable files or lib/pq will complain.
-	return filepath.WalkDir(c.localCertsDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return errors.Wrap(err, "walking localCertsDir failed")
-		}
-		if d.IsDir() {
-			return nil
-		}
-		return os.Chmod(path, 0600)
-	})
+	return roachprod.FetchCertsDir(ctx, c.l, c.MakeNodes(c.Node(node)), fmt.Sprintf("./%s", install.CockroachNodeCertsDir), c.localCertsDir)
 }
 
 func (c *clusterImpl) SetDefaultVirtualCluster(name string) {
@@ -2428,6 +2411,7 @@ func (c *clusterImpl) StopE(
 		stopOpts.RoachprodOpts.Wait = true
 		stopOpts.RoachprodOpts.GracePeriod = 10
 	}
+	c.t.Monitor().ExpectProcessDead(selectedNodesOrDefault(nodes, c.All()))
 	return errors.Wrap(roachprod.Stop(ctx, l, c.MakeNodes(nodes...), stopOpts.RoachprodOpts), "cluster.StopE")
 }
 
@@ -2455,6 +2439,7 @@ func (c *clusterImpl) SignalE(
 	if c.spec.NodeCount == 0 {
 		return nil // unit tests
 	}
+	c.t.Monitor().ExpectProcessDead(selectedNodesOrDefault(nodes, c.All()))
 	return errors.Wrap(roachprod.Signal(ctx, l, c.MakeNodes(nodes...), sig), "cluster.Signal")
 }
 
@@ -2486,6 +2471,7 @@ func (c *clusterImpl) WipeE(
 	}
 	c.setStatusForClusterOpt("wiping", false, nodes...)
 	defer c.clearStatusForClusterOpt(false)
+	c.t.Monitor().ExpectProcessDead(selectedNodesOrDefault(nodes, c.All()))
 	return roachprod.Wipe(ctx, l, c.MakeNodes(nodes...), c.IsSecure())
 }
 
@@ -2667,6 +2653,15 @@ func (c *clusterImpl) Install(
 		return errors.New("Error running cluster.Install: no software passed")
 	}
 	return errors.Wrap(roachprod.Install(ctx, l, c.MakeNodes(nodes), software), "cluster.Install")
+}
+
+// PopulatesEtcHosts populates the cluster's /etc/hosts file with the private IP
+// addresses of the nodes in the cluster.
+func (c *clusterImpl) PopulateEtcHosts(ctx context.Context, l *logger.Logger) error {
+	if ctx.Err() != nil {
+		return errors.Wrap(ctx.Err(), "cluster.Install")
+	}
+	return errors.Wrap(roachprod.PopulateEtcHosts(ctx, l, c.name), "cluster.PopulatesEtcHosts")
 }
 
 // pgURLErr returns the Postgres endpoint for the specified nodes. It accepts a
@@ -3032,14 +3027,16 @@ func (c *clusterImpl) Extend(ctx context.Context, d time.Duration, l *logger.Log
 	return nil
 }
 
-// NewMonitor creates a monitor that can watch for unexpected crdb node deaths on m.Wait()
+// NewDeprecatedMonitor creates a monitor that can watch for unexpected crdb node deaths on m.Wait()
 // and provide roachtest safe goroutines.
 //
 // As a general rule, if the user has a workload node, do not monitor it. A
 // monitor's semantics around handling expected node deaths breaks down if it's
 // monitoring a workload node.
-func (c *clusterImpl) NewMonitor(ctx context.Context, opts ...option.Option) cluster.Monitor {
-	return newMonitor(ctx, c.t, c, opts...)
+func (c *clusterImpl) NewDeprecatedMonitor(
+	ctx context.Context, opts ...option.Option,
+) cluster.Monitor {
+	return newMonitor(ctx, c.t, c, false /* expectExactProcessDeath */, opts...)
 }
 
 func (c *clusterImpl) StartGrafana(
@@ -3162,80 +3159,18 @@ func (c *clusterImpl) MaybeExtendCluster(
 	return nil
 }
 
-// StartSideEyeAgents starts the Side-Eye agent on all the nodes in the cluster.
-// These agents are configured to allow monitoring of cockroach processes.
-// app.side-eye.io will list all currently-running clusters. The test runner's
-// Side-Eye client can be used to programmatically take snapshots of this
-// cluster using the cluster's name; snapshots are taken when the test times
-// out.
-func (c *clusterImpl) StartSideEyeAgents(
-	ctx context.Context, l *logger.Logger, apiToken string,
-) error {
-	envName := c.Name()
-	err := roachprod.StartSideEyeAgents(ctx, l, c.Name(), envName, apiToken)
-	if err != nil {
-		return err
-	}
-	c.setSideEyeEnvName(envName)
-	return nil
-}
-
-// UpdateSideEyeEnvironmentName updates the environment name used by the
-// Side-Eye agents running on this cluster.
-func (c *clusterImpl) UpdateSideEyeEnvironmentName(
-	ctx context.Context, l *logger.Logger, newEnvName string,
-) error {
-	err := roachprod.UpdateSideEyeEnvironmentName(ctx, l, c.Name(), newEnvName)
-	if err != nil {
-		return err
-	}
-	c.setSideEyeEnvName(newEnvName)
-	return nil
-}
-
-// CaptureSideEyeSnapshot asks the Side-Eye service to take a snapshot of the
-// cockroach processes running on this cluster. All errors are logged and
-// swallowed.
-//
-// Returns the URL of the captured snapshot, or "" if not successful.
-func (c *clusterImpl) CaptureSideEyeSnapshot(ctx context.Context) string {
-	l := c.t.L()
-	l.PrintfCtx(ctx, "capturing snapshot of the cluster with Side-Eye...")
-
-	if c.arch == vm.ArchARM64 {
-		l.Printf("Side-Eye does not support ARM64 machines; skipping snapshot")
-		return ""
-	}
-
-	if c.sideEyeClient == nil {
-		l.Printf("WARNING: Side-Eye client is not configured")
-		return ""
-	}
-
-	envName := c.sideEyeEnvName()
-	if envName == "" {
-		l.PrintfCtx(ctx, "cluster does not have Side-Eye agents set up; skipping snapshot")
-		return ""
-	}
-
-	snapURL, ok := roachprod.CaptureSideEyeSnapshot(ctx, l, envName, c.sideEyeClient)
-	if !ok {
-		return ""
-	}
-	l.PrintfCtx(ctx, "captured Side-Eye snapshot: %s", snapURL)
-	annotation := fmt.Sprintf("Captured Side-Eye snapshot: %s", snapURL)
-	if err := c.AddGrafanaAnnotation(ctx, l, grafana.AddAnnotationRequest{Text: annotation}); err != nil {
-		l.PrintfCtx(ctx, "error adding Grafana annotation for snapshot: %s", err)
-	}
-	return snapURL
-}
-
 // archForTest determines the CPU architecture to use for a test. If the test
 // doesn't specify it, one is chosen randomly depending on flags.
 func archForTest(ctx context.Context, l *logger.Logger, testSpec registry.TestSpec) vm.CPUArch {
 	if testSpec.Cluster.Arch != "" {
 		l.PrintfCtx(ctx, "Using specified arch=%q, %s", testSpec.Cluster.Arch, testSpec.Name)
 		return testSpec.Cluster.Arch
+	}
+
+	if roachtestflags.Cloud == spec.IBM {
+		// N.B. IBM only supports S390x on the "s390x" architecture.
+		l.PrintfCtx(ctx, "IBM Cloud: forcing arch=%q (only supported), %s", vm.ArchS390x, testSpec.Name)
+		return vm.ArchS390x
 	}
 
 	// CPU architecture is unspecified, choose one according to the
@@ -3396,4 +3331,21 @@ func (c *clusterImpl) RegisterClusterHook(
 	default:
 		panic(fmt.Sprintf("unknown test hook type %v", hookType))
 	}
+}
+
+// GetFailer returns a *failures.Failer for the given failure mode name. Used
+// for conducting failure injection on a cluster.
+func (c *clusterImpl) GetFailer(
+	l *logger.Logger,
+	nodes option.NodeListOption,
+	failureModeName string,
+	opts ...failures.ClusterOptionFunc,
+) (*failures.Failer, error) {
+	fr := failures.GetFailureRegistry()
+	clusterOpts := append(opts, failures.Secure(c.IsSecure()))
+	failer, err := fr.GetFailer(c.MakeNodes(nodes), failureModeName, l, clusterOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return failer, err
 }

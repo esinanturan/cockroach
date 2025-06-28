@@ -703,7 +703,6 @@ func TestLint(t *testing.T) {
 					":!acceptance/test_acceptance.go",           // For COCKROACH_RUN_ACCEPTANCE
 					":!compose/compare/compare/compare_test.go", // For COCKROACH_RUN_COMPOSE_COMPARE
 					":!compose/compose_test.go",                 // For COCKROACH_RUN_COMPOSE
-					":!testutils/sideeye/sideeye.go",            // For SIDE_EYE_API_TOKEN
 				},
 			},
 		} {
@@ -2855,7 +2854,8 @@ func TestLint(t *testing.T) {
 		}
 	})
 
-	// Test forbidden roachtest imports.
+	// Test forbidden roachtest imports. The mixedversion and task packages are
+	// allowed because they are part of the roachtest framework.
 	t.Run("TestRoachtestForbiddenImports", func(t *testing.T) {
 		t.Parallel()
 
@@ -2891,7 +2891,8 @@ func TestLint(t *testing.T) {
 			filter,
 			stream.Sort(),
 			stream.Uniq(),
-			stream.Grep(`cockroach/pkg/cmd/roachtest/(tests|operations): `),
+			stream.Grep(`cockroach/pkg/cmd/roachtest/.*: `),
+			stream.GrepNot(`cockroach/pkg/cmd/roachtest/roachtestutil/(mixedversion|task): `),
 		), func(s string) {
 			pkgStr := strings.Split(s, ": ")
 			_, importedPkg := pkgStr[0], pkgStr[1]

@@ -25,6 +25,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
+	"github.com/cockroachdb/cockroach/pkg/sql/spanutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlerrors"
 	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
@@ -221,7 +222,7 @@ func (s rowLevelTTLExecutor) GetCreateScheduleStatement(
 
 func makeTTLJobDescription(
 	tableDesc catalog.TableDescriptor, tn tree.ObjectName, sv *settings.Values,
-) string {
+) (string, error) {
 	relationName := tn.FQString()
 	pkIndex := tableDesc.GetPrimaryIndex().IndexDesc()
 	pkColNames := make([]string, 0, len(pkIndex.KeyColumnNames))
@@ -232,14 +233,19 @@ func makeTTLJobDescription(
 		buf.Reset()
 	}
 	pkColDirs := pkIndex.KeyColumnDirections
+	pkColTypes, err := spanutils.GetPKColumnTypes(tableDesc, pkIndex)
+	if err != nil {
+		return "", err
+	}
 	rowLevelTTL := tableDesc.GetRowLevelTTL()
 	ttlExpirationExpr := rowLevelTTL.GetTTLExpr()
 	numPkCols := len(pkColNames)
 	selectBatchSize := ttlbase.GetSelectBatchSize(sv, rowLevelTTL)
-	selectQuery := ttlbase.BuildSelectQuery(
+	selectQuery, err := ttlbase.BuildSelectQuery(
 		relationName,
 		pkColNames,
 		pkColDirs,
+		pkColTypes,
 		ttlbase.DefaultAOSTDuration,
 		ttlExpirationExpr,
 		numPkCols,
@@ -247,6 +253,9 @@ func makeTTLJobDescription(
 		selectBatchSize,
 		true, /*startIncl*/
 	)
+	if err != nil {
+		return "", err
+	}
 	deleteQuery := ttlbase.BuildDeleteQuery(
 		relationName,
 		pkColNames,
@@ -257,7 +266,7 @@ func makeTTLJobDescription(
 -- for each span, iterate to find rows:
 %s
 -- then delete with:
-%s`, relationName, selectQuery, deleteQuery)
+%s`, relationName, selectQuery, deleteQuery), nil
 }
 
 func createRowLevelTTLJob(
@@ -278,8 +287,12 @@ func createRowLevelTTLJob(
 	if err != nil {
 		return 0, err
 	}
+	description, err := makeTTLJobDescription(tableDesc, tn, sv)
+	if err != nil {
+		return 0, err
+	}
 	record := jobs.Record{
-		Description: makeTTLJobDescription(tableDesc, tn, sv),
+		Description: description,
 		Username:    username.NodeUserName(),
 		Details: jobspb.RowLevelTTLDetails{
 			TableID:      tableID,

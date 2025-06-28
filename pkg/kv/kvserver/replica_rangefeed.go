@@ -90,7 +90,7 @@ var RangefeedUseBufferedSender = settings.RegisterBoolSetting(
 	"kv.rangefeed.buffered_sender.enabled",
 	"use buffered sender for all range feeds instead of buffering events "+
 		"separately per client per range",
-	metamorphic.ConstantWithTestBool("kv.rangefeed.buffered_sender.enabled", false),
+	metamorphic.ConstantWithTestBool("kv.rangefeed.buffered_sender.enabled", true),
 )
 
 func init() {
@@ -348,7 +348,18 @@ func (r *Replica) RangeFeed(
 func (r *Replica) getRangefeedProcessorAndFilter() (rangefeed.Processor, *rangefeed.Filter) {
 	r.rangefeedMu.RLock()
 	defer r.rangefeedMu.RUnlock()
-	return r.rangefeedMu.proc, r.rangefeedMu.opFilter
+	p := r.rangefeedMu.proc
+	if p != nil && p.Stopping() {
+		// This is here only to try to preserve existing behaviour when fixing
+		// #144828. Nearly all call paths that stop the processor immediately remove
+		// the processor from the replica. The only call path where this isn't true
+		// is when the processor stops itself after find all of its registrations
+		// have been removed. Thus, we check stopping here to avoid doing work on
+		// this stop-but-not-yet-removed processor.
+		return nil, r.rangefeedMu.opFilter
+	} else {
+		return p, r.rangefeedMu.opFilter
+	}
 }
 
 func (r *Replica) getRangefeedProcessor() rangefeed.Processor {
@@ -485,21 +496,20 @@ func (r *Replica) registerWithRangefeedRaftMuLocked(
 	desc := r.Desc()
 	tp := rangefeedTxnPusher{ir: r.store.intentResolver, r: r, span: desc.RSpan()}
 	cfg := rangefeed.Config{
-		AmbientContext:        r.AmbientContext,
-		Clock:                 r.Clock(),
-		Stopper:               r.store.stopper,
-		Settings:              r.store.ClusterSettings(),
-		RangeID:               r.RangeID,
-		Span:                  desc.RSpan(),
-		TxnPusher:             &tp,
-		PushTxnsAge:           r.store.TestingKnobs().RangeFeedPushTxnsAge,
-		EventChanCap:          defaultEventChanCap,
-		EventChanTimeout:      defaultEventChanTimeout,
-		Metrics:               r.store.metrics.RangeFeedMetrics,
-		MemBudget:             feedBudget,
-		Scheduler:             r.store.getRangefeedScheduler(),
-		Priority:              isSystemSpan, // only takes effect when Scheduler != nil
-		UnregisterFromReplica: r.unsetRangefeedProcessor,
+		AmbientContext:   r.AmbientContext,
+		Clock:            r.Clock(),
+		Stopper:          r.store.stopper,
+		Settings:         r.store.ClusterSettings(),
+		RangeID:          r.RangeID,
+		Span:             desc.RSpan(),
+		TxnPusher:        &tp,
+		PushTxnsAge:      r.store.TestingKnobs().RangeFeedPushTxnsAge,
+		EventChanCap:     defaultEventChanCap,
+		EventChanTimeout: defaultEventChanTimeout,
+		Metrics:          r.store.metrics.RangeFeedMetrics,
+		MemBudget:        feedBudget,
+		Scheduler:        r.store.getRangefeedScheduler(),
+		Priority:         isSystemSpan, // only takes effect when Scheduler != nil
 	}
 	p = rangefeed.NewProcessor(cfg)
 
@@ -856,11 +866,13 @@ func (r *Replica) handleClosedTimestampUpdateRaftMuLocked(
 	// update to the leaseholder so that it will eventually begin to progress
 	// again. Or, if the closed timestamp has been lagging by more than the
 	// cancel threshold for a while, cancel the rangefeed.
-	if signal := r.raftMu.rangefeedCTLagObserver.observeClosedTimestampUpdate(ctx,
+	signal := r.raftMu.rangefeedCTLagObserver.observeClosedTimestampUpdate(ctx,
 		closedTS.GoTime(),
 		r.Clock().PhysicalTime(),
 		&r.store.cfg.Settings.SV,
-	); signal.exceedsNudgeLagThreshold {
+	)
+	exceedsSlowLagThresh = signal.exceedsNudgeLagThreshold
+	if exceedsSlowLagThresh {
 		m := r.store.metrics.RangeFeedMetrics
 		expensiveLog := m.RangeFeedSlowClosedTimestampLogN.ShouldLog()
 		if expensiveLog {

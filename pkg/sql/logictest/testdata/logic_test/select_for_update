@@ -1,4 +1,4 @@
-# LogicTest: !weak-iso-level-configs
+# LogicTest: !weak-iso-level-configs !metamorphic-batch-sizes
 # This test assumes that SERIALIZABLE isolation is being used. See
 # select_for_update_read_committed for READ COMMITTED testing.
 
@@ -667,6 +667,10 @@ user testuser
 
 statement ok
 SET enable_durable_locking_for_serializable = true;
+
+# Turn off buffered writes since we want to ensure a durable lock is actually acquired.
+statement ok
+SET kv_transaction_buffered_writes_enabled=false;
 
 query I
 BEGIN;

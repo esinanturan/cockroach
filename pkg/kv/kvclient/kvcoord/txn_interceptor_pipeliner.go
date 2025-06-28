@@ -10,7 +10,6 @@ import (
 	"math"
 	"sort"
 
-	gbtree "github.com/RaduBerinde/btree" // TODO(#144504): switch to the newer btree
 	"github.com/cockroachdb/cockroach/pkg/kv/kvpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
@@ -19,9 +18,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgcode"
 	"github.com/cockroachdb/cockroach/pkg/sql/pgwire/pgerror"
 	"github.com/cockroachdb/cockroach/pkg/storage/enginepb"
+	"github.com/cockroachdb/cockroach/pkg/util/interval"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/redact"
+	gbtree "github.com/google/btree"
 )
 
 // The degree of the inFlightWrites btree.
@@ -848,12 +849,8 @@ func (tp *txnPipeliner) updateLockTrackingInner(
 			// for the requests that were not evaluated (see fillSkippedResponses).
 			// For these requests, we neither proved nor disproved the existence of
 			// their intent, so we ignore the response.
-			//
-			// TODO(nvanbenschoten): we only need to check FoundIntent, but this field
-			// was not set before v23.2, so for now, we check both fields. Remove this
-			// in the future.
 			qiResp := resp.(*kvpb.QueryIntentResponse)
-			if qiResp.FoundIntent || qiResp.FoundUnpushedIntent {
+			if qiResp.FoundIntent {
 				tp.ifWrites.remove(qiReq.Key, qiReq.Txn.Sequence, qiReq.Strength)
 				// Move to lock footprint.
 				tp.lockFootprint.insert(roachpb.Span{Key: qiReq.Key})
@@ -951,8 +948,26 @@ func (tp *txnPipeliner) setWrapped(wrapped lockedSender) {
 }
 
 // populateLeafInputState is part of the txnInterceptor interface.
-func (tp *txnPipeliner) populateLeafInputState(tis *roachpb.LeafTxnInputState) {
-	tis.InFlightWrites = tp.ifWrites.asSlice()
+func (tp *txnPipeliner) populateLeafInputState(
+	tis *roachpb.LeafTxnInputState, readsTree interval.Tree,
+) {
+	if tp.ifWrites.len() == 0 {
+		return
+	}
+	if readsTree == nil {
+		tis.InFlightWrites = tp.ifWrites.asSlice()
+		return
+	}
+	var sp roachpb.Span
+	tp.ifWrites.ascend(func(w *inFlightWrite) {
+		sp.Key = w.Key
+		sp.EndKey = w.Key.Next()
+		if overlaps := readsTree.DoMatching(
+			func(interval.Interface) (done bool) { return true }, sp.AsRange(),
+		); overlaps {
+			tis.InFlightWrites = append(tis.InFlightWrites, w.SequencedWrite)
+		}
+	})
 }
 
 // initializeLeaf is part of the txnInterceptor interface.
@@ -987,6 +1002,9 @@ func (tp *txnPipeliner) epochBumpedLocked() {
 
 // createSavepointLocked is part of the txnInterceptor interface.
 func (tp *txnPipeliner) createSavepointLocked(context.Context, *savepoint) {}
+
+// releaseSavepointLocked is part of the txnInterceptor interface.
+func (tp *txnPipeliner) releaseSavepointLocked(context.Context, *savepoint) {}
 
 // rollbackToSavepointLocked is part of the txnInterceptor interface.
 func (tp *txnPipeliner) rollbackToSavepointLocked(ctx context.Context, s savepoint) {
@@ -1048,13 +1066,12 @@ func makeInFlightWrite(key roachpb.Key, seq enginepb.TxnSeq, str lock.Strength) 
 	}}
 }
 
-// Less implements the gbtree.Item interface.
+// less is the ordering function used by the B tree.
 //
 // inFlightWrites are ordered by Key, then by Sequence, then by Strength. Two
 // inFlightWrites with the same Key but different Sequences and/or Strengths are
 // not considered equal and are maintained separately in the inFlightWritesSet.
-func (a *inFlightWrite) Less(bItem gbtree.Item) bool {
-	b := bItem.(*inFlightWrite)
+func (a *inFlightWrite) less(b *inFlightWrite) bool {
 	kCmp := a.Key.Compare(b.Key)
 	if kCmp != 0 {
 		// Different Keys.
@@ -1077,7 +1094,7 @@ func (a *inFlightWrite) Less(bItem gbtree.Item) bool {
 // writes, O(log n) removal of existing in-flight writes, and O(m + log n)
 // retrieval over m in-flight writes that overlap with a given key.
 type inFlightWriteSet struct {
-	t     *gbtree.BTree
+	t     *gbtree.BTreeG[*inFlightWrite]
 	bytes int64
 
 	// Avoids allocs.
@@ -1090,15 +1107,15 @@ type inFlightWriteSet struct {
 func (s *inFlightWriteSet) insert(key roachpb.Key, seq enginepb.TxnSeq, str lock.Strength) {
 	if s.t == nil {
 		// Lazily initialize btree.
-		s.t = gbtree.New(txnPipelinerBtreeDegree)
+		s.t = gbtree.NewG[*inFlightWrite](txnPipelinerBtreeDegree, (*inFlightWrite).less)
 	}
 
 	w := s.alloc.alloc(key, seq, str)
-	delItem := s.t.ReplaceOrInsert(w)
+	delItem, _ := s.t.ReplaceOrInsert(w)
 	if delItem != nil {
 		// An in-flight write with the same key and sequence already existed in the
 		// set. We replaced it with an identical in-flight write.
-		*delItem.(*inFlightWrite) = inFlightWrite{} // for GC
+		*delItem = inFlightWrite{} // for GC
 	} else {
 		s.bytes += keySize(key)
 	}
@@ -1114,12 +1131,12 @@ func (s *inFlightWriteSet) remove(key roachpb.Key, seq enginepb.TxnSeq, str lock
 
 	// Delete the write from the in-flight writes set.
 	s.tmp1 = makeInFlightWrite(key, seq, str)
-	delItem := s.t.Delete(&s.tmp1)
+	delItem, _ := s.t.Delete(&s.tmp1)
 	if delItem == nil {
 		// The write was already proven or the txn epoch was incremented.
 		return
 	}
-	*delItem.(*inFlightWrite) = inFlightWrite{} // for GC
+	*delItem = inFlightWrite{} // for GC
 	s.bytes -= keySize(key)
 
 	// Assert that the byte accounting is believable.
@@ -1136,8 +1153,8 @@ func (s *inFlightWriteSet) ascend(f func(w *inFlightWrite)) {
 		// Set is empty.
 		return
 	}
-	s.t.Ascend(func(i gbtree.Item) bool {
-		f(i.(*inFlightWrite))
+	s.t.Ascend(func(i *inFlightWrite) bool {
+		f(i)
 		return true
 	})
 }
@@ -1157,8 +1174,8 @@ func (s *inFlightWriteSet) ascendRange(start, end roachpb.Key, f func(w *inFligh
 		// Range lookup.
 		s.tmp2 = makeInFlightWrite(end, 0, 0)
 	}
-	s.t.AscendRange(&s.tmp1, &s.tmp2, func(i gbtree.Item) bool {
-		f(i.(*inFlightWrite))
+	s.t.AscendRange(&s.tmp1, &s.tmp2, func(i *inFlightWrite) bool {
+		f(i)
 		return true
 	})
 }

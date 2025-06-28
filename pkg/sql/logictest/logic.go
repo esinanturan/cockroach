@@ -74,8 +74,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/debugutil"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
+	"github.com/cockroachdb/cockroach/pkg/util/log/eventlog"
 	"github.com/cockroachdb/cockroach/pkg/util/metamorphic"
 	"github.com/cockroachdb/cockroach/pkg/util/randutil"
+	"github.com/cockroachdb/cockroach/pkg/util/system"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/errors"
@@ -403,6 +405,8 @@ import (
 //    Skips the following `statement` or `query` if the argument is postgresql,
 //    cockroachdb, or a config matching the currently running
 //    configuration. Note that this is different from `skip`.
+//    - skipif bigendian/littleendian will skip the following `statement` or
+//      `query` if the system is big endian / little endian, respectively.
 //
 //  - onlyif <mysql/mssql/postgresql/cockroachdb/config [#ISSUE] CONFIG [CONFIG...]
 //    Skips the following `statement` or `query` if the argument is not
@@ -966,7 +970,6 @@ type logicQuery struct {
 var allowedKVOpTypes = []string{
 	"CPut",
 	"Put",
-	"InitPut",
 	"Del",
 	"DelRange",
 	"ClearRange",
@@ -1334,6 +1337,8 @@ func (t *logicTest) newTestServerCluster(bootstrapBinaryPath, upgradeBinaryPath 
 	t.logsDir = logsDir
 
 	var envVars []string
+	// Set crash reporting URL to the empty string to disable Sentry crash reports.
+	envVars = append(envVars, "COCKROACH_CRASH_REPORTS=")
 	if strings.Contains(upgradeBinaryPath, "cockroach-short") {
 		// If we're using a cockroach-short binary, that means it was
 		// locally built, so we need to opt-out of version offsetting to
@@ -1536,7 +1541,6 @@ func (t *logicTest) newCluster(
 					DisableConsistencyQueue:  true,
 					GlobalMVCCRangeTombstone: globalMVCCRangeTombstone,
 					EvalKnobs: kvserverbase.BatchEvalTestingKnobs{
-						DisableInitPutFailOnTombstones:    ignoreMVCCRangeTombstoneErrors,
 						UseRangeTombstonesForPointDeletes: shouldUseMVCCRangeTombstonesForPointDeletes,
 					},
 				},
@@ -1799,6 +1803,19 @@ func (t *logicTest) newCluster(
 			}
 		}
 
+		if cfg.DisableSchemaLockedByDefault {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.defaults.create_table_with_schema_locked = false",
+			); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			if _, err := conn.Exec(
+				"SET CLUSTER SETTING sql.defaults.create_table_with_schema_locked = true",
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
 		// We disable the automatic stats collection in order to have
 		// deterministic tests.
 		//
@@ -2000,7 +2017,10 @@ func (t *logicTest) setup(
 		skip.UnderRace(t.t(), "test uses a different binary, so the race detector doesn't work")
 		skip.UnderStress(t.t(), "test takes a long time and downloads release artifacts")
 		if !bazel.BuiltWithBazel() {
-			skip.IgnoreLint(t.t(), "cockroach-go/testserver can only be uzed in bazel builds")
+			skip.IgnoreLint(t.t(), "cockroach-go/testserver can only be used in bazel builds")
+		}
+		if runtime.GOARCH == "s390x" {
+			skip.IgnoreLint(t.t(), "cockroach-go/testserver is not operational on s390x")
 		}
 		if cfg.NumNodes != 3 {
 			t.Fatal("cockroach-go testserver tests must use 3 nodes")
@@ -2087,11 +2107,11 @@ var _ knobOpt = knobOptSynchronousEventLog{}
 
 // apply implements the clusterOpt interface.
 func (c knobOptSynchronousEventLog) apply(args *base.TestingKnobs) {
-	_, ok := args.EventLog.(*sql.EventLogTestingKnobs)
+	_, ok := args.EventLog.(*eventlog.EventLogTestingKnobs)
 	if !ok {
-		args.EventLog = &sql.EventLogTestingKnobs{}
+		args.EventLog = &eventlog.EventLogTestingKnobs{}
 	}
-	args.EventLog.(*sql.EventLogTestingKnobs).SyncWrites = true
+	args.EventLog.(*eventlog.EventLogTestingKnobs).SyncWrites = true
 }
 
 // clusterOptIgnoreStrictGCForTenants corresponds to the
@@ -3319,6 +3339,16 @@ func (t *logicTest) processSubtest(
 					"should be skip command instead of skipif: %s:%d",
 					path, s.Line+subtest.lineLineIndexIntoFile,
 				)
+			case "bigendian":
+				if system.BigEndian {
+					s.SetSkip("big endian system")
+					continue
+				}
+			case "littleendian":
+				if !system.BigEndian {
+					s.SetSkip("little endian system")
+					continue
+				}
 			default:
 				return errors.Errorf("unimplemented test statement: %s", s.Text())
 			}

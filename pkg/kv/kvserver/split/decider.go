@@ -75,6 +75,9 @@ type LoadSplitConfig interface {
 	// StatThreshold returns the threshold for load above which the range
 	// should be considered split.
 	StatThreshold(SplitObjective) float64
+	// SampleResetDuration returns the duration that any sampling structure
+	// should retain data for before resetting.
+	SampleResetDuration() time.Duration
 }
 
 type RandSource interface {
@@ -167,6 +170,7 @@ type Decider struct {
 
 		// Fields tracking split key suggestions.
 		splitFinder         LoadBasedSplitter // populated when engaged or decided
+		splitFinderInitAt   time.Time         // when the split finder was initialized
 		lastSplitSuggestion time.Time         // last stipulation to client to carry out split
 		suggestionsMade     int               // suggestions made since last reset
 
@@ -252,6 +256,7 @@ func (d *Decider) recordLocked(
 		if d.mu.lastStatVal >= d.config.StatThreshold(d.mu.objective) {
 			if d.mu.splitFinder == nil {
 				d.mu.splitFinder = d.config.NewLoadBasedSplitter(now, d.mu.objective)
+				d.mu.splitFinderInitAt = now
 			}
 		} else {
 			d.mu.splitFinder = nil
@@ -278,24 +283,41 @@ func (d *Decider) recordLocked(
 				if now.Sub(d.mu.lastNoSplitKeyLoggingMetrics) > minNoSplitKeyLoggingMetricsInterval {
 					d.mu.lastNoSplitKeyLoggingMetrics = now
 					if causeMsg := d.mu.splitFinder.NoSplitKeyCauseLogMsg(); causeMsg != "" {
-						popularKeyFrequency := d.mu.splitFinder.PopularKey().Frequency
-						log.KvDistribution.Infof(ctx, "%s, most popular key occurs in %d%% of samples",
-							causeMsg, int(popularKeyFrequency*100))
 						log.KvDistribution.VInfof(ctx, 3, "splitter_state=%v", (*lockedDecider)(d))
+						popularKeyDetected := ", no popular key"
+						clearDirectionDetected := ", no clear direction"
+
+						popularKeyFrequency := d.mu.splitFinder.PopularKey().Frequency
 						if popularKeyFrequency >= splitKeyThreshold {
+							popularKeyDetected = ", popular key detected"
 							d.loadSplitterMetrics.PopularKeyCount.Inc(1)
 						}
+
 						accessDirection := d.mu.splitFinder.AccessDirection()
 						direction := directionStr(accessDirection)
-						log.KvDistribution.Infof(ctx, "%s, access balance between left and right for sampled keys: %s-biased %d%%",
-							causeMsg, direction, int(math.Abs(accessDirection)*100))
 						if math.Abs(accessDirection) >= clearDirectionThreshold {
+							clearDirectionDetected = ", clear direction detected"
 							d.loadSplitterMetrics.ClearDirectionCount.Inc(1)
 						}
+
+						log.KvDistribution.Infof(
+							ctx, "%s, most popular key occurs in %d%% of samples, access balance %s-biased %d%%%s%s",
+							causeMsg, int(popularKeyFrequency*100), direction, int(math.Abs(accessDirection)*100),
+							redact.SafeString(popularKeyDetected), redact.SafeString(clearDirectionDetected),
+						)
 						d.loadSplitterMetrics.NoSplitKeyCount.Inc(1)
 					}
 				}
 			}
+		}
+		// If the split finder has been initialized for longer than the sample
+		// reset duration, then we discard the split finder and start over. This is
+		// to prevent the split finder from being stuck in a state where it is not
+		// finding a split key based on earlier sampled keys, but could find one if
+		// it were to sample new keys with higher probability.
+		if sampleResetDuration := d.config.SampleResetDuration(); sampleResetDuration != 0 &&
+			now.Sub(d.mu.splitFinderInitAt) >= sampleResetDuration {
+			d.mu.splitFinder = nil
 		}
 	}
 	return false
@@ -402,6 +424,7 @@ func (d *Decider) resetLocked(now time.Time) {
 	d.mu.lastStatVal = 0
 	d.mu.count = 0
 	d.mu.maxStat.reset(now, d.config.StatRetention())
+	d.mu.splitFinderInitAt = time.Time{}
 	d.mu.splitFinder = nil
 	d.mu.suggestionsMade = 0
 	d.mu.lastSplitSuggestion = time.Time{}
@@ -554,7 +577,7 @@ func (t *maxStatTracker) windowWidth() time.Duration {
 
 // Returns the absolute percentage and direction of accesses
 // as a string to be used in a log statement.
-func directionStr(direction float64) string {
+func directionStr(direction float64) redact.SafeString {
 	dstr := "right"
 	if direction == 0 {
 		dstr = "even"
@@ -562,5 +585,5 @@ func directionStr(direction float64) string {
 	if direction < 0 {
 		dstr = "left"
 	}
-	return dstr
+	return redact.SafeString(dstr)
 }

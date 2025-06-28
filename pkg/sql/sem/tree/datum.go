@@ -32,6 +32,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util"
 	"github.com/cockroachdb/cockroach/pkg/util/bitarray"
+	"github.com/cockroachdb/cockroach/pkg/util/collatedstring"
 	"github.com/cockroachdb/cockroach/pkg/util/duration"
 	"github.com/cockroachdb/cockroach/pkg/util/encoding"
 	"github.com/cockroachdb/cockroach/pkg/util/ipaddr"
@@ -1322,7 +1323,8 @@ type DCollatedString struct {
 	Contents string
 	Locale   string
 	// Key is the collation key.
-	Key []byte
+	Key           []byte
+	Deterministic bool
 }
 
 // CollationEnvironment stores the state needed by NewDCollatedString to
@@ -1336,7 +1338,8 @@ type collationEnvironmentCacheEntry struct {
 	// locale is interned.
 	locale string
 	// collator is an expensive factory.
-	collator *collate.Collator
+	collator      *collate.Collator
+	deterministic bool
 }
 
 func (env *CollationEnvironment) getCacheEntry(
@@ -1353,7 +1356,7 @@ func (env *CollationEnvironment) getCacheEntry(
 			return collationEnvironmentCacheEntry{}, err
 		}
 
-		entry = collationEnvironmentCacheEntry{locale, collate.New(tag)}
+		entry = collationEnvironmentCacheEntry{locale, collate.New(tag), collatedstring.IsDeterministicCollation(tag)}
 		env.cache[locale] = entry
 	}
 	return entry, nil
@@ -1372,7 +1375,7 @@ func NewDCollatedString(
 		env.buffer = &collate.Buffer{}
 	}
 	key := entry.collator.KeyFromString(env.buffer, contents)
-	d := DCollatedString{contents, entry.locale, make([]byte, len(key))}
+	d := DCollatedString{contents, entry.locale, make([]byte, len(key)), entry.deterministic}
 	copy(d.Key, key)
 	env.buffer.Reset()
 	return &d, nil
@@ -1445,7 +1448,7 @@ func (d *DCollatedString) IsMin(ctx context.Context, cmpCtx CompareContext) bool
 
 // Min implements the Datum interface.
 func (d *DCollatedString) Min(ctx context.Context, cmpCtx CompareContext) (Datum, bool) {
-	return &DCollatedString{"", d.Locale, nil}, true
+	return &DCollatedString{"", d.Locale, nil, false}, true
 }
 
 // Max implements the Datum interface.
@@ -5460,7 +5463,7 @@ func (d *DEnum) ResolvedType() *types.T {
 	return d.EnumTyp
 }
 
-// PlanCistFromCtx returns the plan gist if it is stored in the context. It is
+// PlanGistFromCtx returns the plan gist if it is stored in the context. It is
 // injected from the sql package to avoid import cycle.
 var PlanGistFromCtx func(context.Context) string
 
@@ -5487,11 +5490,11 @@ func (d *DEnum) Compare(ctx context.Context, cmpCtx CompareContext, other Datum)
 			// safe string.
 			gist = redact.SafeString(PlanGistFromCtx(ctx))
 		}
-		panic(errors.AssertionFailedf(
+		return 0, errors.AssertionFailedf(
 			"comparison of two different versions of enum %s oid %d: versions %d and %d, gist %q",
 			d.EnumTyp.SQLStringForError(), errors.Safe(d.EnumTyp.Oid()), d.EnumTyp.TypeMeta.Version,
 			v.EnumTyp.TypeMeta.Version, gist,
-		))
+		)
 	}
 
 	res := bytes.Compare(d.PhysicalRep, v.PhysicalRep)
@@ -6204,7 +6207,7 @@ var baseDatumTypeSizes = map[types.Family]struct {
 	types.FloatFamily:          {unsafe.Sizeof(DFloat(0.0)), fixedSize},
 	types.DecimalFamily:        {unsafe.Sizeof(DDecimal{}), variableSize},
 	types.StringFamily:         {unsafe.Sizeof(DString("")), variableSize},
-	types.CollatedStringFamily: {unsafe.Sizeof(DCollatedString{"", "", nil}), variableSize},
+	types.CollatedStringFamily: {unsafe.Sizeof(DCollatedString{"", "", nil, false}), variableSize},
 	types.BytesFamily:          {unsafe.Sizeof(DBytes("")), variableSize},
 	types.EncodedKeyFamily:     {unsafe.Sizeof(DBytes("")), variableSize},
 	types.DateFamily:           {unsafe.Sizeof(DDate{}), fixedSize},
@@ -6390,11 +6393,15 @@ func AdjustValueToType(typ *types.T, inVal Datum) (outVal Datum, err error) {
 	switch typ.Family() {
 	case types.StringFamily, types.CollatedStringFamily:
 		var sv string
+		var isString, isCollatedString bool
 		if v, ok := AsDString(inVal); ok {
 			sv = string(v)
+			isString = true
 		} else if v, ok := inVal.(*DCollatedString); ok {
 			sv = v.Contents
+			isCollatedString = true
 		}
+		origLen := len(sv)
 		switch typ.Oid() {
 		case oid.T_char:
 			// "char" is supposed to truncate long values.
@@ -6429,9 +6436,14 @@ func AdjustValueToType(typ *types.T, inVal Datum) (outVal Datum, err error) {
 		}
 
 		if typ.Oid() == oid.T_bpchar || typ.Oid() == oid.T_char || typ.Oid() == oid.T_varchar {
-			if _, ok := AsDString(inVal); ok {
+			if isString {
+				if len(sv) == origLen {
+					// The string wasn't modified, so we can just return the
+					// original datum.
+					return inVal, nil
+				}
 				return NewDString(sv), nil
-			} else if _, ok := inVal.(*DCollatedString); ok {
+			} else if isCollatedString {
 				return NewDCollatedString(sv, typ.Locale(), &CollationEnvironment{})
 			}
 		}

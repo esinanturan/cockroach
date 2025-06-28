@@ -375,17 +375,10 @@ func ForEachExprStringInTableDesc(
 	return nil
 }
 
-// GetAllReferencedTableIDs implements the TableDescriptor interface.
-func (desc *wrapper) GetAllReferencedTableIDs() descpb.IDs {
+// GetAllReferencedRelationIDsExceptFKs implements the TableDescriptor interface.
+func (desc *wrapper) GetAllReferencedRelationIDsExceptFKs() descpb.IDs {
 	var ids catalog.DescriptorIDSet
 
-	// Collect referenced table IDs in foreign keys.
-	for _, fk := range desc.OutboundForeignKeys() {
-		ids.Add(fk.GetReferencedTableID())
-	}
-	for _, fk := range desc.InboundForeignKeys() {
-		ids.Add(fk.GetOriginTableID())
-	}
 	// Add trigger dependencies.
 	for i := range desc.Triggers {
 		ids = ids.Union(catalog.MakeDescriptorIDSet(desc.Triggers[i].DependsOn...))
@@ -458,12 +451,20 @@ func (desc *wrapper) GetAllReferencedFunctionIDs() (catalog.DescriptorIDSet, err
 	for i := range desc.Triggers {
 		ret = ret.Union(catalog.MakeDescriptorIDSet(desc.Triggers[i].DependsOnRoutines...))
 	}
-	// Add deps from policies
+	// Add deps from policies.
 	for i := range desc.Policies {
 		ret = ret.Union(catalog.MakeDescriptorIDSet(desc.Policies[i].DependsOnFunctions...))
 	}
-	// TODO(chengxiong): add logic to extract references from indexes when UDFs
-	// are allowed in them.
+	// Add deps from partial indexes.
+	for _, idx := range desc.AllIndexes() {
+		if idx.IsPartial() {
+			ids, err := schemaexpr.GetUDFIDsFromExprStr(idx.GetPredicate())
+			if err != nil {
+				return catalog.DescriptorIDSet{}, err
+			}
+			ret = ret.Union(ids)
+		}
+	}
 	return ret.Union(catalog.MakeDescriptorIDSet(desc.DependsOnFunctions...)), nil
 }
 
@@ -496,6 +497,26 @@ func (desc *wrapper) GetAllReferencedFunctionIDsInTrigger(
 	return fnIDs
 }
 
+// GetAllReferencedFunctionIDsInIndex implements the TableDescriptor interface.
+func (desc *wrapper) GetAllReferencedFunctionIDsInIndex(
+	indexID descpb.IndexID,
+) (fnIDs catalog.DescriptorIDSet, err error) {
+	idx := catalog.FindIndexByID(desc, indexID)
+	if idx == nil {
+		return catalog.DescriptorIDSet{}, nil
+	}
+
+	var ret catalog.DescriptorIDSet
+	if idx.IsPartial() {
+		ids, err := schemaexpr.GetUDFIDsFromExprStr(idx.GetPredicate())
+		if err != nil {
+			return catalog.DescriptorIDSet{}, err
+		}
+		ret = ret.Union(ids)
+	}
+	return ret, nil
+}
+
 // GetAllReferencedFunctionIDsInPolicy implements the TableDescriptor interface.
 func (desc *wrapper) GetAllReferencedFunctionIDsInPolicy(
 	policyID descpb.PolicyID,
@@ -518,18 +539,26 @@ func (desc *wrapper) GetAllReferencedFunctionIDsInColumnExprs(
 	}
 
 	var ret catalog.DescriptorIDSet
-	// TODO(chengxiong): add support for computed columns when UDFs are allowed in
-	// them.
-	if !col.IsComputed() {
-		if col.HasDefault() {
-			ids, err := schemaexpr.GetUDFIDsFromExprStr(col.GetDefaultExpr())
-			if err != nil {
-				return catalog.DescriptorIDSet{}, err
-			}
-			ret = ret.Union(ids)
+	if col.IsComputed() {
+		ids, err := schemaexpr.GetUDFIDsFromExprStr(col.GetComputeExpr())
+		if err != nil {
+			return catalog.DescriptorIDSet{}, err
 		}
-		// TODO(chengxiong): add support for ON UPDATE expressions when UDFs are
-		// allowed in them.
+		ret = ret.Union(ids)
+	}
+	if col.HasDefault() {
+		ids, err := schemaexpr.GetUDFIDsFromExprStr(col.GetDefaultExpr())
+		if err != nil {
+			return catalog.DescriptorIDSet{}, err
+		}
+		ret = ret.Union(ids)
+	}
+	if col.HasOnUpdate() {
+		ids, err := schemaexpr.GetUDFIDsFromExprStr(col.GetOnUpdateExpr())
+		if err != nil {
+			return catalog.DescriptorIDSet{}, err
+		}
+		ret = ret.Union(ids)
 	}
 
 	return ret, nil
@@ -2767,4 +2796,18 @@ func (desc *Mutable) BumpExternalAsOf(timestamp hlc.Timestamp) error {
 // since the builder will not populate it for offline descriptors.
 func (desc *Mutable) ForceModificationTime(modificationTime hlc.Timestamp) {
 	desc.ModificationTime = modificationTime
+}
+
+func UpdateVectorIndexPrefixColDirections(
+	vecIndexDesc *descpb.IndexDescriptor, primaryIndexDesc *descpb.IndexDescriptor,
+) {
+	numPrefixCols := len(vecIndexDesc.KeyColumnIDs) - 1
+	for i := 0; i < numPrefixCols; i++ {
+		for j, pkColID := range primaryIndexDesc.KeyColumnIDs {
+			if vecIndexDesc.KeyColumnIDs[i] == pkColID {
+				vecIndexDesc.KeyColumnDirections[i] = primaryIndexDesc.KeyColumnDirections[j]
+				break
+			}
+		}
+	}
 }

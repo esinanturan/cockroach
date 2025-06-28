@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -616,6 +617,8 @@ func makeMetrics(internal bool, sv *settings.Values) Metrics {
 			TransactionTimeoutCount:           metric.NewCounter(getMetricMeta(MetaTransactionTimeout, internal)),
 			FullTableOrIndexScanCount:         aggmetric.NewSQLCounter(getMetricMeta(MetaFullTableOrIndexScan, internal)),
 			FullTableOrIndexScanRejectedCount: metric.NewCounter(getMetricMeta(MetaFullTableOrIndexScanRejected, internal)),
+			TxnRetryCount:                     metric.NewCounter(getMetricMeta(MetaTxnRetry, internal)),
+			StatementRetryCount:               metric.NewCounter(getMetricMeta(MetaStatementRetry, internal)),
 		},
 		StartedStatementCounters:  makeStartedStatementCounters(internal),
 		ExecutedStatementCounters: makeExecutedStatementCounters(internal),
@@ -725,6 +728,11 @@ func (s *Server) GetLocalSQLStatsProvider() *sslocal.SQLStats {
 // sql stats sink.
 func (s *Server) GetReportedSQLStatsProvider() *sslocal.SQLStats {
 	return s.reportedStats
+}
+
+// GetSQLStatsIngester returns the sqlstats.Ingester for the current sql.Server.
+func (s *Server) GetSQLStatsIngester() *sslocal.SQLStatsIngester {
+	return s.sqlStatsIngester
 }
 
 // GetTxnIDCache returns the txnidcache.Cache for the current sql.Server.
@@ -3536,6 +3544,9 @@ func (ex *connExecutor) setTransactionModes(
 		if err := ex.state.setIsolationLevel(level); err != nil {
 			return pgerror.WithCandidateCode(err, pgcode.ActiveSQLTransaction)
 		}
+		if !ex.bufferedWritesIsAllowedForIsolationLevel(ctx, level) {
+			ex.state.mu.txn.SetBufferedWritesEnabled(false)
+		}
 	}
 	rwMode := modes.ReadWriteMode
 	if modes.AsOf.Expr != nil && asOfTs.IsEmpty() {
@@ -3572,6 +3583,13 @@ var allowRepeatableReadIsolation = settings.RegisterBoolSetting(
 	false,
 	settings.WithName("sql.txn.repeatable_read_isolation.enabled"),
 	settings.WithPublic,
+)
+
+var allowBufferedWritesForWeakIsolation = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.txn.write_buffering_for_weak_isolation.enabled",
+	"set to true to allow write buffering for transactions at weak isolation levels",
+	false,
 )
 
 var logIsolationLevelLimiter = log.Every(10 * time.Second)
@@ -3710,6 +3728,28 @@ func (ex *connExecutor) bufferedWritesEnabled(ctx context.Context) bool {
 		return false
 	}
 	return ex.sessionData().BufferedWritesEnabled && ex.server.cfg.Settings.Version.IsActive(ctx, clusterversion.V25_2)
+}
+
+func (ex *connExecutor) bufferedWritesIsAllowedForIsolationLevel(
+	ctx context.Context, isoLevel isolation.Level,
+) bool {
+	return bufferedWritesIsAllowedForIsolationLevel(ctx, ex.server.cfg.Settings, isoLevel)
+}
+
+func bufferedWritesIsAllowedForIsolationLevel(
+	ctx context.Context, st *cluster.Settings, isoLevel isolation.Level,
+) bool {
+	if isoLevel == isolation.Serializable {
+		return true
+	}
+
+	// We are at a weaker isolation level that requires lock loss detection which
+	// is only available on 25.3 or greater.
+	if !st.Version.IsActive(ctx, clusterversion.V25_3) {
+		return false
+	}
+
+	return allowBufferedWritesForWeakIsolation.Get(&st.SV)
 }
 
 // initEvalCtx initializes the fields of an extendedEvalContext that stay the
