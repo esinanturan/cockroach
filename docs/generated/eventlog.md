@@ -28,6 +28,28 @@ Events in this category pertain to changefeed usage and metrics.
 Events in this category are logged to the `TELEMETRY` channel.
 
 
+### `alter_changefeed`
+
+An event of type `alter_changefeed` is an event for any ALTER CHANGEFEED statements that are run.
+
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `PreviousDescription` | The description of the changefeed job before the ALTER CHANGEFEED. | yes |
+
+
+#### Common fields
+
+| Field | Description | Sensitive |
+|--|--|--|
+| `Description` | The description of that would show up in the job's description field, redacted | yes |
+| `SinkType` | The type of sink being emitted to (ex: kafka, nodelocal, webhook-https). | no |
+| `NumTables` | The number of tables listed in the query that the changefeed is to run on. | no |
+| `Resolved` | The behavior of emitted resolved spans (ex: yes, no, 10s) | no |
+| `InitialScan` | The desired behavior of initial scans (ex: yes, no, only) | no |
+| `Format` | The data format being emitted (ex: JSON, Avro). | no |
+| `JobId` | The job id for enterprise changefeeds. | no |
+
 ### `changefeed_canceled`
 
 An event of type `changefeed_canceled` is an event for any changefeed cancellations.
@@ -463,9 +485,9 @@ An event of type `hot_ranges_stats`
 | `WriteBytesPerSecond` | Write bytes per second is the recent number of bytes written per second on this range. | no |
 | `ReadBytesPerSecond` | Read bytes per second is the recent number of bytes read per second on this range. | no |
 | `CPUTimePerSecond` | CPU time per second is the recent cpu usage in nanoseconds of this range. | no |
-| `Databases` | Databases for the range. | yes |
-| `Tables` | Tables for the range | yes |
-| `Indexes` | Indexes for the range | yes |
+| `Databases` | Databases for the range. | no |
+| `Tables` | Tables for the range | no |
+| `Indexes` | Indexes for the range | no |
 
 
 #### Common fields
@@ -3521,6 +3543,7 @@ authentication failure.
 | 7 | CREDENTIALS_EXPIRED | occur when the credentials provided by the client are expired. |
 | 8 | NO_REPLICATION_ROLEOPTION | occurs when the connection requires a replication role option, but the user does not have it. |
 | 9 | AUTHORIZATION_ERROR | is used for errors during the authorization phase. For example, this would include issues with mapping LDAP groups to SQL roles and granting those roles to the user. |
+| 10 | PROVISIONING_ERROR | is used for errors during the user provisioning phase. This would include errors when the transaction to provision the authenticating user failed to execute. |
 
 
 

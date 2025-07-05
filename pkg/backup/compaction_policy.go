@@ -20,12 +20,17 @@ var (
 	backupCompactionWindow = settings.RegisterIntSetting(
 		settings.ApplicationLevel,
 		"backup.compaction.window_size",
-		"the number of backups to compact per compaction (must be greater than one and less than threshold)",
+		"the number of backups to compact per compaction (must be greater than two and less than threshold)",
 		3,
 		settings.WithVisibility(settings.Reserved),
-		settings.IntWithMinimum(2),
+		settings.IntWithMinimum(3),
 	)
 )
+
+// compactionPolicy is a function that determines what backups to compact when
+// given a chain of backups. It returns the inclusive start and exclusive end of
+// the window of backups to compact, as well as an error if one occurs.
+type compactionPolicy func(context.Context, *sql.ExecutorConfig, []backuppb.BackupManifest) (int, int, error)
 
 // minSizeDeltaHeuristic is a heuristic that selects a window of backups with the
 // smallest delta in data size between each backup.

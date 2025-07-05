@@ -30,6 +30,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/settings"
+	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/sql/appstatspb"
 	"github.com/cockroachdb/cockroach/pkg/sql/auditlogging"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
@@ -616,6 +617,8 @@ func makeMetrics(internal bool, sv *settings.Values) Metrics {
 			TransactionTimeoutCount:           metric.NewCounter(getMetricMeta(MetaTransactionTimeout, internal)),
 			FullTableOrIndexScanCount:         aggmetric.NewSQLCounter(getMetricMeta(MetaFullTableOrIndexScan, internal)),
 			FullTableOrIndexScanRejectedCount: metric.NewCounter(getMetricMeta(MetaFullTableOrIndexScanRejected, internal)),
+			TxnRetryCount:                     metric.NewCounter(getMetricMeta(MetaTxnRetry, internal)),
+			StatementRetryCount:               metric.NewCounter(getMetricMeta(MetaStatementRetry, internal)),
 		},
 		StartedStatementCounters:  makeStartedStatementCounters(internal),
 		ExecutedStatementCounters: makeExecutedStatementCounters(internal),
@@ -725,6 +728,11 @@ func (s *Server) GetLocalSQLStatsProvider() *sslocal.SQLStats {
 // sql stats sink.
 func (s *Server) GetReportedSQLStatsProvider() *sslocal.SQLStats {
 	return s.reportedStats
+}
+
+// GetSQLStatsIngester returns the sqlstats.Ingester for the current sql.Server.
+func (s *Server) GetSQLStatsIngester() *sslocal.SQLStatsIngester {
+	return s.sqlStatsIngester
 }
 
 // GetTxnIDCache returns the txnidcache.Cache for the current sql.Server.
@@ -1643,6 +1651,12 @@ type connExecutor struct {
 			// checks for resumeProc in buildExecMemo, and executes it as the next
 			// statement if it is non-nil.
 			resumeProc *memo.Memo
+
+			// resumeStmt is set if resumeProc is set. If the stored procedure was
+			// executed via a portal in the extended wire protocol, this statement
+			// will be used to synthesize an ExecStmt command to avoid attempting to
+			// execute the portal twice.
+			resumeStmt statements.Statement[tree.Statement]
 		}
 
 		// shouldExecuteOnTxnRestart indicates that ex.onTxnRestart will be
@@ -2292,6 +2306,15 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		return err // err could be io.EOF
 	}
 
+	// Special handling for COMMIT/ROLLBACK in PL/pgSQL stored procedures. See the
+	// makeCmdForStoredProcResume comment for details.
+	if ex.extraTxnState.storedProcTxnState.resumeProc != nil {
+		cmd, err = ex.makeCmdForStoredProcResume(cmd)
+		if err != nil {
+			return err
+		}
+	}
+
 	if log.ExpensiveLogEnabled(ctx, 2) {
 		ex.sessionEventf(ctx, "[%s pos:%d] executing %s",
 			ex.machine.CurState(), pos, cmd)
@@ -2708,6 +2731,7 @@ func (ex *connExecutor) execCmd() (retErr error) {
 		// and transaction modes. The stored procedure has finished execution,
 		// either successfully or with an error.
 		ex.extraTxnState.storedProcTxnState.resumeProc = nil
+		ex.extraTxnState.storedProcTxnState.resumeStmt = statements.Statement[tree.Statement]{}
 		ex.extraTxnState.storedProcTxnState.txnModes = nil
 	}
 
@@ -2882,6 +2906,35 @@ func stateToTxnStatusIndicator(s fsm.State) TransactionStatusIndicator {
 	default:
 		panic(errors.AssertionFailedf("unknown state: %T", s))
 	}
+}
+
+// makeCmdForStoredProcResume creates a Command that can be used to resume
+// execution of a stored procedure that has ended the previous transaction via
+// COMMIT or ROLLBACK. It is not enough to just process the original command
+// again, because it may have been an ExecPortal statement, and the portal will
+// already have been closed after the first phase of execution.
+func (ex *connExecutor) makeCmdForStoredProcResume(curCmd Command) (Command, error) {
+	if !ex.sessionData().UseProcTxnControlExtendedProtocolFix {
+		// The fix is not enabled, so return the original command.
+		return curCmd, nil
+	}
+	var timeReceived crtime.Mono
+	switch t := curCmd.(type) {
+	case ExecStmt:
+		// NOTE: it is not strictly necessary to replace ExecStmt. However, it seems
+		// best to handle the commands in a consistent way.
+		timeReceived = t.TimeReceived
+	case ExecPortal:
+		timeReceived = t.TimeReceived
+	default:
+		return nil, errors.AssertionFailedf(
+			"unexpected command type %T for stored procedure resume", t,
+		)
+	}
+	return ExecStmt{
+		Statement:    ex.extraTxnState.storedProcTxnState.resumeStmt,
+		TimeReceived: timeReceived,
+	}, nil
 }
 
 // isCopyToExternalStorage returns true if the CopyIn command is writing to an
@@ -3536,6 +3589,9 @@ func (ex *connExecutor) setTransactionModes(
 		if err := ex.state.setIsolationLevel(level); err != nil {
 			return pgerror.WithCandidateCode(err, pgcode.ActiveSQLTransaction)
 		}
+		if !ex.bufferedWritesIsAllowedForIsolationLevel(ctx, level) {
+			ex.state.mu.txn.SetBufferedWritesEnabled(false)
+		}
 	}
 	rwMode := modes.ReadWriteMode
 	if modes.AsOf.Expr != nil && asOfTs.IsEmpty() {
@@ -3572,6 +3628,13 @@ var allowRepeatableReadIsolation = settings.RegisterBoolSetting(
 	false,
 	settings.WithName("sql.txn.repeatable_read_isolation.enabled"),
 	settings.WithPublic,
+)
+
+var allowBufferedWritesForWeakIsolation = settings.RegisterBoolSetting(
+	settings.ApplicationLevel,
+	"sql.txn.write_buffering_for_weak_isolation.enabled",
+	"set to true to allow write buffering for transactions at weak isolation levels",
+	false,
 )
 
 var logIsolationLevelLimiter = log.Every(10 * time.Second)
@@ -3710,6 +3773,28 @@ func (ex *connExecutor) bufferedWritesEnabled(ctx context.Context) bool {
 		return false
 	}
 	return ex.sessionData().BufferedWritesEnabled && ex.server.cfg.Settings.Version.IsActive(ctx, clusterversion.V25_2)
+}
+
+func (ex *connExecutor) bufferedWritesIsAllowedForIsolationLevel(
+	ctx context.Context, isoLevel isolation.Level,
+) bool {
+	return bufferedWritesIsAllowedForIsolationLevel(ctx, ex.server.cfg.Settings, isoLevel)
+}
+
+func bufferedWritesIsAllowedForIsolationLevel(
+	ctx context.Context, st *cluster.Settings, isoLevel isolation.Level,
+) bool {
+	if isoLevel == isolation.Serializable {
+		return true
+	}
+
+	// We are at a weaker isolation level that requires lock loss detection which
+	// is only available on 25.3 or greater.
+	if !st.Version.IsActive(ctx, clusterversion.V25_3) {
+		return false
+	}
+
+	return allowBufferedWritesForWeakIsolation.Get(&st.SV)
 }
 
 // initEvalCtx initializes the fields of an extendedEvalContext that stay the

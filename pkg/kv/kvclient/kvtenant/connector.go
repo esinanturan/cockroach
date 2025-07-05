@@ -28,6 +28,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server/serverpb"
 	"github.com/cockroachdb/cockroach/pkg/server/settingswatcher"
 	"github.com/cockroachdb/cockroach/pkg/settings"
@@ -50,6 +51,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"storj.io/drpc"
 )
 
 func init() {
@@ -221,10 +223,12 @@ type connector struct {
 
 // client represents an RPC client that proxies to a KV instance.
 type client struct {
-	kvpb.InternalClient
-	serverpb.StatusClient
-	serverpb.AdminClient
-	tspb.TimeSeriesClient
+	kvpb.RPCTenantServiceClient
+	kvpb.RPCTenantUsageClient
+	kvpb.RPCTenantSpanConfigClient
+	serverpb.RPCStatusClient
+	serverpb.RPCAdminClient
+	tspb.RPCTimeSeriesClient
 }
 
 // connector is capable of providing information on each of the KV nodes in the
@@ -975,16 +979,33 @@ func (c *connector) dialAddrs(ctx context.Context) (*client, error) {
 		// Try each address on each retry iteration (in random order).
 		for _, i := range rand.Perm(len(c.addrs)) {
 			addr := c.addrs[i]
-			conn, err := c.dialAddr(ctx, addr)
+			if !rpcbase.TODODRPC {
+				conn, err := c.dialAddr(ctx, addr)
+				if err != nil {
+					log.Warningf(ctx, "error dialing tenant KV address %s: %v", addr, err)
+					continue
+				}
+				return &client{
+					RPCTenantServiceClient:    kvpb.NewGRPCInternalToTenantServiceClientAdapter(conn),
+					RPCTenantSpanConfigClient: kvpb.NewGRPCInternalClientAdapter(conn),
+					RPCTenantUsageClient:      kvpb.NewGRPCInternalClientAdapter(conn),
+					RPCStatusClient:           serverpb.NewGRPCStatusClientAdapter(conn),
+					RPCAdminClient:            serverpb.NewGRPCAdminClientAdapter(conn),
+					RPCTimeSeriesClient:       tspb.NewGRPCTimeSeriesClientAdapter(conn),
+				}, nil
+			}
+			conn, err := c.drpcDialAddr(ctx, addr)
 			if err != nil {
 				log.Warningf(ctx, "error dialing tenant KV address %s: %v", addr, err)
 				continue
 			}
 			return &client{
-				InternalClient:   kvpb.NewInternalClient(conn),
-				StatusClient:     serverpb.NewStatusClient(conn),
-				AdminClient:      serverpb.NewAdminClient(conn),
-				TimeSeriesClient: tspb.NewTimeSeriesClient(conn),
+				RPCTenantServiceClient:    kvpb.NewDRPCTenantServiceClientAdapter(conn),
+				RPCTenantSpanConfigClient: kvpb.NewDRPCTenantSpanConfigClientAdapter(conn),
+				RPCTenantUsageClient:      kvpb.NewDRPCTenantUsageClientAdapter(conn),
+				RPCStatusClient:           serverpb.NewDRPCStatusClientAdapter(conn),
+				RPCAdminClient:            serverpb.NewDRPCAdminClientAdapter(conn),
+				RPCTimeSeriesClient:       tspb.NewDRPCTimeSeriesClientAdapter(conn),
 			}, nil
 		}
 	}
@@ -1002,7 +1023,18 @@ func (c *connector) dialAddr(ctx context.Context, addr string) (conn *grpc.Clien
 	return conn, err
 }
 
-func (c *connector) tryForgetClient(ctx context.Context, client kvpb.InternalClient) {
+func (c *connector) drpcDialAddr(ctx context.Context, addr string) (conn drpc.Conn, err error) {
+	if c.rpcDialTimeout == 0 {
+		return c.rpcContext.DRPCUnvalidatedDial(addr, roachpb.Locality{}).Connect(ctx)
+	}
+	err = timeutil.RunWithTimeout(ctx, "dial addr", c.rpcDialTimeout, func(ctx context.Context) error {
+		conn, err = c.rpcContext.DRPCUnvalidatedDial(addr, roachpb.Locality{}).Connect(ctx)
+		return err
+	})
+	return conn, err
+}
+
+func (c *connector) tryForgetClient(ctx context.Context, client *client) {
 	if ctx.Err() != nil {
 		// Error (may be) due to context. Don't forget client.
 		return

@@ -1,3 +1,5 @@
+# LogicTest: !local-schema-locked
+
 subtest cursor
 
 # Verify that SQL and PL/pgSQL cursors run under READ COMMITTED correctly.
@@ -320,6 +322,9 @@ statement ok
 SET autocommit_before_ddl = false
 
 statement ok
+SET create_table_with_schema_locked=false
+
+statement ok
 BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED;
 CREATE TABLE single_stmt_explicit (a INT PRIMARY KEY);
 COMMIT
@@ -480,6 +485,9 @@ ROLLBACK
 statement ok
 RESET autocommit_before_ddl
 
+statement ok
+RESET create_table_with_schema_locked
+
 subtest end
 
 statement ok
@@ -631,3 +639,24 @@ statement ok
 ROLLBACK
 
 subtest end
+
+# Verify that RESET ALL does not change transaction_isolation.
+
+statement ok
+BEGIN ISOLATION LEVEL READ COMMITTED
+
+query T
+SHOW transaction_isolation
+----
+read committed
+
+statement ok
+RESET ALL
+
+query T
+SHOW transaction_isolation
+----
+read committed
+
+statement ok
+COMMIT

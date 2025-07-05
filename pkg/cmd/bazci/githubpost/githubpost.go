@@ -60,14 +60,12 @@ func DefaultFormatter(ctx context.Context, f Failure) (issues.IssueFormatter, is
 	repro := fmt.Sprintf("./dev test ./pkg/%s --race --stress -f %s",
 		trimPkg(f.packageName), f.testName)
 
-	var projColID int
 	var mentions []string
 	var labels []string
 	if os.Getenv("SKIP_LABEL_TEST_FAILURE") == "" {
 		labels = append(labels, issues.DefaultLabels...)
 	}
 	if len(teams) > 0 {
-		projColID = teams[0].TriageColumnID
 		for _, tm := range teams {
 			if !tm.SilenceMentions {
 				var hasAliases bool
@@ -81,9 +79,7 @@ func DefaultFormatter(ctx context.Context, f Failure) (issues.IssueFormatter, is
 					mentions = append(mentions, "@"+string(tm.Name()))
 				}
 			}
-			if tm.Label != "" {
-				labels = append(labels, tm.Label)
-			}
+			labels = append(labels, tm.Labels()...)
 		}
 	}
 	return issues.UnitTestFormatter, issues.PostRequest{
@@ -93,7 +89,6 @@ func DefaultFormatter(ctx context.Context, f Failure) (issues.IssueFormatter, is
 		Artifacts:       "/", // best we can do for unit tests
 		HelpCommand:     issues.UnitTestHelpCommand(repro),
 		MentionOnCreate: mentions,
-		ProjectColumnID: projColID,
 		Labels:          labels,
 	}
 }
@@ -757,4 +752,13 @@ func postGeneralFailureImpl(logs string, fileIssue func(context.Context, Failure
 		log.Println(err) // keep going
 	}
 
+}
+
+// MicrobenchmarkFailure creates a Failure struct for a microbenchmark failure.
+func MicrobenchmarkFailure(packageName string, benchmarkName string, logs string) Failure {
+	return Failure{
+		packageName: packageName,
+		testName:    benchmarkName,
+		testMessage: logs,
+	}
 }

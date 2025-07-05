@@ -434,7 +434,7 @@ func makePGPrivilegeInquiryDef(
 					user = username.MakeSQLUsernameFromPreNormalizedString(userS)
 					if user.Undefined() {
 						if _, ok := arg.(*tree.DOid); ok {
-							// Postgres returns falseifn no matching user is
+							// Postgres returns false if no matching user is
 							// found when given an OID.
 							return tree.DBoolFalse, nil
 						}
@@ -571,7 +571,11 @@ func makeCreateRegDef(typ *types.T) builtinDefinition {
 }
 
 func makeToRegOverload(typ *types.T, helpText string) builtinDefinition {
-	return makeBuiltin(tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+	return makeBuiltin(
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true,
+		},
 		tree.Overload{
 			Types: tree.ParamTypes{
 				{Name: "text", Typ: types.String},
@@ -918,7 +922,10 @@ var pgBuiltins = map[string]builtinDefinition{
 	// none.
 	// https://www.postgresql.org/docs/11/functions-info.html
 	"pg_my_temp_schema": makeBuiltin(
-		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
 		tree.Overload{
 			Types:      tree.ParamTypes{},
 			ReturnType: tree.FixedReturnType(types.Oid),
@@ -951,7 +958,10 @@ var pgBuiltins = map[string]builtinDefinition{
 	// session's temporary schema.
 	// https://www.postgresql.org/docs/11/functions-info.html
 	"pg_is_other_temp_schema": makeBuiltin(
-		tree.FunctionProperties{Category: builtinconstants.CategorySystemInfo},
+		tree.FunctionProperties{
+			Category:         builtinconstants.CategorySystemInfo,
+			DistsqlBlocklist: true, // applicable only on the gateway
+		},
 		tree.Overload{
 			Types:      tree.ParamTypes{{Name: "oid", Typ: types.Oid}},
 			ReturnType: tree.FixedReturnType(types.Bool),
@@ -1860,6 +1870,35 @@ var pgBuiltins = map[string]builtinDefinition{
 			// All users have USAGE privileges to all types.
 			_ = privs
 			return eval.HasPrivilege, nil
+		},
+	),
+
+	"has_system_privilege": makePGPrivilegeInquiryDef(
+		"system",
+		paramTypeOpts{},
+		func(ctx context.Context, evalCtx *eval.Context, args tree.Datums, user username.SQLUsername) (eval.HasAnyPrivilegeResult, error) {
+			// Build the privilege map dynamically from GlobalPrivileges so that
+			// this function automatically picks up new privileges as they are added.
+			m := make(privMap)
+			for _, priv := range privilege.GlobalPrivileges {
+				// ALL is not a valid input for this function.
+				if priv == privilege.ALL {
+					continue
+				}
+				privName := strings.ToUpper(string(priv.DisplayName()))
+				m[privName] = privilege.Privilege{Kind: priv}
+				m[privName+" WITH GRANT OPTION"] = privilege.Privilege{Kind: priv, GrantOption: true}
+			}
+
+			privs, err := parsePrivilegeStr(args[0], m)
+			if err != nil {
+				return eval.HasNoPrivilege, err
+			}
+
+			specifier := eval.HasPrivilegeSpecifier{
+				IsGlobalPrivilege: true,
+			}
+			return evalCtx.Planner.HasAnyPrivilegeForSpecifier(ctx, specifier, user, privs)
 		},
 	),
 

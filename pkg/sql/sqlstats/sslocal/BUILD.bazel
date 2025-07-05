@@ -4,6 +4,7 @@ go_library(
     name = "sslocal",
     srcs = [
         "cluster_settings.go",
+        "doc.go",
         "sql_stats.go",
         "sql_stats_ingestor.go",
         "sslocal_iterator.go",
@@ -39,6 +40,7 @@ go_test(
     srcs = [
         "iterator_test.go",
         "main_test.go",
+        "reported_sql_stats_test.go",
         "sql_stats_ingester_test.go",
         "sql_stats_test.go",
     ],
@@ -67,7 +69,6 @@ go_test(
         "//pkg/sql/sessiondata",
         "//pkg/sql/sessionphase",
         "//pkg/sql/sqlstats",
-        "//pkg/sql/sqlstats/insights",
         "//pkg/sql/sqlstats/persistedsqlstats/sqlstatstestutil",
         "//pkg/sql/sqlstats/ssmemstorage",
         "//pkg/testutils",
@@ -83,6 +84,7 @@ go_test(
         "//pkg/util/stop",
         "//pkg/util/syncutil",
         "//pkg/util/timeutil",
+        "@com_github_cockroachdb_errors//:errors",
         "@com_github_cockroachdb_redact//:redact",
         "@com_github_jackc_pgx_v5//:pgx",
         "@com_github_stretchr_testify//require",

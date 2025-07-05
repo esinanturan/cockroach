@@ -10,6 +10,7 @@ import (
 	"fmt"
 
 	"github.com/cockroachdb/cockroach/pkg/rpc"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/server/authserver"
 	"github.com/cockroachdb/cockroach/pkg/server/telemetry"
 	"github.com/cockroachdb/cockroach/pkg/ts"
@@ -69,13 +70,14 @@ func configureGRPCGateway(
 		gwruntime.WithMarshalerOption(httputil.AltProtoContentType, protopb),
 		gwruntime.WithOutgoingHeaderMatcher(authserver.AuthenticationHeaderMatcher),
 		gwruntime.WithMetadata(authserver.TranslateHTTPAuthInfoToGRPCMetadata),
+		gwruntime.WithMetadata(rpc.MarkGatewayRequest),
 	)
 	gwCtx, gwCancel := context.WithCancel(ambientCtx.AnnotateCtx(context.Background()))
 	stopper.AddCloser(stop.CloserFn(gwCancel))
 
 	// Eschew `(*rpc.Context).GRPCDial` to avoid unnecessary moving parts on the
 	// uniquely in-process connection.
-	dialOpts, err := rpcContext.GRPCDialOptions(ctx, GRPCAddr, rpc.DefaultClass)
+	dialOpts, err := rpcContext.GRPCDialOptions(ctx, GRPCAddr, rpcbase.DefaultClass)
 	if err != nil {
 		return nil, nil, nil, err
 	}

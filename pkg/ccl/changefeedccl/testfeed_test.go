@@ -178,6 +178,9 @@ func (t seenTrackerMap) markSeen(m *cdctest.TestFeedMessage) (isNew bool) {
 		// The second time we see a duplicated message, this field is not
 		// necessarily the same, so we remove it before marking it as seen.
 		delete(valueMap, "ts_ns")
+		// It's usually not necessary to delete the op field, but in the case of schema backfills
+		// the op is set to `u`, which can cause duplicates to surface in tests if the original was a `c` (likely).
+		delete(valueMap, "op")
 
 		if marshalledValue, err := gojson.Marshal(valueMap); err == nil {
 			normalizedValue = marshalledValue
@@ -411,6 +414,8 @@ type jobFeed struct {
 		syncutil.Mutex
 		terminalErr error
 	}
+
+	forcedEnriched bool
 }
 
 var _ cdctest.EnterpriseTestFeed = (*jobFeed)(nil)
@@ -425,6 +430,14 @@ func newJobFeed(db *gosql.DB, wrapper wrapSinkFn) *jobFeed {
 
 type jobFailedMarker interface {
 	jobFailed(err error)
+}
+
+func (f *jobFeed) ForcedEnriched() bool {
+	return f.forcedEnriched
+}
+
+func (f *jobFeed) SetForcedEnriched(forced bool) {
+	f.forcedEnriched = forced
 }
 
 // jobFailed marks this job as failed.
@@ -548,8 +561,8 @@ func (f *jobFeed) HighWaterMark() (hlc.Timestamp, error) {
 	return hwm, nil
 }
 
-// TickHighWaterMark implements the TestFeed interface.
-func (f *jobFeed) TickHighWaterMark(minHWM hlc.Timestamp) error {
+// WaitForHighWaterMark implements the TestFeed interface.
+func (f *jobFeed) WaitForHighWaterMark(minHWM hlc.Timestamp) error {
 	return testutils.SucceedsWithinError(func() error {
 		current, err := f.HighWaterMark()
 		if err != nil {
@@ -559,7 +572,7 @@ func (f *jobFeed) TickHighWaterMark(minHWM hlc.Timestamp) error {
 			return nil
 		}
 		return errors.Newf("waiting to tick: current=%s min=%s", current, minHWM)
-	}, 10*time.Second)
+	}, timeout())
 }
 
 // FetchTerminalJobErr retrieves the error message from changefeed job.
@@ -1732,6 +1745,10 @@ func (c *fakeKafkaClient) Close() error {
 	return nil
 }
 
+func (c *fakeKafkaClient) LeastLoadedBroker() *sarama.Broker {
+	return nil
+}
+
 func (c *fakeKafkaClient) Config() *sarama.Config {
 	return c.config
 }
@@ -1762,6 +1779,8 @@ func (p *asyncIgnoreCloseProducer) Close() error {
 type sinkKnobs struct {
 	// kafkaInterceptor is only valid for the v1 kafka sink.
 	kafkaInterceptor func(m *sarama.ProducerMessage, client kafkaClient) error
+	// BypassConnectionCheck is used for v1 kafka sink.
+	bypassKafkaV1ConnectionCheck bool
 }
 
 // fakeKafkaSink is a sink that arranges for fake kafka client and producer
@@ -1782,6 +1801,7 @@ func (s *fakeKafkaSink) Dial() error {
 		client := &fakeKafkaClient{config}
 		return client, nil
 	}
+	kafka.knobs.BypassConnectionCheck = s.knobs.bypassKafkaV1ConnectionCheck
 
 	kafka.knobs.OverrideAsyncProducerFromClient = func(client kafkaClient) (sarama.AsyncProducer, error) {
 		// The producer we give to kafka sink ignores close call.
@@ -1933,13 +1953,14 @@ func mustBeKafkaFeedFactory(f cdctest.TestFeedFactory) *kafkaFeedFactory {
 	}
 }
 
-// makeKafkaFeedFactory returns a TestFeedFactory implementation using the `kafka` uri.
-func makeKafkaFeedFactory(
-	t *testing.T, srvOrCluster interface{}, rootDB *gosql.DB,
+func makeKafkaFeedFactoryWithConnectionCheck(
+	t *testing.T, srvOrCluster interface{}, rootDB *gosql.DB, forceKafkaV1ConnectionCheck bool,
 ) cdctest.TestFeedFactory {
 	s, injectables := getInjectables(srvOrCluster)
 	return &kafkaFeedFactory{
-		knobs: &sinkKnobs{},
+		knobs: &sinkKnobs{
+			bypassKafkaV1ConnectionCheck: !forceKafkaV1ConnectionCheck,
+		},
 		enterpriseFeedFactory: enterpriseFeedFactory{
 			s:      s,
 			db:     rootDB,
@@ -1948,6 +1969,13 @@ func makeKafkaFeedFactory(
 		},
 		t: t,
 	}
+}
+
+// makeKafkaFeedFactory returns a TestFeedFactory implementation using the `kafka` uri.
+func makeKafkaFeedFactory(
+	t *testing.T, srvOrCluster interface{}, rootDB *gosql.DB,
+) cdctest.TestFeedFactory {
+	return makeKafkaFeedFactoryWithConnectionCheck(t, srvOrCluster, rootDB, false)
 }
 
 func exprAsString(expr tree.Expr) (string, error) {
@@ -2316,12 +2344,25 @@ func isResolvedTimestamp(message []byte) (bool, error) {
 func extractTopicFromJSONValue(
 	envelopeType changefeedbase.EnvelopeType, wrapped []byte,
 ) (topic string, value []byte, err error) {
+	// Enriched envelopes dont have the topic in them per se but they have the table name so use that.
+	if envelopeType == changefeedbase.OptEnvelopeEnriched {
+		var parsed map[string]any
+		if err := gojson.Unmarshal(wrapped, &parsed); err != nil {
+			return "", nil, err
+		}
+		source, ok := parsed["source"]
+		if !ok {
+			return "", wrapped, nil
+		}
+		topic = source.(map[string]any)["table_name"].(string)
+		return topic, wrapped, nil
+	}
+
 	var topicRaw gojson.RawMessage
 	topicRaw, value, err = extractFieldFromJSONValue("topic", envelopeType, wrapped)
 	if err != nil {
 		return "", nil, err
 	}
-	// TODO: this, or skip this method for enriched
 	if topicRaw == nil {
 		return "", value, nil
 	}

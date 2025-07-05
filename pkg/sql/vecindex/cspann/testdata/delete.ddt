@@ -94,8 +94,7 @@ vec7: (2, 8)
     │
     └───• vec4 (-4, 5)
 
-# Test case where initial search fails to find vector to delete and it must be
-# retried.
+# Test case where search fails to find vector to delete.
 delete
 vec1: (2, 4)
 ----
@@ -116,6 +115,7 @@ vec1: (2, 4)
     │
     ├───• 4 (1, -2)
     │   │
+    │   ├───• vec1 (MISSING)
     │   └───• vec6 (1, -6)
     │
     └───• 2 (5.5, 3.5)
@@ -141,6 +141,9 @@ vec6
 └───• 9 (3.25, 0.75)
     │
     ├───• 4 (1, -2)
+    │   │
+    │   └───• vec1 (MISSING)
+    │
     └───• 2 (5.5, 3.5)
         │
         ├───• vec3 (4, 3)
@@ -194,7 +197,7 @@ vec3
 search max-results=1
 (4, 3)
 ----
-vec4: 5 (centroid=1.12)
+vec4: 5
 4 leaf vectors, 6 vectors, 4 full vectors, 3 partitions
 
 # Again, with higher max results.
@@ -203,9 +206,9 @@ vec4: 5 (centroid=1.12)
 search max-results=2
 (4, 3)
 ----
-vec4: 5 (centroid=1.12)
-vec1: 10 (centroid=1.58)
-vec2: 10 (centroid=1.12)
+vec4: 5
+vec1: 10
+vec2: 10
 3 leaf vectors, 5 vectors, 3 full vectors, 3 partitions
 
 # Vector should now be gone from the index.
@@ -288,7 +291,7 @@ vec3
 search max-results=1
 (4, 3)
 ----
-vec4: 5 (centroid=7.07)
+vec4: 5
 4 leaf vectors, 4 vectors, 4 full vectors, 1 partitions
 
 # Split should detect missing vector and remove it.
@@ -331,3 +334,93 @@ search max-results=1 beam-size=1
 format-tree
 ----
 • 1 (0, 0)
+
+# ----------------------------------------------------------------------
+# Use Cosine distance metric.
+# ----------------------------------------------------------------------
+new-index distance-metric=Cosine min-partition-size=1 max-partition-size=4 beam-size=2
+vec1: (1, 2)
+vec2: (7, 4)
+vec3: (4, 3)
+vec4: (-4, 5)
+vec5: (1, 11)
+vec6: (1, -6)
+vec7: (2, 8)
+----
+• 1 (0, 0)
+│
+├───• 2 (0.8341, 0.5481)
+│   │
+│   ├───• vec3 (4, 3)
+│   ├───• vec2 (7, 4)
+│   └───• vec6 (1, -6)
+│
+├───• 5 (-0.2671, 0.8884)
+│   │
+│   ├───• vec5 (1, 11)
+│   └───• vec4 (-4, 5)
+│
+└───• 4 (0.3449, 0.9323)
+    │
+    ├───• vec1 (1, 2)
+    └───• vec7 (2, 8)
+
+delete
+vec1
+vec2
+vec3
+vec4
+vec5
+vec6
+vec7
+----
+• 1 (0, 0)
+│
+├───• 2 (0.8341, 0.5481)
+├───• 5 (-0.2671, 0.8884)
+└───• 4 (0.3449, 0.9323)
+
+# ----------------------------------------------------------------------
+# Use InnerProduct distance metric.
+# ----------------------------------------------------------------------
+new-index distance-metric=InnerProduct min-partition-size=1 max-partition-size=4 beam-size=2
+vec1: (1, 2)
+vec2: (7, 4)
+vec3: (4, 3)
+vec4: (-4, 5)
+vec5: (1, 11)
+vec6: (1, -6)
+vec7: (2, 8)
+----
+• 1 (0, 0)
+│
+├───• 2 (5.5, 3.5)
+│   │
+│   ├───• vec3 (4, 3)
+│   ├───• vec2 (7, 4)
+│   └───• vec6 (1, -6)
+│
+├───• 5 (-1.5, 3.5)
+│   │
+│   ├───• vec4 (-4, 5)
+│   └───• vec1 (1, 2)
+│
+└───• 4 (1.5, 9.5)
+    │
+    ├───• vec7 (2, 8)
+    └───• vec5 (1, 11)
+
+delete
+vec1
+vec2
+vec3
+vec4
+vec5
+vec6
+vec7
+----
+• 1 (0, 0)
+│
+├───• 2 (5.5, 3.5)
+├───• 5 (-1.5, 3.5)
+└───• 4 (1.5, 9.5)

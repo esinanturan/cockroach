@@ -667,6 +667,32 @@ message LocalOnlySessionData {
   // PropagateAdmissionHeaderToLeafTransactions, when true, causes leaf
   // transactions to inherit the admission header from the root transaction.
   bool propagate_admission_header_to_leaf_transactions = 169;
+  // OptimizerUseExistsFilterHoistRule, when true, causes the optimizer to apply
+  // the HoistUnboundFilterFromExistsSubquery rule to EXISTS conditions.
+  bool optimizer_use_exists_filter_hoist_rule = 170;
+  // InitialRetryBackoffForReadCommitted controls the initial backoff
+  // duration for automatic retries of statements in explicit READ COMMITTED
+  // transactions that see a transaction retry error. 0 disables backoff.
+  int64 initial_retry_backoff_for_read_committed = 171 [(gogoproto.casttype) = "time.Duration"];
+  // UseImprovedRoutineDependencyTracking, when true, causes newly-created
+  // routines to only consider user-specified target columns when determining the
+  // dependencies of an INSERT statement in a routine.
+  bool use_improved_routine_dependency_tracking = 172;
+  // OptimizerDisableCrossRegionCascadeFastPathForRBRTables, when true, causes the optimizer
+  // to unconditionally attempt to apply the fast path for cascading deletes.
+  // See also #146705.
+  bool optimizer_disable_cross_region_cascade_fast_path_for_rbr_tables = 173 [(gogoproto.customname) = "OptimizerDisableCrossRegionCascadeFastPathForRBRTables"];
+  // DistSQLUseReducedLeafWriteSets, when true, indicates that the DistSQL
+  // runner should use the reduced write sets when constructing LeafTxns.
+  bool distsql_use_reduced_leaf_write_sets = 174 [(gogoproto.customname) = "DistSQLUseReducedLeafWriteSets"];
+  // UseProcTxnControlExtendedProtocolFix, when true, enables the fix for
+  // PL/pgSQL transaction control statements (COMMIT, ROLLBACK) when the stored
+  // procedure is executed via a portal in the extended wire protocol.
+  bool use_proc_txn_control_extended_protocol_fix = 175;
+  // EnableScrubJob controls if a job is initiated when the EXPERIMENTAL SCRUB
+  // command is used.
+  bool enable_scrub_job = 176;
+
   ///////////////////////////////////////////////////////////////////////////
   // WARNING: consider whether a session parameter you're adding needs to  //
   // be propagated to the remote nodes. If so, that parameter should live  //

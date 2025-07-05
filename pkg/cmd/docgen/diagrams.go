@@ -576,6 +576,29 @@ var specs = []stmtSpec{
 		unlink:  []string{"view_name", "view_new_name"},
 	},
 	{
+		name:    "alter_virtual_cluster",
+		stmt:    "alter_virtual_cluster_stmt",
+		inline:  []string{"virtual_cluster", "replication_options_list", "alter_virtual_cluster_capability_stmt", "alter_virtual_cluster_replication_stmt", "alter_virtual_cluster_rename_stmt", "alter_virtual_cluster_service_stmt"},
+		replace: map[string]string{"'ON' d_expr": "'ON' physical_cluster", "d_expr": "virtual_cluster_spec", "a_expr": "timestamp"},
+		unlink:  []string{"physical_cluster", "virtual_cluster_spec", "timestamp"},
+	},
+	{
+		name: "alter_virtual_cluster_capability",
+		stmt: "alter_virtual_cluster_capability_stmt",
+	},
+	{
+		name: "alter_virtual_cluster_replication",
+		stmt: "alter_virtual_cluster_replication_stmt",
+	},
+	{
+		name: "alter_virtual_cluster_rename",
+		stmt: "alter_virtual_cluster_rename_stmt",
+	},
+	{
+		name: "alter_virtual_cluster_service",
+		stmt: "alter_virtual_cluster_service_stmt",
+	},
+	{
 		name:    "alter_zone_database_stmt",
 		inline:  []string{"set_zone_config", "var_set_list"},
 		replace: map[string]string{"var_name": "variable", "var_value": "value"},
@@ -652,6 +675,16 @@ var specs = []stmtSpec{
 		stmt:    "stmt_block",
 		replace: map[string]string{"	stmt": "	'CREATE' 'TABLE' table_name '(' column_name column_type 'CHECK' '(' check_expr ')' ( column_constraints | ) ( ',' ( column_table_def ( ',' column_table_def )* ) | ) ( table_constraints | ) ')' ')'"},
 		unlink:  []string{"table_name", "column_name", "column_type", "check_expr", "column_constraints", "table_constraints"},
+	},
+	{
+		name:   "check_external_connection",
+		stmt:   "check_external_connection_stmt",
+		inline: []string{"opt_with_check_external_connection_options_list"},
+		exclude: []*regexp.Regexp{
+			regexp.MustCompile("'WITH' 'OPTIONS'"),
+		},
+		replace: map[string]string{"string_or_placeholder": "connection_uri"},
+		unlink:  []string{"connection_uri"},
 	},
 	{
 		name:    "check_table_level",
@@ -749,9 +782,10 @@ var specs = []stmtSpec{
 		unlink:  []string{"non_reserved_word_or_sconst", "signed_iconst", "encoding", "limit"},
 		nosplit: true,
 	},
+	// TODO: Add new database level changefeed syntax here when it is ready to be released (#149347).
 	{
 		name:   "create_changefeed_stmt",
-		inline: []string{"changefeed_targets", "opt_changefeed_sink", "opt_with_options", "kv_option_list", "kv_option"},
+		inline: []string{"changefeed_table_targets", "opt_changefeed_sink", "opt_with_options", "kv_option_list", "kv_option"},
 		replace: map[string]string{
 			"table_option":                 "table_name",
 			"'INTO' string_or_placeholder": "'INTO' sink",
@@ -763,9 +797,10 @@ var specs = []stmtSpec{
 		unlink: []string{"table_name", "sink", "option", "value"},
 	},
 	{
-		name:    "create_external_connection_stmt",
-		replace: map[string]string{"label_spec": "connection_name", "string_or_placeholder": "connection_URI"},
-		unlink:  []string{"connection_name", "connection_URI"},
+		name:    "create_external_connection",
+		stmt:    "create_external_connection_stmt",
+		replace: map[string]string{"label_spec": "connection_name", "string_or_placeholder": "connection_uri"},
+		unlink:  []string{"connection_name", "connection_uri"},
 	},
 	{
 		name:   "create_index_stmt",
@@ -805,7 +840,7 @@ var specs = []stmtSpec{
 	},
 	{
 		name:   "create_schedule_for_changefeed_stmt",
-		inline: []string{"opt_with_schedule_options", "changefeed_targets", "table_pattern", "opt_where_clause", "changefeed_target_expr", "cron_expr"},
+		inline: []string{"opt_with_schedule_options", "changefeed_table_targets", "table_pattern", "opt_where_clause", "changefeed_target_expr", "cron_expr"},
 		replace: map[string]string{
 			"schedule_label_spec":   "( 'IF NOT EXISTS' | )  schedule_label",
 			"changefeed_sink":       "( 'INTO' changefeed_sink )",
@@ -913,6 +948,10 @@ var specs = []stmtSpec{
 			"opt_role_options":                  "OPTIONS",
 			"string_or_placeholder  'PASSWORD'": "name 'PASSWORD'",
 			"'PASSWORD' string_or_placeholder":  "'PASSWORD' password"},
+	},
+	{
+		name:   "declare_cursor_stmt",
+		inline: []string{"opt_hold"},
 	},
 	{
 		name: "default_value_column_level",

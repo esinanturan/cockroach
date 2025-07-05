@@ -3200,30 +3200,39 @@ func TestLeaseDescriptorRangeFeedFailure(t *testing.T) {
 	var srv serverutils.TestClusterInterface
 	var enableAfterStageKnob atomic.Bool
 	var rangeFeedResetChan chan struct{}
+	grp := ctxgroup.WithContext(ctx)
 	srv = serverutils.StartCluster(t, 3, base.TestClusterArgs{
 		ServerArgs: base.TestServerArgs{
 			Settings: settings,
 			Knobs: base.TestingKnobs{
 				SQLDeclarativeSchemaChanger: &scexec.TestingKnobs{
 					BeforeStage: func(p scplan.Plan, stageIdx int) error {
-						// Once this stage completes, we can "resume" the range feed,
-						// so the update is detected.
-						if p.Params.ExecutionPhase == scop.PostCommitPhase &&
-							enableAfterStageKnob.Load() &&
-							strings.Contains(p.Statements[0].Statement, "ALTER TABLE t1 ADD COLUMN j INT DEFAULT 64") {
-							rangeFeedResetChan = srv.ApplicationLayer(1).LeaseManager().(*lease.Manager).TestingSetDisableRangeFeedCheckpointFn(true)
+						// Skip if the knob is disabled
+						if !enableAfterStageKnob.Load() ||
+							!strings.Contains(p.Statements[0].Statement, "ALTER TABLE t1 ADD COLUMN j INT8 DEFAULT 64") ||
+							p.Params.ExecutionPhase != scop.PostCommitPhase {
+							return nil
 						}
-						return nil
-					},
-					AfterStage: func(p scplan.Plan, stageIdx int) error {
+						foundDescriptorDrop := false
+						// Ensure we have a descriptor drop that will be executed before
+						// we mess with the range feed.
+						for _, op := range p.Stages[stageIdx].EdgeOps {
+							if _, ok := op.(*scop.MarkDescriptorAsDropped); ok {
+								foundDescriptorDrop = true
+							}
+						}
 						// Once this stage completes, we can "resume" the range feed,
 						// so the update is detected.
-						if p.Params.ExecutionPhase == scop.PostCommitPhase &&
-							enableAfterStageKnob.Load() &&
-							strings.Contains(p.Statements[0].Statement, "ALTER TABLE t1 ADD COLUMN j INT DEFAULT 64") {
-							<-rangeFeedResetChan
-							srv.ApplicationLayer(1).LeaseManager().(*lease.Manager).TestingSetDisableRangeFeedCheckpointFn(false)
+						if foundDescriptorDrop {
+							rangeFeedResetChan = srv.ApplicationLayer(1).LeaseManager().(*lease.Manager).TestingSetDisableRangeFeedCheckpointFn(true)
 							enableAfterStageKnob.Swap(false)
+							grp.Go(func() error {
+								// Once this channel is closed we know for certain the range feed has
+								// recovered. Allow updates so that descriptors are refreshed and purged.
+								<-rangeFeedResetChan
+								srv.ApplicationLayer(1).LeaseManager().(*lease.Manager).TestingSetDisableRangeFeedCheckpointFn(false)
+								return nil
+							})
 						}
 						return nil
 					},
@@ -3238,15 +3247,20 @@ func TestLeaseDescriptorRangeFeedFailure(t *testing.T) {
 	// detects a problem.
 	defer srv.ApplicationLayer(1).LeaseManager().(*lease.Manager).TestingSetDisableRangeFeedCheckpointFn(false)
 	firstConn.Exec(t, "CREATE TABLE t1(n int)")
+	firstConn.Exec(t, "CREATE TABLE t2(n int)")
 	require.NoError(t, srv.WaitForFullReplication())
 	tx := secondConn.Begin(t)
 	_, err := tx.Exec("SELECT * FROM t1;")
+	require.NoError(t, err)
+	_, err = tx.Exec("SELECT * FROM t2;")
 	require.NoError(t, err)
 	// This schema change will wait for the connection on
 	// node 1 to release the lease. Because the rangefeed is
 	// disabled it will never know about the new version.
 	enableAfterStageKnob.Store(true)
-	firstConn.Exec(t, "ALTER TABLE t1 ADD COLUMN j INT DEFAULT 64")
+	firstConn.Exec(t, "SET autocommit_before_ddl=false")
+	firstConn.Exec(t, "SET use_declarative_schema_changer='unsafe_always'")
+	firstConn.Exec(t, "ALTER TABLE t1 ADD COLUMN j INT DEFAULT 64; DROP TABLE t2;")
 	_, err = tx.Exec("INSERT INTO t1 VALUES (32)")
 	if err != nil {
 		t.Fatal(err)
@@ -3260,6 +3274,8 @@ func TestLeaseDescriptorRangeFeedFailure(t *testing.T) {
 			t.Fatal("no error encountered")
 		}
 	}
+	require.NoError(t, grp.Wait())
+	require.Falsef(t, enableAfterStageKnob.Load(), "testing knob was not hit")
 }
 
 // TestLeaseTableWriteFailure is used to ensure that sqlliveness heart-beating
