@@ -37,6 +37,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tochar"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/grpcinterceptor"
+	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingutil"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/logtags"
 	"github.com/cockroachdb/redact"
@@ -95,6 +96,12 @@ func NewServer(
 	ds.remoteFlowRunner.Init(ds.Metrics)
 
 	return ds
+}
+
+type drpcServerImpl ServerImpl
+
+func (ds *ServerImpl) AsDRPCServer() execinfrapb.DRPCDistSQLServer {
+	return (*drpcServerImpl)(ds)
 }
 
 // Start launches workers for the server.
@@ -160,14 +167,22 @@ func (ds *ServerImpl) setDraining(drain bool) error {
 	return nil
 }
 
+type onFlowCleanupFn func()
+
+func (f onFlowCleanupFn) Do() {
+	if f != nil {
+		f()
+	}
+}
+
 // setupFlow creates a Flow.
-//
-//   - reserved: specifies the upfront memory reservation that the flow takes
-//     ownership of. This account is already closed if an error is returned or
-//     will be closed through Flow.Cleanup.
-//
-//   - localState: specifies if the flow runs entirely on this node and, if it
-//     does, specifies the txn and other attributes.
+// - reserved: specifies the upfront memory reservation that the flow takes
+// ownership of. This account is already closed if an error is returned or will
+// be closed through Flow.Cleanup.
+// - localState: specifies if the flow runs entirely on this node and, if it
+// does, specifies the txn and other attributes.
+// - onFlowCleanup, if non-nil, will be called at the end of Flow.Cleanup. It'll
+// also be called if this method returns an error.
 //
 // Note: unless an error is returned, the returned context contains a span that
 // must be finished through Flow.Cleanup.
@@ -180,6 +195,7 @@ func (ds *ServerImpl) setupFlow(
 	rowSyncFlowConsumer execinfra.RowReceiver,
 	batchSyncFlowConsumer execinfra.BatchReceiver,
 	localState LocalState,
+	onFlowCleanup onFlowCleanupFn,
 ) (retCtx context.Context, _ flowinfra.Flow, _ execopnode.OpChains, retErr error) {
 	var sp *tracing.Span                       // will be Finish()ed by Flow.Cleanup()
 	var monitor, diskMonitor *mon.BytesMonitor // will be closed in Flow.Cleanup()
@@ -198,6 +214,7 @@ func (ds *ServerImpl) setupFlow(
 				onFlowCleanupEnd(ctx)
 			} else {
 				reserved.Close(ctx)
+				onFlowCleanup.Do()
 			}
 			// We finish the span after performing other cleanup in case that
 			// cleanup accesses the context with the span.
@@ -294,6 +311,7 @@ func (ds *ServerImpl) setupFlow(
 			onFlowCleanupEnd = func(ctx context.Context) {
 				localEvalCtx.Txn = origTxn
 				reserved.Close(ctx)
+				onFlowCleanup.Do()
 			}
 			// Update the Txn field early (before f.SetTxn() below) since some
 			// processors capture the field in their constructor (see #41992).
@@ -301,11 +319,13 @@ func (ds *ServerImpl) setupFlow(
 		} else {
 			onFlowCleanupEnd = func(ctx context.Context) {
 				reserved.Close(ctx)
+				onFlowCleanup.Do()
 			}
 		}
 	} else {
 		onFlowCleanupEnd = func(ctx context.Context) {
 			reserved.Close(ctx)
+			onFlowCleanup.Do()
 		}
 		if localState.IsLocal {
 			return nil, nil, nil, errors.AssertionFailedf(
@@ -354,6 +374,7 @@ func (ds *ServerImpl) setupFlow(
 		}
 		evalCtx.SetStmtTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.StmtTimestampNanos))
 		evalCtx.SetTxnTimestamp(timeutil.Unix(0 /* sec */, req.EvalContext.TxnTimestampNanos))
+		evalCtx.TestingKnobs.ForceProductionValues = req.EvalContext.TestingKnobsForceProductionValues
 	}
 
 	// Create the FlowCtx for the flow.
@@ -384,7 +405,7 @@ func (ds *ServerImpl) setupFlow(
 
 	if !f.IsLocal() {
 		bld := logtags.BuildBuffer()
-		bld.Add("f", flowCtx.ID.Short().String())
+		bld.Add("f", flowCtx.ID.Short())
 		if req.JobTag != "" {
 			bld.Add("job", req.JobTag)
 		}
@@ -572,7 +593,7 @@ func (ds *ServerImpl) SetupLocalSyncFlow(
 ) (context.Context, flowinfra.Flow, execopnode.OpChains, error) {
 	return ds.setupFlow(
 		ctx, tracing.SpanFromContext(ctx), parentMonitor, &mon.BoundAccount{}, /* reserved */
-		req, output, batchOutput, localState,
+		req, output, batchOutput, localState, nil, /* onFlowCleanup */
 	)
 }
 
@@ -592,13 +613,13 @@ func (ds *ServerImpl) setupSpanForIncomingRPC(
 		// It's not expected to have a span in the context since the gRPC server
 		// interceptor that generally opens spans exempts this particular RPC. Note
 		// that this method is not called for flows local to the gateway.
-		return tr.StartSpanCtx(ctx, grpcinterceptor.SetupFlowMethodName,
+		return tr.StartSpanCtx(ctx, tracingutil.SetupFlowMethodName,
 			tracing.WithParent(parentSpan),
 			tracing.WithServerSpanKind)
 	}
 
 	if !req.TraceInfo.Empty() {
-		return tr.StartSpanCtx(ctx, grpcinterceptor.SetupFlowMethodName,
+		return tr.StartSpanCtx(ctx, tracingutil.SetupFlowMethodName,
 			tracing.WithRemoteParentFromTraceInfo(req.TraceInfo),
 			tracing.WithServerSpanKind)
 	}
@@ -608,9 +629,16 @@ func (ds *ServerImpl) setupSpanForIncomingRPC(
 	if err != nil {
 		log.Warningf(ctx, "error extracting tracing info from gRPC: %s", err)
 	}
-	return tr.StartSpanCtx(ctx, grpcinterceptor.SetupFlowMethodName,
+	return tr.StartSpanCtx(ctx, tracingutil.SetupFlowMethodName,
 		tracing.WithRemoteParentFromSpanMeta(remoteParent),
 		tracing.WithServerSpanKind)
+}
+
+// SetupFlow is part of the execinfrapb.DRPCDistSQLServer interface.
+func (ds *drpcServerImpl) SetupFlow(
+	ctx context.Context, req *execinfrapb.SetupFlowRequest,
+) (*execinfrapb.SimpleResponse, error) {
+	return (*ServerImpl)(ds).SetupFlow(ctx, req)
 }
 
 // SetupFlow is part of the execinfrapb.DistSQLServer interface.
@@ -625,10 +653,10 @@ func (ds *ServerImpl) SetupFlow(
 	// Note: the passed context will be canceled when this RPC completes, so we
 	// can't associate it with the flow since it outlives the RPC.
 	ctx = ds.AnnotateCtx(context.Background())
-	// Ensure that the flow respects the node being shut down. Note that since
-	// the flow outlives the RPC, we cannot defer the cancel function, so we
-	// simply ignore it.
-	ctx, _ = ds.Stopper.WithCancelOnQuiesce(ctx)
+	// Ensure that the flow respects the node being shut down. We can only call
+	// the cancellation function once the flow exits.
+	var cancel context.CancelFunc
+	ctx, cancel = ds.Stopper.WithCancelOnQuiesce(ctx)
 	if err := func() error {
 		// Reserve some memory for this remote flow which is a poor man's
 		// admission control based on the RAM usage.
@@ -640,7 +668,7 @@ func (ds *ServerImpl) SetupFlow(
 		var f flowinfra.Flow
 		ctx, f, _, err = ds.setupFlow(
 			ctx, rpcSpan, ds.memMonitor, &reserved, req, nil, /* rowSyncFlowConsumer */
-			nil /* batchSyncFlowConsumer */, LocalState{},
+			nil /* batchSyncFlowConsumer */, LocalState{}, onFlowCleanupFn(cancel),
 		)
 		// Check whether the RPC context has been canceled indicating that we
 		// actually don't need to run this flow. This can happen when the
@@ -675,6 +703,13 @@ func (ds *ServerImpl) SetupFlow(
 	return &execinfrapb.SimpleResponse{}, nil
 }
 
+// CancelDeadFlows is part of the execinfrapb.DRPCDistSQLServer interface.
+func (ds *drpcServerImpl) CancelDeadFlows(
+	ctx context.Context, req *execinfrapb.CancelDeadFlowsRequest,
+) (*execinfrapb.SimpleResponse, error) {
+	return (*ServerImpl)(ds).CancelDeadFlows(ctx, req)
+}
+
 // CancelDeadFlows is part of the execinfrapb.DistSQLServer interface.
 func (ds *ServerImpl) CancelDeadFlows(
 	ctx context.Context, req *execinfrapb.CancelDeadFlowsRequest,
@@ -685,7 +720,7 @@ func (ds *ServerImpl) CancelDeadFlows(
 }
 
 func (ds *ServerImpl) flowStreamInt(
-	ctx context.Context, stream execinfrapb.DistSQL_FlowStreamServer,
+	ctx context.Context, stream execinfrapb.RPCDistSQL_FlowStreamStream,
 ) error {
 	// Receive the first message.
 	msg, err := stream.Recv()
@@ -719,8 +754,17 @@ func (ds *ServerImpl) flowStreamInt(
 	return streamStrategy.Run(ctx, stream, msg, f)
 }
 
+// FlowStream is part of the execinfrapb.DRPCDistSQLServer interface.
+func (ds *drpcServerImpl) FlowStream(stream execinfrapb.DRPCDistSQL_FlowStreamStream) error {
+	return (*ServerImpl)(ds).flowStream(stream)
+}
+
 // FlowStream is part of the execinfrapb.DistSQLServer interface.
 func (ds *ServerImpl) FlowStream(stream execinfrapb.DistSQL_FlowStreamServer) error {
+	return ds.flowStream(stream)
+}
+
+func (ds *ServerImpl) flowStream(stream execinfrapb.RPCDistSQL_FlowStreamStream) error {
 	ctx := ds.AnnotateCtx(stream.Context())
 	err := ds.flowStreamInt(ctx, stream)
 	if err != nil && log.V(2) {

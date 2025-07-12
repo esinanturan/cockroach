@@ -16,8 +16,22 @@ import (
 
 func (b *Builder) buildCreateView(cv *tree.CreateView, inScope *scope) (outScope *scope) {
 	b.DisableMemoReuse = true
-	preFuncResolver := b.semaCtx.FunctionResolver
-	b.semaCtx.FunctionResolver = nil
+
+	isTemp := resolveTemporaryStatus(cv.Name.ObjectNamePrefix, cv.Persistence)
+	if isTemp {
+		// Postgres allows using `pg_temp` as an alias for the session specific temp
+		// schema. In PG, the following are equivalent:
+		// CREATE TEMP TABLE t <=> CREATE TABLE pg_temp.t <=> CREATE TEMP TABLE pg_temp.t
+		//
+		// The temporary schema is created the first time a session creates a
+		// temporary object, so it is possible to use `pg_temp` in a fully qualified
+		// name when the temporary schema does not exist. To allow the name to be
+		// resolved, we unset the explicitly named schema and set the Persistence to
+		// temporary.
+		cv.Name.ObjectNamePrefix.SchemaName = ""
+		cv.Name.ObjectNamePrefix.ExplicitSchema = false
+		cv.Persistence = tree.PersistenceTemporary
+	}
 
 	// We build the select statement to:
 	//  - check the statement semantically,
@@ -46,7 +60,6 @@ func (b *Builder) buildCreateView(cv *tree.CreateView, inScope *scope) (outScope
 		b.qualifyDataSourceNamesInAST = false
 		delete(b.sourceViews, viewFQString)
 
-		b.semaCtx.FunctionResolver = preFuncResolver
 		switch recErr := recover().(type) {
 		case nil:
 			// No error.
@@ -118,6 +131,7 @@ func (b *Builder) buildCreateView(cv *tree.CreateView, inScope *scope) (outScope
 			Columns:   p,
 			Deps:      b.schemaDeps,
 			TypeDeps:  b.schemaTypeDeps,
+			FuncDeps:  b.schemaFunctionDeps,
 		},
 	)
 	return outScope

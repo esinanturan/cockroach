@@ -370,7 +370,7 @@ type CreateType struct {
 	Variety  CreateTypeVariety
 	// EnumLabels is set when this represents a CREATE TYPE ... AS ENUM statement.
 	EnumLabels EnumValueList
-	// CompositeTypeList is set when this repesnets a CREATE TYPE ... AS ( )
+	// CompositeTypeList is set when this represents a CREATE TYPE ... AS ( )
 	// statement.
 	CompositeTypeList []CompositeTypeElem
 	// IfNotExists is true if IF NOT EXISTS was requested.
@@ -1112,6 +1112,10 @@ type UniqueConstraintTableDef struct {
 	PrimaryKey   bool
 	WithoutIndex bool
 	IfNotExists  bool
+	// FormatAsIndex indicates if the constraint should be formatted as an index
+	// definition. This is needed since indexes support syntax for things like
+	// storage parameters and sharding, while constraints do not.
+	FormatAsIndex bool
 }
 
 // SetName implements the TableDef interface.
@@ -1126,7 +1130,7 @@ func (node *UniqueConstraintTableDef) SetIfNotExists() {
 
 // Format implements the NodeFormatter interface.
 func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
-	if node.Name != "" {
+	if node.Name != "" && !node.FormatAsIndex {
 		ctx.WriteString("CONSTRAINT ")
 		if node.IfNotExists {
 			ctx.WriteString("IF NOT EXISTS ")
@@ -1138,6 +1142,13 @@ func (node *UniqueConstraintTableDef) Format(ctx *FmtCtx) {
 		ctx.WriteString("PRIMARY KEY ")
 	} else {
 		ctx.WriteString("UNIQUE ")
+		if node.FormatAsIndex {
+			ctx.WriteString("INDEX ")
+			if node.Name != "" {
+				ctx.FormatNode(&node.Name)
+				ctx.WriteByte(' ')
+			}
+		}
 	}
 	if node.WithoutIndex {
 		ctx.WriteString("WITHOUT INDEX ")
@@ -1701,7 +1712,7 @@ func (node *SequenceOptions) Format(ctx *FmtCtx) {
 			ctx.WriteString(option.AsIntegerType.SQLString())
 		case SeqOptCycle, SeqOptNoCycle:
 			ctx.WriteString(option.Name)
-		case SeqOptCache, SeqOptCacheNode:
+		case SeqOptCacheNode, SeqOptCacheSession:
 			ctx.WriteString(option.Name)
 			ctx.WriteByte(' ')
 			// TODO(knz): replace all this with ctx.FormatNode if/when
@@ -1798,18 +1809,18 @@ type SequenceOption struct {
 
 // Names of options on CREATE SEQUENCE.
 const (
-	SeqOptAs        = "AS"
-	SeqOptCycle     = "CYCLE"
-	SeqOptNoCycle   = "NO CYCLE"
-	SeqOptOwnedBy   = "OWNED BY"
-	SeqOptCache     = "CACHE"
-	SeqOptCacheNode = "PER NODE CACHE"
-	SeqOptIncrement = "INCREMENT"
-	SeqOptMinValue  = "MINVALUE"
-	SeqOptMaxValue  = "MAXVALUE"
-	SeqOptStart     = "START"
-	SeqOptRestart   = "RESTART"
-	SeqOptVirtual   = "VIRTUAL"
+	SeqOptAs           = "AS"
+	SeqOptCycle        = "CYCLE"
+	SeqOptNoCycle      = "NO CYCLE"
+	SeqOptOwnedBy      = "OWNED BY"
+	SeqOptCacheNode    = "PER NODE CACHE"
+	SeqOptCacheSession = "PER SESSION CACHE"
+	SeqOptIncrement    = "INCREMENT"
+	SeqOptMinValue     = "MINVALUE"
+	SeqOptMaxValue     = "MAXVALUE"
+	SeqOptStart        = "START"
+	SeqOptRestart      = "RESTART"
+	SeqOptVirtual      = "VIRTUAL"
 
 	// Avoid unused warning for constants.
 	_ = SeqOptAs
@@ -1942,6 +1953,28 @@ func (node *CreateRole) Format(ctx *FmtCtx) {
 	}
 }
 
+// ViewOptions represents options for CREATE VIEW statements.
+type ViewOptions struct {
+	SecurityInvoker bool
+}
+
+// Format implements the NodeFormatter interface.
+func (node *ViewOptions) Format(ctx *FmtCtx) {
+	if node.SecurityInvoker {
+		ctx.WriteString("security_invoker = true")
+	} else {
+		ctx.WriteString("security_invoker = false")
+	}
+}
+
+func (node *ViewOptions) doc(p *PrettyCfg) pretty.Doc {
+	if node.SecurityInvoker {
+		return pretty.Text("security_invoker = true")
+	} else {
+		return pretty.Text("security_invoker = false")
+	}
+}
+
 // CreateView represents a CREATE VIEW statement.
 type CreateView struct {
 	Name         TableName
@@ -1949,6 +1982,7 @@ type CreateView struct {
 	AsSource     *Select
 	IfNotExists  bool
 	Persistence  Persistence
+	Options      *ViewOptions
 	Replace      bool
 	Materialized bool
 	WithData     bool
@@ -1982,6 +2016,12 @@ func (node *CreateView) Format(ctx *FmtCtx) {
 		ctx.WriteByte('(')
 		ctx.FormatNode(&node.ColumnNames)
 		ctx.WriteByte(')')
+	}
+
+	if node.Options != nil {
+		ctx.WriteString(` WITH ( `)
+		ctx.FormatNode(node.Options)
+		ctx.WriteString(` )`)
 	}
 
 	ctx.WriteString(" AS ")

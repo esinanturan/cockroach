@@ -143,6 +143,8 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 			_, err = db.Barrier(ctx, o.Key, o.EndKey)
 		}
 		o.Result = resultInit(ctx, err)
+	case *FlushLockTableOperation:
+		o.Result = resultInit(ctx, db.FlushLockTable(ctx, o.Key, o.EndKey))
 	case *ClosureTxnOperation:
 		// Use a backoff loop to avoid thrashing on txn aborts. Don't wait between
 		// epochs of the same transaction to avoid waiting while holding locks.
@@ -155,6 +157,7 @@ func applyOp(ctx context.Context, env *Env, db *kv.DB, op *Operation) {
 			if err := txn.SetIsoLevel(o.IsoLevel); err != nil {
 				panic(err)
 			}
+			txn.SetBufferedWritesEnabled(o.BufferedWrites)
 			if savedTxn != nil && txn.TestingCloneTxn().Epoch == 0 {
 				// If the txn's current epoch is 0 and we've run at least one prior
 				// iteration, we were just aborted.
@@ -449,6 +452,16 @@ func applyClientOp(
 			})
 		})
 		o.Result = resultInit(ctx, err)
+	case *FlushLockTableOperation:
+		_, _, err := dbRunWithResultAndTimestamp(ctx, db, func(b *kv.Batch) {
+			b.AddRawRequest(&kvpb.FlushLockTableRequest{
+				RequestHeader: kvpb.RequestHeader{
+					Key:    o.Key,
+					EndKey: o.EndKey,
+				},
+			})
+		})
+		o.Result = resultInit(ctx, err)
 	case *BatchOperation:
 		b := &kv.Batch{}
 		applyBatchOp(ctx, b, db.Run, o)
@@ -569,6 +582,8 @@ func applyBatchOp(
 			panic(errors.AssertionFailedf(`AddSSTable cannot be used in batches`))
 		case *BarrierOperation:
 			panic(errors.AssertionFailedf(`Barrier cannot be used in batches`))
+		case *FlushLockTableOperation:
+			panic(errors.AssertionFailedf(`FlushLockOperation cannot be used in batches`))
 		default:
 			panic(errors.AssertionFailedf(`unknown batch operation type: %T %v`, subO, subO))
 		}

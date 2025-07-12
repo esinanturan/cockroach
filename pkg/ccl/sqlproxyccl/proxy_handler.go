@@ -194,7 +194,9 @@ func newProxyHandler(
 	proxyMetrics *metrics,
 	options ProxyOptions,
 ) (*proxyHandler, error) {
-	ctx, _ = stopper.WithCancelOnQuiesce(ctx)
+	// The proxy handler shares the same lifetime as the proxy which will shutdown
+	// via the stopper, so we can ignore the cancellation function here.
+	ctx, _ = stopper.WithCancelOnQuiesce(ctx) // nolint:quiesce
 
 	handler := proxyHandler{
 		stopper:       stopper,
@@ -279,7 +281,7 @@ func newProxyHandler(
 		dirOpts = append(dirOpts, handler.testingKnobs.dirOpts...)
 	}
 
-	client := tenant.NewDirectoryClient(conn)
+	client := tenant.NewGRPCDirectoryClientAdapter(conn)
 	handler.directoryCache, err = tenant.NewDirectoryCache(ctx, stopper, client, dirOpts...)
 	if err != nil {
 		return nil, err

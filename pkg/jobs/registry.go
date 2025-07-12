@@ -29,7 +29,6 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
 	"github.com/cockroachdb/cockroach/pkg/sql/sqlliveness"
-	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/cidr"
 	"github.com/cockroachdb/cockroach/pkg/util/envutil"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
@@ -321,6 +320,10 @@ const (
 	UpdateTableMetadataCacheJobID = jobspb.JobID(105)
 
 	SqlActivityFlushJobID = jobspb.JobID(106)
+
+	// HotRangesLoggerJobID A static job ID which is used for the
+	// hot ranges logger job.
+	HotRangesLoggerJobID = jobspb.JobID(107)
 )
 
 // MakeJobID generates a new job ID.
@@ -483,7 +486,7 @@ func batchJobInsertStmt(
 		return "", nil, nil, errors.NewAssertionErrorWithWrappedErrf(err, "failed to make timestamp for creation of job")
 	}
 	instanceID := r.ID()
-	columns := []string{`id`, `created`, `status`, `claim_session_id`, `claim_instance_id`, `job_type`}
+	columns := []string{`id`, `created`, `status`, `claim_session_id`, `claim_instance_id`, `job_type`, `owner`, `description`}
 	valueFns := map[string]func(*Job) (interface{}, error){
 		`id`:                func(job *Job) (interface{}, error) { return job.ID(), nil },
 		`created`:           func(job *Job) (interface{}, error) { return created, nil },
@@ -494,12 +497,8 @@ func batchJobInsertStmt(
 			payload := job.Payload()
 			return payload.Type().String(), nil
 		},
-	}
-
-	if schemaVersion.AtLeast(clusterversion.V25_1_AddJobsColumns.Version()) {
-		columns = append(columns, `owner`, `description`)
-		valueFns[`owner`] = func(job *Job) (interface{}, error) { return job.Payload().UsernameProto.Decode().Normalized(), nil }
-		valueFns[`description`] = func(job *Job) (interface{}, error) { return job.Payload().Description, nil }
+		`owner`:       func(job *Job) (interface{}, error) { return job.Payload().UsernameProto.Decode().Normalized(), nil },
+		`description`: func(job *Job) (interface{}, error) { return job.Payload().Description, nil },
 	}
 
 	appendValues := func(job *Job, vals *[]interface{}) (err error) {
@@ -590,15 +589,9 @@ func (r *Registry) CreateJobWithTxn(
 			return errors.NewAssertionErrorWithWrappedErrf(err, "failed to construct job created timestamp")
 		}
 
-		cols := []string{"id", "created", "status", "claim_session_id", "claim_instance_id", "job_type"}
-		vals := []interface{}{jobID, created, StateRunning, s.ID().UnsafeBytes(), r.ID(), jobType.String()}
-		v, err := txn.GetSystemSchemaVersion(ctx)
-		if err != nil {
-			return err
-		}
-		if v.AtLeast(clusterversion.V25_1_AddJobsColumns.Version()) {
-			cols = append(cols, "owner", "description")
-			vals = append(vals, j.mu.payload.UsernameProto.Decode().Normalized(), j.mu.payload.Description)
+		cols := []string{"id", "created", "status", "claim_session_id", "claim_instance_id", "job_type", "owner", "description"}
+		vals := []interface{}{
+			jobID, created, StateRunning, s.ID().UnsafeBytes(), r.ID(), jobType.String(), j.mu.payload.UsernameProto.Decode().Normalized(), j.mu.payload.Description,
 		}
 
 		totalNumCols := len(cols)
@@ -730,18 +723,9 @@ func (r *Registry) CreateAdoptableJobWithTxn(
 		}
 		typ := j.mu.payload.Type().String()
 
-		cols := []string{"id", "created", "status", "created_by_type", "created_by_id", "job_type"}
-		placeholders := []string{"$1", "now() at time zone 'utc'", "$2", "$3", "$4", "$5"}
-		vals := []interface{}{jobID, StateRunning, createdByType, createdByID, typ}
-		v, err := txn.GetSystemSchemaVersion(ctx)
-		if err != nil {
-			return err
-		}
-		if v.AtLeast(clusterversion.V25_1_AddJobsColumns.Version()) {
-			cols = append(cols, "owner", "description")
-			placeholders = append(placeholders, "$6", "$7")
-			vals = append(vals, j.mu.payload.UsernameProto.Decode().Normalized(), j.mu.payload.Description)
-		}
+		cols := []string{"id", "created", "status", "created_by_type", "created_by_id", "job_type", "owner", "description"}
+		placeholders := []string{"$1", "now() at time zone 'utc'", "$2", "$3", "$4", "$5", "$6", "$7"}
+		vals := []interface{}{jobID, StateRunning, createdByType, createdByID, typ, j.mu.payload.UsernameProto.Decode().Normalized(), j.mu.payload.Description}
 
 		// Insert the job row, but do not set a `claim_session_id`. By not
 		// setting the claim, the job can be adopted by any node and will
@@ -944,7 +928,7 @@ func (r *Registry) withSession(ctx context.Context, f withSessionFunc) {
 // jobs if it observes a failure. Otherwise it starts all the main daemons of
 // registry that poll the jobs table and start/cancel/gc jobs.
 func (r *Registry) Start(ctx context.Context, stopper *stop.Stopper) error {
-	if r.knobs.DisableRegistryLifecycleManagent {
+	if r.knobs.DisableRegistryLifecycleManagement {
 		return nil
 	}
 
@@ -1190,26 +1174,6 @@ FROM system.job_info
 WHERE written < $1 AND job_id NOT IN (SELECT id FROM system.jobs)
 LIMIT $2`
 
-// The ordering is important as we keep track of the maximum ID we've seen.
-const expiredJobsQueryWithJobInfoTable = `
-WITH
-latestpayload AS (
-    SELECT job_id, value
-    FROM system.job_info AS payload
-    WHERE job_id > $2 AND info_key = 'legacy_payload'
-    ORDER BY written desc
-),
-jobpage AS (
-    SELECT id, status
-    FROM system.jobs
-    WHERE (created < $1) and (id > $2)
-    ORDER BY id
-    LIMIT $3
-)
-SELECT distinct (id), latestpayload.value AS payload, status
-FROM jobpage AS j
-INNER JOIN latestpayload ON j.id = latestpayload.job_id`
-
 // jobMetadataTables are all of the tables that have rows storing additional
 // attributes or data about jobs beyond the core job record in system.jobs. All
 // of these tables identity the job which own rows in them using a "job_id"
@@ -1224,95 +1188,31 @@ var jobMetadataTables = []string{"job_info", "job_progress", "job_progress_histo
 func (r *Registry) cleanupOldJobsPage(
 	ctx context.Context, olderThan time.Time, minID jobspb.JobID, pageSize int,
 ) (done bool, maxID jobspb.JobID, retErr error) {
-	query := expiredJobsQueryWithJobInfoTable
+	query := "SELECT id, status, finished, $1 FROM system.jobs WHERE status in (" + terminalStateList + ") AND (finished < $1) and (id >= $2) ORDER BY id LIMIT $3"
 
 	it, err := r.db.Executor().QueryIterator(ctx, "gc-jobs", nil, /* txn */
 		query, olderThan, minID, pageSize)
 	if err != nil {
 		return false, 0, err
 	}
-	// We have to make sure to close the iterator since we might return from the
-	// for loop early (before Next() returns false).
-	defer func() { retErr = errors.CombineErrors(retErr, it.Close()) }()
-	toDelete := tree.NewDArray(types.Int)
-	oldMicros := timeutil.ToUnixMicros(olderThan)
-
+	var candidates []jobspb.JobID
 	var ok bool
-	var numRows int
 	for ok, err = it.Next(ctx); ok; ok, err = it.Next(ctx) {
-		numRows++
-		row := it.Cur()
-		payload, err := UnmarshalPayload(row[1])
-		if err != nil {
+		candidates = append(candidates, jobspb.JobID(tree.MustBeDInt(it.Cur()[0])))
+	}
+	err = errors.CombineErrors(err, it.Close())
+
+	if err != nil || len(candidates) == 0 {
+		return len(candidates) == 0, 0, err
+	}
+
+	log.VEventf(ctx, 2, "found %d expired jobs", len(candidates))
+	for _, id := range candidates {
+		if err := r.DeleteTerminalJobByID(ctx, id); err != nil {
 			return false, 0, err
 		}
-		remove := false
-		switch State(*row[2].(*tree.DString)) {
-		case StateSucceeded, StateCanceled, StateFailed:
-			remove = payload.FinishedMicros < oldMicros
-		}
-		if remove {
-			toDelete.Array = append(toDelete.Array, row[0])
-		}
 	}
-	if err != nil {
-		return false, 0, err
-	}
-	if numRows == 0 {
-		return true, 0, nil
-	}
-
-	log.VEventf(ctx, 2, "read potentially expired jobs: %d", numRows)
-	if len(toDelete.Array) > 0 {
-		log.VEventf(ctx, 2, "attempting to clean up %d expired job records", len(toDelete.Array))
-		const stmt = `DELETE FROM system.jobs WHERE id = ANY($1)`
-		nDeleted, err := r.db.Executor().Exec(
-			ctx, "gc-jobs", nil /* txn */, stmt, toDelete,
-		)
-		if err != nil {
-			log.Warningf(ctx, "error cleaning up %d jobs: %v", len(toDelete.Array), err)
-			return false, 0, errors.Wrap(err, "deleting old jobs")
-		}
-
-		counts := make(map[string]int)
-		for i, tbl := range jobMetadataTables {
-			var deleted int
-			if err := r.db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-				// Tables other than job_info -- the 0th -- are only present if the txn is
-				// running at a version that includes them.
-				if i > 0 {
-					v, err := txn.GetSystemSchemaVersion(ctx)
-					if err != nil {
-						return err
-					}
-					if v.Less(clusterversion.V25_1_AddJobsTables.Version()) {
-						return nil
-					}
-				}
-				deleted, err = txn.Exec(ctx, redact.RedactableString("gc-job-"+tbl), txn.KV(),
-					"DELETE FROM system."+tbl+" WHERE job_id = ANY($1)", toDelete,
-				)
-				if err != nil {
-					return err
-				}
-				return nil
-			}); err != nil {
-				return false, 0, errors.Wrapf(err, "deleting old job metadata from %s", tbl)
-			}
-			counts[tbl] = deleted
-		}
-		if nDeleted > 0 {
-			log.Infof(ctx, "cleaned up %d expired job records (%d infos, %d progresses, %d progress_hists, %d statuses, %d messages)",
-				nDeleted, counts["job_info"], counts["job_progress"], counts["job_progress_history"], counts["job_status"], counts["job_message"])
-		}
-	}
-	// If we got as many rows as we asked for, there might be more.
-	morePages := numRows == pageSize
-	// Track the highest ID we encounter, so it can serve as the bottom of the
-	// next page.
-	lastRow := it.Cur()
-	maxID = jobspb.JobID(*(lastRow[0].(*tree.DInt)))
-	return !morePages, maxID, nil
+	return len(candidates) < pageSize, candidates[len(candidates)-1], nil
 }
 
 // DeleteTerminalJobByID deletes the given job ID if it is in a
@@ -1337,17 +1237,7 @@ func (r *Registry) DeleteTerminalJobByID(ctx context.Context, id jobspb.JobID) e
 			if err != nil {
 				return err
 			}
-			for i, tbl := range jobMetadataTables {
-				if i > 0 {
-					v, err := txn.GetSystemSchemaVersion(ctx)
-					if err != nil {
-						return err
-					}
-					if v.Less(clusterversion.V25_1_AddJobsTables.Version()) {
-						break
-					}
-				}
-
+			for _, tbl := range jobMetadataTables {
 				_, err = txn.Exec(
 					ctx, redact.RedactableString("delete-job-"+tbl), txn.KV(),
 					"DELETE FROM system."+tbl+" WHERE job_id = $1", id,

@@ -33,6 +33,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/rpc"
 	"github.com/cockroachdb/cockroach/pkg/rpc/nodedialer"
+	"github.com/cockroachdb/cockroach/pkg/rpc/rpcbase"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
 	"github.com/cockroachdb/cockroach/pkg/testutils"
 	"github.com/cockroachdb/cockroach/pkg/testutils/skip"
@@ -2071,6 +2072,11 @@ func TestGetFirstRangeDescriptor(t *testing.T) {
 		node.Gossip.EnableSimulationCycler(false)
 	}
 	n.Start()
+	// Make sure the first two nodes are connected via gossip.
+	n.SimulateNetwork(func(_ int, _ *simulation.Network) bool { return false })
+	<-n.Nodes[0].Gossip.Connected
+	<-n.Nodes[1].Gossip.Connected
+
 	ds := NewDistSender(DistSenderConfig{
 		AmbientCtx:         log.MakeTestingAmbientContext(stopper.Tracer()),
 		NodeDescs:          n.Nodes[0].Gossip,
@@ -4022,6 +4028,27 @@ func TestMultipleErrorsMerged(t *testing.T) {
 	}
 }
 
+func TestMergeErrorIndex(t *testing.T) {
+	// When merging, the error with lower index should be preferred. Create two
+	// errors with the same priority but different indices.
+	err1 := kvpb.NewError(&kvpb.ConditionFailedError{})
+	err1.Index = &kvpb.ErrPosition{Index: 2}
+	err2 := kvpb.NewError(&kvpb.ConditionFailedError{})
+	err2.Index = &kvpb.ErrPosition{Index: 1}
+
+	require.Equal(t, int32(1), mergeErrors(err1, err2).Index.Index)
+	require.Equal(t, int32(1), mergeErrors(err2, err1).Index.Index)
+
+	// Test that priority still takes precedence over index
+	highPriorityErr := kvpb.NewError(&kvpb.TransactionAbortedError{})
+	highPriorityErr.Index = &kvpb.ErrPosition{Index: 5}
+	lowPriorityErr := kvpb.NewError(&kvpb.ConditionFailedError{})
+	lowPriorityErr.Index = &kvpb.ErrPosition{Index: 3}
+
+	require.Equal(t, int32(5), mergeErrors(highPriorityErr, lowPriorityErr).Index.Index)
+	require.Equal(t, int32(5), mergeErrors(lowPriorityErr, highPriorityErr).Index.Index)
+}
+
 // Regression test for #20067.
 // If a batch is partitioned into multiple partial batches, the
 // kvpb.Error.Index of each batch should correspond to its original index in
@@ -4528,7 +4555,7 @@ func TestConnectionClass(t *testing.T) {
 
 	// class will capture the connection class used for the last transport
 	// created.
-	var class rpc.ConnectionClass
+	var class rpcbase.ConnectionClass
 	var transportFactory TransportFactory = func(opts SendOptions, replicas ReplicaSlice) Transport {
 		class = opts.class
 		return adaptSimpleTransport(
@@ -4556,16 +4583,16 @@ func TestConnectionClass(t *testing.T) {
 
 	for _, pair := range []struct {
 		key       roachpb.Key
-		wantClass rpc.ConnectionClass
+		wantClass rpcbase.ConnectionClass
 	}{
-		{key: keys.Meta1Prefix, wantClass: rpc.SystemClass},
-		{key: keys.NodeLivenessKey(1), wantClass: rpc.SystemClass},
-		{key: keys.StatusNodePrefix, wantClass: rpc.SystemClass},
-		{key: keys.NodeStatusKey(15), wantClass: rpc.SystemClass},
-		{key: keys.NodeIDGenerator, wantClass: rpc.SystemClass},
-		{key: keys.TimeseriesPrefix, wantClass: rpc.DefaultClass},
-		{key: keys.SystemSpanConfigPrefix, wantClass: rpc.DefaultClass},
-		{key: keys.SystemSQLCodec.TablePrefix(1234), wantClass: rpc.DefaultClass},
+		{key: keys.Meta1Prefix, wantClass: rpcbase.SystemClass},
+		{key: keys.NodeLivenessKey(1), wantClass: rpcbase.SystemClass},
+		{key: keys.StatusNodePrefix, wantClass: rpcbase.SystemClass},
+		{key: keys.NodeStatusKey(15), wantClass: rpcbase.SystemClass},
+		{key: keys.NodeIDGenerator, wantClass: rpcbase.SystemClass},
+		{key: keys.TimeseriesPrefix, wantClass: rpcbase.DefaultClass},
+		{key: keys.SystemSpanConfigPrefix, wantClass: rpcbase.DefaultClass},
+		{key: keys.SystemSQLCodec.TablePrefix(1234), wantClass: rpcbase.DefaultClass},
 	} {
 		t.Run(pair.key.String(), func(t *testing.T) {
 			ba := &kvpb.BatchRequest{}
@@ -4749,7 +4776,7 @@ func TestDistSenderSlowLogMessage(t *testing.T) {
 	desc := &roachpb.RangeDescriptor{RangeID: 9, StartKey: roachpb.RKey("x"), EndKey: roachpb.RKey("z")}
 	{
 		exp := `have been waiting 8.16s (120 attempts) for RPC Get(Shared,Unreplicated) [‹"a"›] to` +
-			` r9:‹{x-z}› [<no replicas>, next=0, gen=0]; resp: ‹(err: boom)›`
+			` r9:{‹x›-‹z›} [<no replicas>, next=0, gen=0]; resp: (err: boom)`
 		var s redact.StringBuilder
 		slowRangeRPCWarningStr(&s, ba, dur, attempts, desc, nil /* err */, br)
 		act := s.RedactableString()
@@ -4764,7 +4791,7 @@ func TestDistSenderSlowLogMessage(t *testing.T) {
 	}
 	{
 		exp := `have been waiting 8.16s (120 attempts) for RPC Get(Shared,Unreplicated) [‹"a"›] to` +
-			` replica (n2,s3):1; resp: ‹(err: boom)›`
+			` replica (n2,s3):1; resp: (err: boom)`
 		var s redact.StringBuilder
 		slowReplicaRPCWarningStr(&s, ba, dur, attempts, nil /* err */, br)
 		act := s.RedactableString()

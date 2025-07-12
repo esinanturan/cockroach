@@ -19,7 +19,7 @@ import (
 )
 
 var psycopgReleaseTagRegex = regexp.MustCompile(`^(?P<major>\d+)(?:\.(?P<minor>\d+)(?:\.(?P<point>\d+)(?:\.(?P<subpoint>\d+))?)?)?$`)
-var supportedPsycopgTag = "3.2.6"
+var supportedPsycopgTag = "3.2.8"
 
 // This test runs psycopg full test suite against a single cockroach node.
 func registerPsycopg(r registry.Registry) {
@@ -155,7 +155,7 @@ func registerPsycopg(r registry.Registry) {
 			cd /mnt/data1/psycopg/ &&
 			export PSYCOPG_TEST_DSN="host=localhost port={pgport:1} user=%[1]s password=%[2]s dbname=defaultdb" &&
 			export PGPASSWORD=%[2]s
-			pytest -vv --junit-xml=%[3]s`,
+			pytest -vv -m "not timing" --junit-xml=%[3]s`,
 			install.DefaultUser, install.DefaultPassword, testResultsXML))
 
 		// Fatal for a roachprod or transient error. A roachprod error is when result.Err==nil.
@@ -195,7 +195,7 @@ func registerPsycopg(r registry.Registry) {
 		Owner:            registry.OwnerSQLFoundations,
 		Cluster:          r.MakeClusterSpec(1),
 		Leases:           registry.MetamorphicLeases,
-		CompatibleClouds: registry.AllExceptAWS,
+		CompatibleClouds: registry.AllClouds.NoAWS().NoIBM(),
 		Suites:           registry.Suites(registry.Nightly, registry.Driver),
 		Run: func(ctx context.Context, t test.Test, c cluster.Cluster) {
 			runPsycopg(ctx, t, c)

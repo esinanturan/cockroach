@@ -31,6 +31,11 @@ import (
 // DescriptorType is a symbol representing the (sub)type of a descriptor.
 type DescriptorType string
 
+var _ redact.SafeValue = DescriptorType("")
+
+// SafeValue implements redact.SafeValue.
+func (DescriptorType) SafeValue() {}
+
 const (
 	// Any represents any descriptor.
 	Any DescriptorType = "any"
@@ -641,10 +646,10 @@ type TableDescriptor interface {
 	// is now deprecated.
 	GetReplacementOf() descpb.TableDescriptor_Replacement
 
-	// GetAllReferencedTableIDs returns all relation IDs that this table
-	// references. Table references can be from foreign keys, triggers, or via
-	// direct references if the descriptor is a view.
-	GetAllReferencedTableIDs() descpb.IDs
+	// GetAllReferencedRelationIDsExceptFKs returns the IDs of all relations
+	// this table depends on, excluding foreign key dependencies. Dependencies can
+	// originate from triggers, policies, or direct references in views.
+	GetAllReferencedRelationIDsExceptFKs() descpb.IDs
 
 	// GetAllReferencedTypeIDs returns all user defined type descriptor IDs that
 	// this table references. It takes in a function that returns the TypeDescriptor
@@ -678,6 +683,12 @@ type TableDescriptor interface {
 	// field of column descriptors.
 	GetAllReferencedFunctionIDsInColumnExprs(
 		colID descpb.ColumnID,
+	) (DescriptorIDSet, error)
+
+	// GetAllReferencedFunctionIDsInIndex returns descriptor IDs of all user
+	// defined functions referenced in expressions used by this index.
+	GetAllReferencedFunctionIDsInIndex(
+		indexID descpb.IndexID,
 	) (DescriptorIDSet, error)
 
 	// ForeachDependedOnBy runs a function on all indexes, including those being

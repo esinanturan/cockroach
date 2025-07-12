@@ -9,6 +9,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/funcinfo"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/typedesc"
@@ -35,6 +36,10 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 		}
 	}
 
+	isTemp := resolveTemporaryStatus(cf.Name.ObjectNamePrefix, tree.PersistencePermanent)
+	if isTemp {
+		panic(unimplemented.NewWithIssue(104687, "cannot create user-defined functions under a temporary schema"))
+	}
 	sch, resName := b.resolveSchemaForCreateFunction(&cf.Name)
 	schID := b.factory.Metadata().AddSchema(sch)
 	cf.Name.ObjectNamePrefix = resName
@@ -402,6 +407,13 @@ func (b *Builder) buildCreateFunction(cf *tree.CreateRoutine, inScope *scope) (o
 			afterBuildStmt()
 		}
 	case tree.RoutineLangPLpgSQL:
+		if isSetReturning {
+			if !b.evalCtx.Settings.Version.IsActive(b.ctx, clusterversion.V25_2) {
+				panic(unimplemented.Newf("PL/pgSQL set-returning functions",
+					"PL/pgSQL set-returning functions are only supported in v25.2 and later"))
+			}
+		}
+
 		// Parse the function body.
 		stmt, err := plpgsqlparser.Parse(funcBodyStr)
 		if err != nil {

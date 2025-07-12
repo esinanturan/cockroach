@@ -33,13 +33,11 @@ import (
 	aload "github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/load"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/storepool"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/concurrency/lock"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/kvflowdispatch"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvflowcontrol/node_rac2"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverbase"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvserverpb"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/kvstorage"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/liveness/livenesspb"
-	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/logstore"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/rditer"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/stateloader"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/storeliveness"
@@ -71,8 +69,10 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/tracing"
 	"github.com/cockroachdb/cockroach/pkg/util/uuid"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/redact"
 	"github.com/kr/pretty"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -187,7 +187,9 @@ func createTestStoreWithoutStart(
 	}
 	rpcContext := rpc.NewContext(ctx, rpcOpts)
 	stopper.SetTracer(cfg.AmbientCtx.Tracer)
-	server, err := rpc.NewServer(ctx, rpcContext) // never started
+	grpcServer, err := rpc.NewServer(ctx, rpcContext) // never started
+	require.NoError(t, err)
+	drpcServer, err := rpc.NewDRPCServer(ctx, rpcContext) // never started
 	require.NoError(t, err)
 
 	// Some tests inject their own Gossip and StorePool, via
@@ -236,10 +238,8 @@ func createTestStoreWithoutStart(
 		stopper,
 		cfg.Clock,
 		cfg.NodeDialer,
-		server,
-		kvflowdispatch.NewDummyDispatch(),
-		NoopStoresFlowControlIntegration{},
-		NoopRaftTransportDisconnectListener{},
+		grpcServer,
+		drpcServer,
 		(*node_rac2.AdmittedPiggybacker)(nil),
 		nil, /* PiggybackedAdmittedResponseScheduler */
 		nil, /* knobs */
@@ -249,9 +249,10 @@ func createTestStoreWithoutStart(
 		livenessInterval, heartbeatInterval := cfg.StoreLivenessDurations()
 		supportGracePeriod := rpcContext.StoreLivenessWithdrawalGracePeriod()
 		options := storeliveness.NewOptions(livenessInterval, heartbeatInterval, supportGracePeriod)
-		transport := storeliveness.NewTransport(
-			cfg.AmbientCtx, stopper, cfg.Clock, cfg.NodeDialer, server, nil, /* knobs */
+		transport, err := storeliveness.NewTransport(
+			cfg.AmbientCtx, stopper, cfg.Clock, cfg.NodeDialer, grpcServer, drpcServer, nil, /* knobs */
 		)
+		require.NoError(t, err)
 		knobs := cfg.TestingKnobs.StoreLivenessKnobs
 		cfg.StoreLiveness = storeliveness.NewNodeContainer(stopper, options, transport, knobs)
 	}
@@ -414,11 +415,7 @@ func TestIterateIDPrefixKeys(t *testing.T) {
 			wanted = append(wanted, seenT{rangeID: rangeID, tombstone: tombstone})
 
 			t.Logf("writing tombstone at rangeID=%d", rangeID)
-			if err := storage.MVCCPutProto(
-				ctx, eng, keys.RangeTombstoneKey(rangeID), hlc.Timestamp{}, &tombstone, storage.MVCCWriteOptions{},
-			); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, stateloader.Make(rangeID).SetRangeTombstone(ctx, eng, tombstone))
 
 			if len(wanted) >= rangeCount {
 				break
@@ -623,7 +620,7 @@ func TestStoreAddRemoveRanges(t *testing.T) {
 		t.Error(err)
 	}
 	// Remove range 1.
-	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}); err != nil {
 		t.Error(err)
@@ -639,7 +636,7 @@ func TestStoreAddRemoveRanges(t *testing.T) {
 		t.Fatal("expected error re-adding same range")
 	}
 	// Try to remove range 1 again.
-	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}); err != nil {
 		t.Fatalf("didn't expect error re-removing same range: %v", err)
@@ -747,7 +744,7 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 
 	// Can't remove Replica with DestroyData false because this requires the destroyStatus
 	// to already have been set by the caller (but we didn't).
-	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: false,
 	}), `replica not marked as destroyed`)
 
@@ -755,14 +752,14 @@ func TestStoreRemoveReplicaDestroy(t *testing.T) {
 	// NB: we rely on this idempotency today (as @tbg found out when he accidentally
 	// removed it).
 	for i := 0; i < 2; i++ {
-		require.NoError(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+		require.NoError(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 			DestroyData: true,
 		}), "%d", i)
 	}
 
 	// However, if we have DestroyData=false, caller is expected to be the unique first "destroyer"
 	// of the Replica.
-	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	require.ErrorContains(t, store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: false,
 	}), `does not exist`)
 
@@ -805,7 +802,7 @@ func TestStoreReplicaVisitor(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}); err != nil {
 		t.Error(err)
@@ -889,7 +886,7 @@ func TestMarkReplicaInitialized(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	if err := store.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}); err != nil {
 		t.Error(err)
@@ -902,8 +899,7 @@ func TestMarkReplicaInitialized(t *testing.T) {
 
 	newRangeID := roachpb.RangeID(3)
 	const replicaID = 1
-	require.NoError(t,
-		logstore.NewStateLoader(newRangeID).SetRaftReplicaID(ctx, store.TODOEngine(), replicaID))
+	require.NoError(t, stateloader.Make(newRangeID).SetRaftReplicaID(ctx, store.TODOEngine(), replicaID))
 
 	r, err := newUninitializedReplica(store, newRangeID, replicaID)
 	require.NoError(t, err)
@@ -2761,7 +2757,7 @@ func TestMaybeRemove(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if err := store.RemoveReplica(ctx, repl, repl.Desc().NextReplicaID, RemoveOptions{
+	if err := store.RemoveReplica(ctx, repl, repl.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}); err != nil {
 		t.Error(err)
@@ -2790,7 +2786,8 @@ func TestStoreGCThreshold(t *testing.T) {
 		}
 		repl.mu.Lock()
 		gcThreshold := *repl.shMu.state.GCThreshold
-		pgcThreshold, err := repl.mu.stateLoader.LoadGCThreshold(context.Background(), store.TODOEngine())
+		pgcThreshold, err := stateloader.Make(repl.RangeID).LoadGCThreshold(
+			context.Background(), store.StateEngine())
 		repl.mu.Unlock()
 		if err != nil {
 			t.Fatal(err)
@@ -2878,7 +2875,7 @@ func TestStoreRangePlaceholders(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if err := s.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, RemoveOptions{
+	if err := s.RemoveReplica(ctx, repl1, repl1.Desc().NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}); err != nil {
 		t.Error(err)
@@ -3014,7 +3011,7 @@ func TestStoreRemovePlaceholderOnRaftIgnored(t *testing.T) {
 	repl1, err := s.GetReplica(1)
 	desc := repl1.Desc()
 	require.NoError(t, err)
-	require.NoError(t, s.RemoveReplica(ctx, repl1, desc.NextReplicaID, RemoveOptions{
+	require.NoError(t, s.RemoveReplica(ctx, repl1, desc.NextReplicaID, redact.SafeString(t.Name()), RemoveOptions{
 		DestroyData: true,
 	}))
 
@@ -3385,9 +3382,10 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 	desc.Capacity.Available = 1
 	desc.Capacity.Used = desc.Capacity.Capacity - desc.Capacity.Available
 
-	s.cfg.StorePool.DetailsMu.Lock()
-	s.cfg.StorePool.GetStoreDetailLocked(desc.StoreID).Desc = desc
-	s.cfg.StorePool.DetailsMu.Unlock()
+	sd := s.cfg.StorePool.GetStoreDetail(desc.StoreID)
+	sd.Lock()
+	sd.Desc = desc
+	sd.Unlock()
 
 	if n := s.ReservationCount(); n != 0 {
 		t.Fatalf("expected 0 reservations, but found %d", n)
@@ -3409,9 +3407,10 @@ func TestReserveSnapshotFullnessLimit(t *testing.T) {
 	// available disk space should be rejected.
 	desc.Capacity.Available = desc.Capacity.Capacity / 2
 	desc.Capacity.Used = desc.Capacity.Capacity - desc.Capacity.Available
-	s.cfg.StorePool.DetailsMu.Lock()
-	s.cfg.StorePool.GetStoreDetailLocked(desc.StoreID).Desc = desc
-	s.cfg.StorePool.DetailsMu.Unlock()
+	sd = s.cfg.StorePool.GetStoreDetail(desc.StoreID)
+	sd.Lock()
+	sd.Desc = desc
+	sd.Unlock()
 
 	if n := s.ReservationCount(); n != 0 {
 		t.Fatalf("expected 0 reservations, but found %d", n)
@@ -4124,9 +4123,81 @@ func TestStoreGetOrCreateReplicaWritesRaftReplicaID(t *testing.T) {
 		})
 	require.NoError(t, err)
 	require.True(t, created)
-	replicaID, err := repl.mu.stateLoader.LoadRaftReplicaID(ctx, tc.store.TODOEngine())
+	replicaID, err := stateloader.Make(repl.RangeID).LoadRaftReplicaID(
+		ctx, tc.store.StateEngine())
 	require.NoError(t, err)
-	require.Equal(t, &kvserverpb.RaftReplicaID{ReplicaID: 7}, replicaID)
+	require.Equal(t, kvserverpb.RaftReplicaID{ReplicaID: 7}, replicaID)
+}
+
+// TestSplitPreApplyInitializesTruncatedState ensures that the Raft truncated
+// state for the RHS is correctly initialized when calling splitPreApply.
+func TestSplitPreApplyInitializesTruncatedState(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	defer log.Scope(t).Close(t)
+
+	ctx := context.Background()
+	manual := timeutil.NewManualTime(timeutil.Unix(0, 10))
+	clock := hlc.NewClockForTesting(manual)
+
+	db := storage.NewDefaultInMemForTesting()
+	defer db.Close()
+	batch := db.NewBatch()
+	defer batch.Close()
+
+	startKey := roachpb.Key("0000")
+	endKey := roachpb.Key("9999")
+	desc := roachpb.RangeDescriptor{
+		RangeID:  99,
+		StartKey: roachpb.RKey(startKey),
+		EndKey:   roachpb.RKey(endKey),
+	}
+	desc.AddReplica(1, 1, roachpb.VOTER_FULL)
+
+	sl := stateloader.Make(desc.RangeID)
+	// Write the range state that will be consulted and copied during the split.
+	lease := roachpb.Lease{
+		Replica:       desc.InternalReplicas[0],
+		Term:          10,
+		MinExpiration: hlc.Timestamp{WallTime: 100},
+	}
+	err := sl.SetLease(ctx, batch, nil, lease)
+	require.NoError(t, err)
+
+	// Set up the store and LHS replica.
+	cfg := TestStoreConfig(clock)
+	stopper := stop.NewStopper()
+	defer stopper.Stop(ctx)
+	store := createTestStoreWithConfig(ctx, t, stopper, testStoreOpts{}, &cfg)
+	lhsRepl := createReplica(store, desc.RangeID, desc.StartKey, desc.EndKey)
+
+	// Construct the split trigger.
+	splitKey := roachpb.RKey("5555")
+	leftDesc, rightDesc := desc, desc
+	leftDesc.EndKey = splitKey
+	rightDesc.RangeID++
+	rightDesc.StartKey = splitKey
+	rightDesc.InternalReplicas = slices.Clone(leftDesc.InternalReplicas)
+	rightDesc.InternalReplicas[0].ReplicaID++
+
+	// Create an uninitialized replica for the RHS. splitPreApply expects this.
+	_, _, err = store.getOrCreateReplica(
+		ctx, rightDesc.RangeID, rightDesc.InternalReplicas[0].ReplicaID, &rightDesc.InternalReplicas[0],
+	)
+	require.NoError(t, err)
+
+	split := roachpb.SplitTrigger{
+		LeftDesc:  leftDesc,
+		RightDesc: rightDesc,
+	}
+
+	splitPreApply(ctx, lhsRepl, batch, split, nil)
+
+	// Verify that the RHS truncated state is initialized as expected.
+	rsl := stateloader.Make(rightDesc.RangeID)
+	truncState, err := rsl.LoadRaftTruncatedState(ctx, batch)
+	require.NoError(t, err)
+	require.Equal(t, stateloader.RaftInitialLogIndex, int(truncState.Index))
+	require.Equal(t, stateloader.RaftInitialLogTerm, int(truncState.Term))
 }
 
 func BenchmarkStoreGetReplica(b *testing.B) {

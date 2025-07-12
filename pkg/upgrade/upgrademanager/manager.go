@@ -19,6 +19,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
 	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
+	"github.com/cockroachdb/cockroach/pkg/multitenant/mtinfo"
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/server/license"
@@ -119,10 +120,16 @@ func safeToUpgradeTenant(
 	codec keys.SQLCodec,
 	overrides cluster.OverridesInformer,
 	tenantClusterVersion clusterversion.ClusterVersion,
+	tenantInfoAccessor mtinfo.ReadFromTenantInfoAccessor,
 ) (bool, error) {
 	if codec.ForSystemTenant() {
 		// Unconditionally run upgrades for the system tenant.
 		return true, nil
+	}
+	if tenantInfoAccessor != nil {
+		if id, _, _ := tenantInfoAccessor.ReadFromTenantInfo(ctx); id.IsSet() {
+			return false, errors.Newf("reader virtual clusters cannot be upgraded. Instead, drop the current read only virtual cluster, and recreate a new one via ALTER VIRTUAL CLUSTER...")
+		}
 	}
 	// The overrides informer can be nil, but only in a system tenant.
 	if overrides == nil {
@@ -331,7 +338,7 @@ func (m *Manager) Migrate(
 	}
 
 	// Determine whether it's safe to perform the upgrade for secondary tenants.
-	if safe, err := safeToUpgradeTenant(ctx, m.codec, m.settings.OverridesInformer, from); !safe {
+	if safe, err := safeToUpgradeTenant(ctx, m.codec, m.settings.OverridesInformer, from, m.deps.TenantInfoAccessor); !safe {
 		return err
 	}
 
@@ -579,7 +586,7 @@ func bumpClusterVersion(
 	req := &serverpb.BumpClusterVersionRequest{ClusterVersion: &clusterVersion}
 	op := fmt.Sprintf("bump-cluster-version=%s", req.ClusterVersion.PrettyPrint())
 	return forEveryNodeUntilClusterStable(ctx, op, c, func(
-		ctx context.Context, client serverpb.MigrationClient,
+		ctx context.Context, client serverpb.RPCMigrationClient,
 	) error {
 		_, err := client.BumpClusterVersion(ctx, req)
 		return err
@@ -594,7 +601,7 @@ func validateTargetClusterVersion(
 	req := &serverpb.ValidateTargetClusterVersionRequest{ClusterVersion: &clusterVersion}
 	op := fmt.Sprintf("validate-cluster-version=%s", req.ClusterVersion.PrettyPrint())
 	return forEveryNodeUntilClusterStable(ctx, op, c, func(
-		tx context.Context, client serverpb.MigrationClient,
+		tx context.Context, client serverpb.RPCMigrationClient,
 	) error {
 		_, err := client.ValidateTargetClusterVersion(ctx, req)
 		// The tenant upgrade interlock is new in 23.1, as a result, before
@@ -617,7 +624,7 @@ func forEveryNodeUntilClusterStable(
 	ctx context.Context,
 	op string,
 	c upgrade.Cluster,
-	f func(ctx context.Context, client serverpb.MigrationClient) error,
+	f func(ctx context.Context, client serverpb.RPCMigrationClient) error,
 ) error {
 	log.Infof(ctx, "executing operation %s", redact.Safe(op))
 	return c.UntilClusterStable(ctx, retry.Options{

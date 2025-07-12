@@ -16,11 +16,11 @@ import (
 
 const (
 	// rulesVersion version of elements that can be appended to rel rule names.
-	rulesVersion = "-25.2"
+	rulesVersion = "-25.4"
 )
 
 // rulesVersionKey version of elements used by this rule set.
-var rulesVersionKey = clusterversion.V25_2
+var rulesVersionKey = clusterversion.V25_4
 
 // descriptorIsNotBeingDropped creates a clause which leads to the outer clause
 // failing to unify if the passed element is part of a descriptor and
@@ -173,11 +173,6 @@ func getExpression(element scpb.Element) (*scpb.Expression, error) {
 			return nil, nil
 		}
 		return e.EmbeddedExpr, nil
-	case *scpb.SecondaryIndexPartial:
-		if e == nil {
-			return nil, nil
-		}
-		return &e.Expression, nil
 	case *scpb.CheckConstraint:
 		if e == nil {
 			return nil, nil
@@ -254,7 +249,7 @@ func isIndexDependent(e scpb.Element) bool {
 	case *scpb.IndexName, *scpb.IndexComment, *scpb.IndexColumn,
 		*scpb.IndexZoneConfig:
 		return true
-	case *scpb.IndexPartitioning, *scpb.PartitionZoneConfig, *scpb.SecondaryIndexPartial:
+	case *scpb.IndexPartitioning, *scpb.PartitionZoneConfig:
 		return true
 	}
 	return false

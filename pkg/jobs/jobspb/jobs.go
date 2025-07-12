@@ -11,10 +11,12 @@ import (
 	"slices"
 
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
+	"github.com/cockroachdb/cockroach/pkg/security/username"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/iterutil"
 	"github.com/cockroachdb/cockroach/pkg/util/tracing/tracingpb"
+	"github.com/cockroachdb/redact"
 )
 
 // JobID is the ID of a job.
@@ -22,6 +24,14 @@ type JobID = catpb.JobID
 
 // InvalidJobID is the zero value for JobID corresponding to no job.
 const InvalidJobID = catpb.InvalidJobID
+
+// PendingJob represents a job that is pending creation (e.g. in a session).
+type PendingJob struct {
+	JobID       JobID
+	Type        Type
+	Description string
+	Username    username.SQLUsername
+}
 
 // ToText implements the ProtobinExecutionDetailFile interface.
 func (t *TraceData) ToText() []byte {
@@ -138,11 +148,6 @@ func (tsm *TimestampSpansMap) IsEmpty() bool {
 	return tsm == nil || len(tsm.Entries) == 0
 }
 
-// IsEmpty returns whether the checkpoint is empty.
-func (m *ChangefeedProgress_Checkpoint) IsEmpty() bool {
-	return m == nil || (len(m.Spans) == 0 && m.Timestamp.IsEmpty())
-}
-
 func (r RestoreDetails) OnlineImpl() bool {
 	return r.ExperimentalCopy || r.ExperimentalOnline
 }
@@ -159,4 +164,11 @@ func (b *BackupEncryptionOptions) HasKey() bool {
 func (b *BackupEncryptionOptions) IsEncrypted() bool {
 	// For dumb reasons, there are two ways to represent no encryption.
 	return !(b == nil || b.Mode == EncryptionMode_None)
+}
+
+var _ redact.SafeFormatter = (*RowLevelTTLProcessorProgress)(nil)
+
+// SafeFormat implements the redact.SafeFormatter interface.
+func (r *RowLevelTTLProcessorProgress) SafeFormat(p redact.SafePrinter, _ rune) {
+	p.SafeString(redact.SafeString(r.String()))
 }

@@ -9,7 +9,10 @@ import (
 	math "math"
 	"slices"
 
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/cspann/utils"
+	"github.com/cockroachdb/cockroach/pkg/sql/vecindex/vecpb"
 	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/num32"
 	"github.com/cockroachdb/cockroach/pkg/util/vector"
 	"github.com/cockroachdb/errors"
 )
@@ -64,7 +67,7 @@ func (cs *RaBitQCodeSet) Clone() RaBitQCodeSet {
 func (cs *RaBitQCodeSet) Clear() {
 	if buildutil.CrdbTestBuild {
 		// Write non-zero values to cleared memory.
-		for i := 0; i < len(cs.Data); i++ {
+		for i := range len(cs.Data) {
 			cs.Data[i] = 0xBADF00D
 		}
 	}
@@ -113,50 +116,43 @@ func (vs *RaBitQuantizedVectorSet) GetCount() int {
 	return len(vs.CodeCounts)
 }
 
-// GetCentroid implements the QuantizedVectorSet interface.
-func (vs *RaBitQuantizedVectorSet) GetCentroid() vector.T {
-	return vs.Centroid
-}
-
-// GetCentroidDistances implements the QuantizedVectorSet interface.
-func (vs *RaBitQuantizedVectorSet) GetCentroidDistances() []float32 {
-	return vs.CentroidDistances
-}
-
 // ReplaceWithLast implements the QuantizedVectorSet interface.
 func (vs *RaBitQuantizedVectorSet) ReplaceWithLast(offset int) {
-	lastOffset := len(vs.CodeCounts) - 1
 	vs.Codes.ReplaceWithLast(offset)
-	vs.CodeCounts[offset] = vs.CodeCounts[lastOffset]
-	vs.CodeCounts = vs.CodeCounts[:lastOffset]
-	vs.CentroidDistances[offset] = vs.CentroidDistances[lastOffset]
-	vs.CentroidDistances = vs.CentroidDistances[:lastOffset]
-	vs.DotProducts[offset] = vs.DotProducts[lastOffset]
-	vs.DotProducts = vs.DotProducts[:lastOffset]
+	vs.CodeCounts = utils.ReplaceWithLast(vs.CodeCounts, offset)
+	vs.CentroidDistances = utils.ReplaceWithLast(vs.CentroidDistances, offset)
+	vs.QuantizedDotProducts = utils.ReplaceWithLast(vs.QuantizedDotProducts, offset)
+	if vs.CentroidDotProducts != nil {
+		// This is nil for the L2Squared distance metric.
+		vs.CentroidDotProducts = utils.ReplaceWithLast(vs.CentroidDotProducts, offset)
+	}
 }
 
 // Clone implements the QuantizedVectorSet interface.
 func (vs *RaBitQuantizedVectorSet) Clone() QuantizedVectorSet {
 	return &RaBitQuantizedVectorSet{
-		Centroid:          vs.Centroid, // Centroid is immutable
-		Codes:             vs.Codes.Clone(),
-		CodeCounts:        slices.Clone(vs.CodeCounts),
-		CentroidDistances: slices.Clone(vs.CentroidDistances),
-		DotProducts:       slices.Clone(vs.DotProducts),
+		Metric:               vs.Metric,
+		Centroid:             vs.Centroid, // Centroid is immutable
+		Codes:                vs.Codes.Clone(),
+		CodeCounts:           slices.Clone(vs.CodeCounts),
+		CentroidDistances:    slices.Clone(vs.CentroidDistances),
+		QuantizedDotProducts: slices.Clone(vs.QuantizedDotProducts),
+		CentroidDotProducts:  slices.Clone(vs.CentroidDotProducts),
+		CentroidNorm:         vs.CentroidNorm,
 	}
 }
 
 // Clear implements the QuantizedVectorSet interface
 func (vs *RaBitQuantizedVectorSet) Clear(centroid vector.T) {
 	if buildutil.CrdbTestBuild {
-		for i := 0; i < len(vs.CodeCounts); i++ {
+		for i := range len(vs.CodeCounts) {
 			vs.CodeCounts[i] = 0xBADF00D
 		}
-		for i := 0; i < len(vs.CentroidDistances); i++ {
+		for i := range len(vs.CentroidDistances) {
 			vs.CentroidDistances[i] = math.Pi
 		}
-		for i := 0; i < len(vs.DotProducts); i++ {
-			vs.DotProducts[i] = math.Pi
+		for i := range len(vs.QuantizedDotProducts) {
+			vs.QuantizedDotProducts[i] = math.Pi
 		}
 		// RaBitQCodeSet.Clear takes care of scribbling memory for vs.Codes.
 	}
@@ -166,7 +162,13 @@ func (vs *RaBitQuantizedVectorSet) Clear(centroid vector.T) {
 	vs.Codes.Clear()
 	vs.CodeCounts = vs.CodeCounts[:0]
 	vs.CentroidDistances = vs.CentroidDistances[:0]
-	vs.DotProducts = vs.DotProducts[:0]
+	vs.QuantizedDotProducts = vs.QuantizedDotProducts[:0]
+	vs.CentroidDotProducts = vs.CentroidDotProducts[:0]
+	if vs.Metric != vecpb.L2SquaredDistance {
+		if &vs.Centroid[0] != &centroid[0] {
+			vs.CentroidNorm = num32.Norm(centroid)
+		}
+	}
 }
 
 // AddUndefined adds the given number of quantized vectors to this set. The new
@@ -178,6 +180,11 @@ func (vs *RaBitQuantizedVectorSet) AddUndefined(count int) {
 	vs.CodeCounts = vs.CodeCounts[:newCount]
 	vs.CentroidDistances = slices.Grow(vs.CentroidDistances, count)
 	vs.CentroidDistances = vs.CentroidDistances[:newCount]
-	vs.DotProducts = slices.Grow(vs.DotProducts, count)
-	vs.DotProducts = vs.DotProducts[:newCount]
+	vs.QuantizedDotProducts = slices.Grow(vs.QuantizedDotProducts, count)
+	vs.QuantizedDotProducts = vs.QuantizedDotProducts[:newCount]
+	if vs.Metric != vecpb.L2SquaredDistance {
+		// L2Squared doesn't need this.
+		vs.CentroidDotProducts = slices.Grow(vs.CentroidDotProducts, count)
+		vs.CentroidDotProducts = vs.CentroidDotProducts[:newCount]
+	}
 }

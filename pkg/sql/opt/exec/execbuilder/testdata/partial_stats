@@ -282,6 +282,7 @@ scan g
  │   histogram(1)=  0  2   0  1   0  1   0  1   0  1   0  1
  │                <--- 11 --- 12 --- 13 --- 14 --- 15 --- 17
  ├── cost: 25.09
+ ├── cost-flags: unbounded-cardinality
  ├── key: (1)
  └── distribution: test
 
@@ -753,6 +754,7 @@ scan i
  │   histogram(1)=  0  1   0  1   0  1   0  0
  │                <--- -3 --- -2 --- -1 --- 5
  ├── cost: 25.05
+ ├── cost-flags: unbounded-cardinality
  ├── key: (1)
  └── distribution: test
 
@@ -1390,14 +1392,19 @@ INSERT INTO ka VALUES (10, 10)
 statement ok
 CREATE STATISTICS ka_partialstat ON a FROM ka USING EXTREMES
 
-query T retry
+# Now clear the stats cache so that the query below is guaranteed to pick up the
+# new stats (partial and merged).
+statement ok
+SELECT crdb_internal.clear_table_stats_cache();
+
+query T
 EXPLAIN SELECT * FROM ka WHERE a > 5
 ----
 distribution: local
 vectorized: true
 ·
 • scan
-  estimated row count: 4 (36% of the table; stats collected <hidden> ago)
+  estimated row count: 4 (40% of the table; stats collected <hidden> ago)
   table: ka@ka_a_idx
   spans: [/6 - ]
 
@@ -1436,3 +1443,38 @@ vectorized: true
   estimated row count: 1 (9.1% of the table; stats collected <hidden> ago)
   table: ka@ka_a_idx
   spans: [/10 - /10]
+
+subtest regression_148316
+
+# Ensure we can run DELETE statement on system.table_statistics.
+statement ok
+INSERT INTO system.users (username, "hashedPassword", "isRole", user_id) VALUES ('node', NULL, true, 3);
+
+statement ok
+GRANT node TO root;
+
+# Keep only partial stats on the target table.
+statement ok
+DELETE FROM system.table_statistics WHERE name NOT LIKE '%partial%' AND "tableID" = 'ka'::REGCLASS::OID;
+
+query TT
+SELECT statistics_name, column_names FROM [SHOW STATISTICS FOR TABLE ka] ORDER BY created
+----
+ka_partialstat  {a}
+
+# Ensure that the system table is read on the next query.
+statement ok
+SELECT crdb_internal.clear_table_stats_cache();
+
+query T
+EXPLAIN SELECT * FROM ka WHERE a = 10
+----
+distribution: local
+vectorized: true
+·
+• scan
+  missing stats
+  table: ka@ka_a_idx
+  spans: [/10 - /10]
+
+subtest end

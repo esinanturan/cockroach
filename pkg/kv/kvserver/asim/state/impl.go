@@ -11,13 +11,13 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"reflect"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/RaduBerinde/btree" // TODO(#144504): switch to the newer btree
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator"
 	"github.com/cockroachdb/cockroach/pkg/kv/kvserver/allocator/allocatorimpl"
@@ -34,6 +34,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/spanconfig/spanconfigreporter"
 	"github.com/cockroachdb/cockroach/pkg/util/hlc"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
+	"github.com/google/btree"
 )
 
 type state struct {
@@ -88,7 +89,7 @@ func newState(settings *config.SimulationSettings) *state {
 type rmap struct {
 	// NB: Both rangeTree and rangeMap hold references to ranges. They must
 	// both be updated on insertion and deletion to maintain consistent state.
-	rangeTree *btree.BTree
+	rangeTree *btree.BTreeG[*rng]
 	rangeMap  map[RangeID]*rng
 
 	// Unique ID generator for Ranges.
@@ -96,18 +97,16 @@ type rmap struct {
 }
 
 func newRMap() *rmap {
+	lessFn := func(a, b *rng) bool {
+		return a.startKey < b.startKey
+	}
 	rmap := &rmap{
-		rangeTree: btree.New(8),
+		rangeTree: btree.NewG[*rng](8, lessFn),
 		rangeMap:  make(map[RangeID]*rng),
 	}
 
 	rmap.initFirstRange()
 	return rmap
-}
-
-// Less is part of the btree.Item interface.
-func (r *rng) Less(than btree.Item) bool {
-	return r.startKey < than.(*rng).startKey
 }
 
 // initFirstRange initializes the first range within the rangemap, with
@@ -164,8 +163,7 @@ func (s *state) String() string {
 	builder := &strings.Builder{}
 
 	orderedRanges := []*rng{}
-	s.ranges.rangeTree.Ascend(func(i btree.Item) bool {
-		r := i.(*rng)
+	s.ranges.rangeTree.Ascend(func(r *rng) bool {
 		orderedRanges = append(orderedRanges, r)
 		return !r.desc.EndKey.Equal(MaxKey.ToRKey())
 	})
@@ -189,16 +187,21 @@ func (s *state) String() string {
 		}
 	}
 	builder.WriteString("] ")
+	builder.WriteString("\n")
 
 	nRanges := len(orderedRanges)
 	iterRanges := 0
 	builder.WriteString(fmt.Sprintf("ranges(%d)=[", nRanges))
+	numOfRangesPerLine := 5
 	for _, r := range orderedRanges {
 		builder.WriteString(r.String())
 		if iterRanges < nRanges-1 {
 			builder.WriteString(",")
 		}
 		iterRanges++
+		if iterRanges%numOfRangesPerLine == 0 {
+			builder.WriteString("\n")
+		}
 	}
 	builder.WriteString("]")
 
@@ -267,7 +270,9 @@ func (s *state) capacity(storeID StoreID) roachpb.StoreCapacity {
 	capacity := store.desc.Capacity
 	capacity.QueriesPerSecond = 0
 	capacity.WritesPerSecond = 0
+	capacity.WriteBytesPerSecond = 0
 	capacity.LogicalBytes = 0
+	capacity.CPUPerSecond = 0
 	capacity.LeaseCount = 0
 	capacity.RangeCount = 0
 	capacity.Used = 0
@@ -275,20 +280,19 @@ func (s *state) capacity(storeID StoreID) roachpb.StoreCapacity {
 
 	for _, repl := range s.Replicas(storeID) {
 		rangeID := repl.Range()
-		replicaID := repl.ReplicaID()
 		rng, _ := s.Range(rangeID)
-		if rng.Leaseholder() == replicaID {
-			// TODO(kvoli): We currently only consider load on the leaseholder
-			// replica for a range. The other replicas have an estimate that is
-			// calculated within the allocation algorithm. Adapt this to
-			// support follower reads, when added to the workload generator.
-			usage := s.RangeUsageInfo(rng.RangeID(), storeID)
-			capacity.QueriesPerSecond += usage.QueriesPerSecond
-			capacity.WritesPerSecond += usage.WritesPerSecond
-			capacity.LogicalBytes += usage.LogicalBytes
+		usage := s.RangeUsageInfo(rng.RangeID(), storeID)
+		// RangeUsageInfo should return valid usage depending on leaseholder. No
+		// special handling needed here.
+		capacity.QueriesPerSecond += usage.QueriesPerSecond
+		capacity.WritesPerSecond += usage.WritesPerSecond
+		capacity.WriteBytesPerSecond += usage.WriteBytesPerSecond
+		capacity.LogicalBytes += usage.LogicalBytes
+		capacity.CPUPerSecond += usage.RequestCPUNanosPerSecond + usage.RaftCPUNanosPerSecond
+		capacity.RangeCount++
+		if leaseholder, _ := s.LeaseholderStore(rangeID); leaseholder.StoreID() == storeID {
 			capacity.LeaseCount++
 		}
-		capacity.RangeCount++
 	}
 
 	// TODO(kvoli): parameterize the logical to actual used storage bytes. At the
@@ -330,8 +334,8 @@ func (s *state) rangeFor(key Key) *rng {
 	var r *rng
 	// If keyToFind equals to MinKey of the range, we found the right range, if
 	// the range is less than keyToFind then this is the right range also.
-	s.ranges.rangeTree.DescendLessOrEqual(keyToFind, func(i btree.Item) bool {
-		r = i.(*rng)
+	s.ranges.rangeTree.DescendLessOrEqual(keyToFind, func(i *rng) bool {
+		r = i
 		return false
 	})
 	return r
@@ -433,6 +437,34 @@ func (s *state) SetNodeLocality(nodeID NodeID, locality roachpb.Locality) {
 	}
 }
 
+func (s *state) SetNodeCPURateCapacity(nodeID NodeID, cpuRateCapacity int64) {
+	node, ok := s.nodes[nodeID]
+	if !ok {
+		panic(fmt.Sprintf("programming error: node with ID %d doesn't exist", nodeID))
+	}
+	node.cpuRateCapacity = cpuRateCapacity
+}
+
+// NodeCapacity returns the capacity of the Node with ID NodeID. Note that it is
+// currently unused.
+// TODO(wenyihu6): MMA integration should later use it.
+func (s *state) NodeCapacity(nodeID NodeID) roachpb.NodeCapacity {
+	node := s.nodes[nodeID]
+	stores := node.Stores()
+	cpuRate := 0
+	for _, storeID := range stores {
+		capacity := s.capacity(storeID)
+		cpuRate += int(capacity.CPUPerSecond)
+	}
+
+	return roachpb.NodeCapacity{
+		StoresCPURate:       int64(cpuRate),
+		NumStores:           int32(len(stores)),
+		NodeCPURateUsage:    int64(cpuRate),
+		NodeCPURateCapacity: node.cpuRateCapacity,
+	}
+}
+
 // Topology represents the locality hierarchy information for a cluster.
 type Topology struct {
 	children map[string]*Topology
@@ -515,7 +547,7 @@ func (s *state) AddStore(nodeID NodeID) (Store, bool) {
 	node := s.nodes[nodeID]
 	s.storeSeqGen++
 	storeID := s.storeSeqGen
-	sp, st := NewStorePool(s.NodeCountFn(), s.NodeLivenessFn(), hlc.NewClockForTesting(s.clock))
+	sp, st := NewStorePool(s.NodeCountFn(), s.NodeLivenessFn(), hlc.NewClockForTesting(s.clock), s.settings.ST)
 	store := &store{
 		storeID:   storeID,
 		nodeID:    nodeID,
@@ -688,8 +720,7 @@ func (s *state) SetSpanConfig(span roachpb.Span, config *roachpb.SpanConfig) {
 	//   [f, z)         - keeps old span config from [c,z)
 
 	splitsRequired := []Key{}
-	s.ranges.rangeTree.DescendLessOrEqual(&rng{startKey: startKey}, func(i btree.Item) bool {
-		cur, _ := i.(*rng)
+	s.ranges.rangeTree.DescendLessOrEqual(&rng{startKey: startKey}, func(cur *rng) bool {
 		rStart := cur.startKey
 		// There are two cases we handle:
 		// (1) rStart == startKey: We don't need to split.
@@ -702,8 +733,7 @@ func (s *state) SetSpanConfig(span roachpb.Span, config *roachpb.SpanConfig) {
 		return false
 	})
 
-	s.ranges.rangeTree.DescendLessOrEqual(&rng{startKey: endKey}, func(i btree.Item) bool {
-		cur, _ := i.(*rng)
+	s.ranges.rangeTree.DescendLessOrEqual(&rng{startKey: endKey}, func(cur *rng) bool {
 		rEnd := cur.endKey
 		rStart := cur.startKey
 		if rStart == endKey {
@@ -732,8 +762,7 @@ func (s *state) SetSpanConfig(span roachpb.Span, config *roachpb.SpanConfig) {
 	}
 
 	// Apply the span config to all the ranges affected.
-	s.ranges.rangeTree.AscendGreaterOrEqual(&rng{startKey: startKey}, func(i btree.Item) bool {
-		cur, _ := i.(*rng)
+	s.ranges.rangeTree.AscendGreaterOrEqual(&rng{startKey: startKey}, func(cur *rng) bool {
 		if cur.startKey == endKey {
 			return false
 		}
@@ -800,16 +829,15 @@ func (s *state) SplitRange(splitKey Key) (Range, Range, bool) {
 	endKey := Key(math.MaxInt32)
 	failed := false
 	// Find the sucessor range in the range map, to determine the endkey.
-	ranges.rangeTree.AscendGreaterOrEqual(r, func(i btree.Item) bool {
+	ranges.rangeTree.AscendGreaterOrEqual(r, func(i *rng) bool {
 		// The min key already exists in the range map, we cannot return a new
 		// range.
-		if !r.Less(i) {
+		if r.startKey == i.startKey {
 			failed = true
 			return false
 		}
 
-		successorRange, _ := i.(*rng)
-		endKey = successorRange.startKey
+		endKey = i.startKey
 		return false
 	})
 
@@ -822,10 +850,10 @@ func (s *state) SplitRange(splitKey Key) (Range, Range, bool) {
 	var predecessorRange *rng
 	// Find the predecessor range, to update it's endkey to the new range's min
 	// key.
-	ranges.rangeTree.DescendLessOrEqual(r, func(i btree.Item) bool {
+	ranges.rangeTree.DescendLessOrEqual(r, func(i *rng) bool {
 		// The case where the min key already exists cannot occur here, as the
 		// failed flag will have been set above.
-		predecessorRange, _ = i.(*rng)
+		predecessorRange = i
 		return false
 	})
 
@@ -998,8 +1026,7 @@ func (s *state) ApplyLoad(lb workload.LoadBatch) {
 	// that range is not larger than the any key of the remaining load events.
 	iter := n - 1
 	max := &rng{startKey: Key(lb[iter].Key)}
-	s.ranges.rangeTree.DescendLessOrEqual(max, func(i btree.Item) bool {
-		next, _ := i.(*rng)
+	s.ranges.rangeTree.DescendLessOrEqual(max, func(next *rng) bool {
 		for iter > -1 && lb[iter].Key >= int64(next.startKey) {
 			s.applyLoad(next, lb[iter])
 			iter--
@@ -1025,29 +1052,36 @@ func (s *state) applyLoad(rng *rng, le workload.LoadEvent) {
 	s.loadsplits[store.StoreID()].Record(s.clock.Now(), rng.rangeID, le)
 }
 
-// ReplicaLoad returns the usage information for the Range with ID
-// RangeID on the store with ID StoreID.
+// RangeUsageInfo returns the usage information for the Range with ID RangeID on
+// the store with ID StoreID. If the given store has a replica for the range,
+// this returns the write-bytes-per-second, raft cpu, written keys and logical
+// bytes. If the given store is the leaseholder for the range, then the request
+// cpu and qps is also returned. If the given store does not have a replica for
+// the range, this function panics.
 func (s *state) RangeUsageInfo(rangeID RangeID, storeID StoreID) allocator.RangeUsageInfo {
-	// NB: we only return the actual replica load, if the range leaseholder is
-	// currently on the store given. Otherwise, return an empty, zero counter
-	// value.
-	store, ok := s.LeaseholderStore(rangeID)
+	r, ok := s.Range(rangeID)
 	if !ok {
 		panic(fmt.Sprintf("no leaseholder store found for range %d", storeID))
 	}
 
-	r, _ := s.Range(rangeID)
-	// TODO(kvoli): The requested storeID is not the leaseholder. Non
-	// leaseholder load tracking is not currently supported but is checked by
-	// other components such as hot ranges. In this case, ignore it but we
-	// should also track non leaseholder load. See load.go for more. Return an
-	// empty initialized load counter here.
-	if store.StoreID() != storeID {
-		return allocator.RangeUsageInfo{LogicalBytes: r.Size()}
+	if _, ok = r.Replica(storeID); !ok {
+		panic(fmt.Sprintf("no replica found for range %v on store %v [replicas=%v]",
+			rangeID, storeID, r.Replicas()))
 	}
 
 	usage := s.load[rangeID].Load()
 	usage.LogicalBytes = r.Size()
+	leaseholderStore, ok := s.LeaseholderStore(rangeID)
+	if !ok {
+		panic(fmt.Sprintf("no leaseholder store found for range %v", rangeID))
+	}
+
+	if leaseholderStore.StoreID() != storeID {
+		// See the method comment, we don't include the request cpu or qps for
+		// non-leaseholder replicas.
+		usage.RequestCPUNanosPerSecond = 0
+		usage.QueriesPerSecond = 0
+	}
 	return usage
 }
 
@@ -1070,7 +1104,7 @@ func (s *state) Clock() timeutil.TimeSource {
 // UpdateStorePool modifies the state of the StorePool for the Store with
 // ID StoreID.
 func (s *state) UpdateStorePool(
-	storeID StoreID, storeDescriptors map[roachpb.StoreID]*storepool.StoreDetail,
+	storeID StoreID, storeDescriptors map[roachpb.StoreID]*storepool.StoreDetailMu,
 ) {
 	var storeIDs roachpb.StoreIDSlice
 	for storeIDA := range storeDescriptors {
@@ -1079,10 +1113,8 @@ func (s *state) UpdateStorePool(
 	sort.Sort(storeIDs)
 	for _, gossipStoreID := range storeIDs {
 		detail := storeDescriptors[gossipStoreID]
-		copiedDetail := *detail
-		copiedDesc := *detail.Desc
-		copiedDetail.Desc = &copiedDesc
-		s.stores[storeID].storepool.DetailsMu.StoreDetails[gossipStoreID] = &copiedDetail
+		copiedDetail := detail.Copy()
+		s.stores[storeID].storepool.Details.StoreDetails.Store(gossipStoreID, copiedDetail)
 	}
 }
 
@@ -1283,7 +1315,7 @@ func (s *state) Scan(
 func (s *state) Report() roachpb.SpanConfigConformanceReport {
 	reporter := spanconfigreporter.New(
 		s.nodeLiveness, s, s, s,
-		cluster.MakeClusterSettings(), &spanconfig.TestingKnobs{})
+		s.settings.ST, &spanconfig.TestingKnobs{})
 	report, err := reporter.SpanConfigConformance(context.Background(), []roachpb.Span{{}})
 	if err != nil {
 		panic(fmt.Sprintf("programming error: error getting span config report %s", err.Error()))
@@ -1324,10 +1356,32 @@ func (s *state) RegisterConfigChangeListener(listener ConfigChangeListener) {
 	s.configChangeListeners = append(s.configChangeListeners, listener)
 }
 
+// SetSimulationSettings sets the simulation setting for the given key to the
+// given value.
+func (s *state) SetSimulationSettings(Key string, Value interface{}) {
+	settingsValue := reflect.ValueOf(s.settings).Elem()
+	settingsType := settingsValue.Type()
+
+	for i := 0; i < settingsValue.NumField(); i++ {
+		field := settingsType.Field(i)
+		if field.Name == Key {
+			fieldValue := settingsValue.Field(i)
+			if fieldValue.CanSet() {
+				newValue := reflect.ValueOf(Value)
+				if newValue.Type().ConvertibleTo(fieldValue.Type()) {
+					fieldValue.Set(newValue.Convert(fieldValue.Type()))
+				}
+			}
+			break
+		}
+	}
+}
+
 // node is an implementation of the Node interface.
 type node struct {
-	nodeID NodeID
-	desc   roachpb.NodeDescriptor
+	nodeID          NodeID
+	desc            roachpb.NodeDescriptor
+	cpuRateCapacity int64
 
 	stores []StoreID
 }

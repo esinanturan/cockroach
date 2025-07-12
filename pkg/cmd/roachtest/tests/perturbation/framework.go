@@ -107,7 +107,12 @@ var numNodes = []int{5, 12, 30}
 var numVCPUs = []int{4, 8, 16, 32}
 var numDisks = []int{1, 2}
 var memOptions = []spec.MemPerCPU{spec.Low, spec.Standard, spec.High}
-var cloudSets = []registry.CloudSet{registry.OnlyAWS, registry.OnlyGCE, registry.OnlyAzure}
+var cloudSets = []registry.CloudSet{
+	registry.OnlyAWS,
+	registry.OnlyGCE,
+	registry.OnlyAzure,
+	registry.OnlyIBM,
+}
 var admissionControlOptions = []admissionControlMode{elasticOnlyBoth, fullNormalElasticRepl, fullBoth}
 var diskBandwidthLimitOptions = []string{"0", "350MiB"}
 
@@ -238,7 +243,7 @@ func (v variations) randomize(rng *rand.Rand) variations {
 func setup(p perturbation, acceptableChange float64) variations {
 	v := variations{}
 	v.workload = kvWorkload{}
-	v.leaseType = registry.EpochLeases
+	v.leaseType = registry.LeaderLeases
 	v.blockSize = 4096
 	v.splits = 10000
 	v.numNodes = 12
@@ -292,6 +297,10 @@ func RegisterTests(r registry.Registry) {
 
 func (v variations) makeClusterSpec() spec.ClusterSpec {
 	opts := append(v.specOptions, spec.CPU(v.vcpu), spec.SSD(v.disks), spec.Mem(v.mem), spec.TerminateOnMigration())
+	// Disable cluster reuse to avoid potential cgroup side effects.
+	if v.perturbationName() == "slowDisk" {
+		opts = append(opts, spec.ReuseNone())
+	}
 	return spec.MakeClusterSpec(v.numNodes+v.numWorkloadNodes, opts...)
 }
 
@@ -614,7 +623,7 @@ func (v variations) runTest(ctx context.Context, t test.Test, c cluster.Cluster)
 	t.Status("T0: starting nodes")
 
 	// Track the three operations that we are sending in this test.
-	m := c.NewMonitor(ctx, v.stableNodes())
+	m := c.NewDeprecatedMonitor(ctx, v.stableNodes())
 
 	// Start the stable nodes and let the perturbation start the target node(s).
 	v.startNoBackup(ctx, t, v.stableNodes())

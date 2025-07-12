@@ -23,12 +23,11 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/eval"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
-	"github.com/cockroachdb/cockroach/pkg/util/ctxgroup"
+	"github.com/cockroachdb/cockroach/pkg/util/humanizeutil"
 	"github.com/cockroachdb/errors"
 )
 
-// defaultScanBuffer is the default max row size of the PGCOPY and PGDUMP
-// scanner.
+// defaultScanBuffer is the default max row size of the PGCOPY.
 const defaultScanBuffer = 1024 * 1024 * 4
 
 type pgCopyReader struct {
@@ -62,9 +61,6 @@ func newPgCopyReader(
 		},
 		opts: opts,
 	}, nil
-}
-
-func (d *pgCopyReader) start(ctx ctxgroup.Group) {
 }
 
 func (d *pgCopyReader) readFiles(
@@ -375,4 +371,12 @@ func (d *pgCopyReader) readFile(
 	}
 
 	return runParallelImport(ctx, d.importCtx, fileCtx, producer, consumer)
+}
+
+func wrapWithLineTooLongHint(err error) error {
+	return errors.WithHintf(
+		err,
+		"use `max_row_size` to increase the maximum line limit (default: %s).",
+		humanizeutil.IBytes(defaultScanBuffer),
+	)
 }

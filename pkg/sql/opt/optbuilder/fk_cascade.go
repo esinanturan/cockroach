@@ -225,6 +225,39 @@ func (mb *mutationBuilder) tryNewOnDeleteFastCascadeBuilder(
 		return nil, false
 	}
 
+	// For a REGIONAL BY ROW child table, if the region column is part of the FK,
+	// check that it is constrained to a single value. If this is not the case,
+	// the fast path can be suboptimal, since joining against the parent buffer
+	// will constrain the region column to a single constant value.
+	if childTab.IsRegionalByRow() &&
+		mb.b.evalCtx.SessionData().OptimizerDisableCrossRegionCascadeFastPathForRBRTables {
+		// The regional column is the first in every index, including the primary.
+		regionalColOrd := childTab.Index(cat.PrimaryIndex).Column(0).Ordinal()
+		var regionalColID opt.ColumnID
+		for i, colID := range fkCols {
+			if fk.OriginColumnOrdinal(childTab, i) == regionalColOrd {
+				regionalColID = colID
+				break
+			}
+		}
+		if regionalColID != 0 {
+			regionalColIsConstrained := false
+			for i := range filters {
+				if eq, isEq := filters[i].Condition.(*memo.EqExpr); isEq {
+					if v, leftIsVar := eq.Left.(*memo.VariableExpr); leftIsVar && v.Col == regionalColID {
+						if opt.IsConstValueOp(eq.Right) {
+							regionalColIsConstrained = true
+							break
+						}
+					}
+				}
+			}
+			if !regionalColIsConstrained {
+				return nil, false
+			}
+		}
+	}
+
 	var visited intsets.Fast
 	parentTabID := parentTab.ID()
 	childTabID := childTab.ID()
@@ -515,7 +548,7 @@ func (cb *onDeleteSetBuilder) Build(
 					updateExprs[i].Expr = tree.DefaultVal{}
 				}
 			}
-			mb.addUpdateCols(updateExprs)
+			mb.addUpdateCols(updateExprs, nil /* colRefs */)
 
 			// Register the mutation with the statementTree
 			b.checkMultipleMutations(mb.tab, generalMutation)
@@ -527,7 +560,8 @@ func (cb *onDeleteSetBuilder) Build(
 			// against the parent we are cascading from. Need to investigate in which
 			// cases this is safe (e.g. other cascades could have messed with the parent
 			// table in the meantime).
-			mb.buildUpdate(nil /* returning */)
+			// The exempt policy is used for RLS to maintain data integrity.
+			mb.buildUpdate(nil /* returning */, cat.PolicyScopeExempt, nil /* colRefs */)
 			return mb.outScope.expr
 		})
 }
@@ -775,7 +809,7 @@ func (cb *onUpdateCascadeBuilder) Build(
 					panic(errors.AssertionFailedf("unsupported action"))
 				}
 			}
-			mb.addUpdateCols(updateExprs)
+			mb.addUpdateCols(updateExprs, nil /* colRefs */)
 
 			// Register the mutation with the statementTree
 			b.checkMultipleMutations(mb.tab, generalMutation)
@@ -783,7 +817,8 @@ func (cb *onUpdateCascadeBuilder) Build(
 			// Cascades can fire triggers on the child table.
 			mb.buildRowLevelBeforeTriggers(tree.TriggerEventUpdate, true /* cascade */)
 
-			mb.buildUpdate(nil /* returning */)
+			// The exempt policy is used for RLS to maintain data integrity.
+			mb.buildUpdate(nil /* returning */, cat.PolicyScopeExempt, nil /* colRefs */)
 			return mb.outScope.expr
 		})
 }

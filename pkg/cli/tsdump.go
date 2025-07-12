@@ -29,6 +29,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/ts"
 	"github.com/cockroachdb/cockroach/pkg/ts/tspb"
 	"github.com/cockroachdb/cockroach/pkg/ts/tsutil"
+	"github.com/cockroachdb/cockroach/pkg/util/netutil/addr"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
 	"github.com/spf13/cobra"
@@ -37,18 +38,20 @@ import (
 // TODO(knz): this struct belongs elsewhere.
 // See: https://github.com/cockroachdb/cockroach/issues/49509
 var debugTimeSeriesDumpOpts = struct {
-	format           tsDumpFormat
-	from, to         timestampValue
-	clusterLabel     string
-	yaml             string
-	targetURL        string
-	ddApiKey         string
-	ddSite           string
-	httpToken        string
-	clusterID        string
-	zendeskTicket    string
-	organizationName string
-	userName         string
+	format                 tsDumpFormat
+	from, to               timestampValue
+	clusterLabel           string
+	yaml                   string
+	targetURL              string
+	ddApiKey               string
+	ddSite                 string
+	httpToken              string
+	clusterID              string
+	zendeskTicket          string
+	organizationName       string
+	userName               string
+	storeToNodeMapYAMLFile string
+	dryRun                 bool
 }{
 	format:       tsDumpText,
 	from:         timestampValue{},
@@ -56,6 +59,9 @@ var debugTimeSeriesDumpOpts = struct {
 	clusterLabel: "",
 	yaml:         "/tmp/tsdump.yaml",
 }
+
+// hostNameOverride is used to override the hostname for testing purpose.
+var hostNameOverride string
 
 var debugTimeSeriesDumpCmd = &cobra.Command{
 	Use:   "tsdump",
@@ -109,18 +115,16 @@ will then convert it to the --format requested in the current invocation.
 				return errors.New("no input file provided")
 			}
 
-			targetURL, err := getDatadogTargetURL(debugTimeSeriesDumpOpts.ddSite)
-			if err != nil {
-				return err
-			}
-
-			var datadogWriter = makeDatadogWriter(
-				targetURL,
+			datadogWriter, err := makeDatadogWriter(
+				debugTimeSeriesDumpOpts.ddSite,
 				cmd == tsDumpDatadogInit,
 				debugTimeSeriesDumpOpts.ddApiKey,
 				100,
-				doDDRequest,
+				hostNameOverride,
 			)
+			if err != nil {
+				return err
+			}
 			return datadogWriter.upload(args[0])
 		case tsDumpOpenMetrics:
 			if debugTimeSeriesDumpOpts.targetURL != "" {
@@ -137,13 +141,15 @@ will then convert it to the --format requested in the current invocation.
 		if convertFile == "" {
 			// To enable conversion without a running cluster, we want to skip
 			// connecting to the server when converting an existing tsdump.
-			conn, finish, err := getClientGRPCConn(ctx, serverCfg)
+			conn, finish, err := newClientConn(ctx, serverCfg)
 			if err != nil {
 				return err
 			}
 			defer finish()
 
-			names, err := serverpb.GetInternalTimeseriesNamesFromServer(ctx, conn)
+			target, _ := addr.AddrWithDefaultLocalhost(serverCfg.AdvertiseAddr)
+			adminClient := conn.NewAdminClient()
+			names, err := serverpb.GetInternalTimeseriesNamesFromServer(ctx, adminClient)
 			if err != nil {
 				return err
 			}
@@ -155,12 +161,12 @@ will then convert it to the --format requested in the current invocation.
 					tspb.TimeSeriesResolution_RESOLUTION_30M, tspb.TimeSeriesResolution_RESOLUTION_10S,
 				},
 			}
-			tsClient := tspb.NewTimeSeriesClient(conn)
 
+			tsClient := conn.NewTimeSeriesClient()
 			if debugTimeSeriesDumpOpts.format == tsDumpRaw {
 				stream, err := tsClient.DumpRaw(context.Background(), req)
 				if err != nil {
-					return err
+					return errors.Wrapf(err, "connecting to %s", target)
 				}
 
 				// Buffer the writes to os.Stdout since we're going to
@@ -171,7 +177,8 @@ will then convert it to the --format requested in the current invocation.
 				}
 
 				// get the node details so that we can get the SQL port
-				resp, err := serverpb.NewStatusClient(conn).Details(ctx, &serverpb.DetailsRequest{NodeId: "local"})
+				statusClient := conn.NewStatusClient()
+				resp, err := statusClient.Details(ctx, &serverpb.DetailsRequest{NodeId: "local"})
 				if err != nil {
 					return err
 				}
@@ -190,7 +197,7 @@ will then convert it to the --format requested in the current invocation.
 			}
 			stream, err := tsClient.Dump(context.Background(), req)
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "connecting to %s", target)
 			}
 			recv = stream.Recv
 		} else {
@@ -245,22 +252,13 @@ will then convert it to the --format requested in the current invocation.
 				return w.Flush()
 			}
 			if err != nil {
-				return err
+				return errors.Wrapf(err, "connecting to %s", serverCfg.AdvertiseAddr)
 			}
 			if err := w.Emit(data); err != nil {
 				return err
 			}
 		}
 	}),
-}
-
-func getDatadogTargetURL(site string) (string, error) {
-	host, ok := ddSiteToHostMap[site]
-	if !ok {
-		return "", fmt.Errorf("unsupported datadog site '%s'", site)
-	}
-	targetURL := fmt.Sprintf(targetURLFormat, host)
-	return targetURL, nil
 }
 
 func doRequest(req *http.Request) error {

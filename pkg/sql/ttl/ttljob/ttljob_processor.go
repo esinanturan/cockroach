@@ -16,9 +16,7 @@ import (
 
 	"github.com/cockroachdb/cockroach/pkg/jobs"
 	"github.com/cockroachdb/cockroach/pkg/jobs/jobspb"
-	"github.com/cockroachdb/cockroach/pkg/keys"
 	"github.com/cockroachdb/cockroach/pkg/kv"
-	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catenumpb"
@@ -26,12 +24,14 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/descs"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfra"
 	"github.com/cockroachdb/cockroach/pkg/sql/execinfrapb"
+	"github.com/cockroachdb/cockroach/pkg/sql/execversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/isql"
 	"github.com/cockroachdb/cockroach/pkg/sql/lexbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowenc"
 	"github.com/cockroachdb/cockroach/pkg/sql/rowexec"
 	"github.com/cockroachdb/cockroach/pkg/sql/sem/tree"
 	"github.com/cockroachdb/cockroach/pkg/sql/sessiondata"
+	"github.com/cockroachdb/cockroach/pkg/sql/spanutils"
 	"github.com/cockroachdb/cockroach/pkg/sql/ttl/ttlbase"
 	"github.com/cockroachdb/cockroach/pkg/sql/types"
 	"github.com/cockroachdb/cockroach/pkg/util/admission/admissionpb"
@@ -41,6 +41,7 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/util/retry"
 	"github.com/cockroachdb/cockroach/pkg/util/timeutil"
 	"github.com/cockroachdb/errors"
+	pbtypes "github.com/gogo/protobuf/types"
 )
 
 // ttlMaxKVAutoRetry is the maximum number of times a TTL operation will
@@ -61,19 +62,110 @@ var ttlMaxKVAutoRetry = settings.RegisterIntSetting(
 // that is run by runTTLOnQueryBounds.
 type ttlProcessor struct {
 	execinfra.ProcessorBase
-	ttlSpec execinfrapb.TTLSpec
+	ttlSpec              execinfrapb.TTLSpec
+	processorConcurrency int64
+	progressUpdater      ttlProgressUpdater
 }
 
 var _ execinfra.RowSource = (*ttlProcessor)(nil)
+var _ execinfra.Processor = (*ttlProcessor)(nil)
 
-func (t *ttlProcessor) Start(ctx context.Context) {
+// ttlProgressUpdater abstracts how a TTL processor reports its progress.
+// Implementations can either write directly to the job table (legacy) or stream
+// metadata back to the coordinator (preferred).
+type ttlProgressUpdater interface {
+	// InitProgress is called once at the beginning of the TTL processor.
+	InitProgress(totalSpanCount int64)
+	// UpdateProgress is called to refresh the TTL processor progress.
+	UpdateProgress(ctx context.Context, output execinfra.RowReceiver) error
+	// OnSpanProcessed is called each time a span has been processed (even partially).
+	OnSpanProcessed(spansProcessed, deletedRowCount int64)
+	// FinalizeProgress is the final call to update the progress once all spans have been processed.
+	FinalizeProgress(ctx context.Context, output execinfra.RowReceiver) error
+}
+
+// directJobProgressUpdater handles TTL progress updates by writing directly to
+// the jobs table from this processor. This is the legacy model and exists to
+// support mixed-version scenarios.
+//
+// This can be removed once version 25.4 is the minimum supported version.
+type directJobProgressUpdater struct {
+	// proc references the running TTL processor.
+	proc *ttlProcessor
+
+	// updateEvery is the number of spans that must be processed before triggering a progress update.
+	updateEvery int64
+
+	// updateEveryDuration is the minimum amount of time that must pass between progress updates.
+	updateEveryDuration time.Duration
+
+	// lastUpdated records the time of the last progress update.
+	lastUpdated time.Time
+
+	// totalSpanCount is the total number of spans assigned to this processor.
+	totalSpanCount int64
+
+	// rowsProcessed is the cumulative number of rows deleted.
+	rowsProcessed atomic.Int64
+
+	// rowsProcessedSinceLastUpdate is the number of rows deleted since the last progress update.
+	rowsProcessedSinceLastUpdate atomic.Int64
+
+	// spansProcessed is the cumulative number of spans processed.
+	spansProcessed atomic.Int64
+
+	// spansProcessedSinceLastUpdate is the number of spans processed since the last progress update.
+	spansProcessedSinceLastUpdate atomic.Int64
+}
+
+// coordinatorStreamUpdater handles TTL progress updates by flowing the
+// information back to the coordinator. The coordinator is then responsible for
+// writing that back to the jobs table.
+type coordinatorStreamUpdater struct {
+	// proc references the running TTL processor.
+	proc *ttlProcessor
+
+	// totalSpanCount is the total number of spans assigned to this processor.
+	totalSpanCount int64
+
+	// deletedRowCount tracks the cumulative number of rows deleted by this processor.
+	deletedRowCount atomic.Int64
+
+	// processedSpanCount tracks the number of spans this processor has reported as processed.
+	processedSpanCount atomic.Int64
+
+	// progressLogger is used to control how often we log progress updates that
+	// are sent back to the coordinator.
+	progressLogger log.EveryN
+}
+
+// Start implements the execinfra.RowSource interface.
+func (t *ttlProcessor) Start(context.Context) {}
+
+// Run implements the execinfra.Processor interface.
+func (t *ttlProcessor) Run(ctx context.Context, output execinfra.RowReceiver) {
 	ctx = t.StartInternal(ctx, "ttl")
-	err := t.work(ctx)
-	t.MoveToDraining(err)
+	v := execversion.FromContext(ctx)
+	// TTL processors support two progress update models. The legacy model (used in V25_2)
+	// has each processor write progress directly to the job table. The newer model flows
+	// progress metadata back to the coordinator, which handles the job table updates centrally.
+	// The selected behavior is gated on the active cluster version.
+	// TODO(spilchen): remove directJobProgerssUpdater once 25.4 is the minimum supported version.
+	if v == execversion.V25_2 {
+		t.progressUpdater = &directJobProgressUpdater{proc: t}
+	} else {
+		t.progressUpdater = &coordinatorStreamUpdater{proc: t, progressLogger: log.Every(1 * time.Minute)}
+	}
+	err := t.work(ctx, output)
+	if err != nil {
+		output.Push(nil, &execinfrapb.ProducerMetadata{Err: err})
+	}
+	execinfra.SendTraceData(ctx, t.FlowCtx, output)
+	output.ProducerDone()
 }
 
 func getTableInfo(
-	ctx context.Context, db descs.DB, descsCol *descs.Collection, tableID descpb.ID,
+	ctx context.Context, db descs.DB, tableID descpb.ID,
 ) (
 	relationName string,
 	pkColIDs catalog.TableColMap,
@@ -84,8 +176,8 @@ func getTableInfo(
 	labelMetrics bool,
 	err error,
 ) {
-	err = db.Txn(ctx, func(ctx context.Context, txn isql.Txn) error {
-		desc, err := descsCol.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID)
+	err = db.DescsTxn(ctx, func(ctx context.Context, txn descs.Txn) error {
+		desc, err := txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, tableID)
 		if err != nil {
 			return err
 		}
@@ -99,7 +191,7 @@ func getTableInfo(
 			pkColNames = append(pkColNames, buf.String())
 			buf.Reset()
 		}
-		pkColTypes, err = GetPKColumnTypes(desc, primaryIndexDesc)
+		pkColTypes, err = spanutils.GetPKColumnTypes(desc, primaryIndexDesc)
 		if err != nil {
 			return err
 		}
@@ -116,7 +208,7 @@ func getTableInfo(
 		rowLevelTTL := desc.GetRowLevelTTL()
 		labelMetrics = rowLevelTTL.LabelMetrics
 
-		tn, err := descs.GetObjectName(ctx, txn.KV(), descsCol, desc)
+		tn, err := descs.GetObjectName(ctx, txn.KV(), txn.Descriptors(), desc)
 		if err != nil {
 			return errors.Wrapf(err, "error fetching table relation name for TTL")
 		}
@@ -127,18 +219,20 @@ func getTableInfo(
 	return relationName, pkColIDs, pkColNames, pkColTypes, pkColDirs, numFamilies, labelMetrics, err
 }
 
-func (t *ttlProcessor) work(ctx context.Context) error {
-
+func (t *ttlProcessor) work(ctx context.Context, output execinfra.RowReceiver) error {
 	ttlSpec := t.ttlSpec
 	flowCtx := t.FlowCtx
 	serverCfg := flowCtx.Cfg
 	db := serverCfg.DB
-	descsCol := flowCtx.Descriptors
 	codec := serverCfg.Codec
 	details := ttlSpec.RowLevelTTLDetails
 	tableID := details.TableID
 	cutoff := details.Cutoff
 	ttlExpr := ttlSpec.TTLExpr
+
+	// Note: the ttl-restart test depends on this message to know what nodes are
+	// involved in a TTL job.
+	log.Infof(ctx, "TTL processor started processorID=%d tableID=%d", t.ProcessorID, tableID)
 
 	selectRateLimit := ttlSpec.SelectRateLimit
 	// Default 0 value to "unlimited" in case job started on node <= v23.2.
@@ -161,7 +255,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 	)
 
 	relationName, pkColIDs, pkColNames, pkColTypes, pkColDirs, numFamilies, labelMetrics, err := getTableInfo(
-		ctx, db, descsCol, tableID,
+		ctx, db, tableID,
 	)
 	if err != nil {
 		return err
@@ -174,67 +268,17 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 	)
 
 	group := ctxgroup.WithContext(ctx)
-	processorSpanCount := int64(len(ttlSpec.Spans))
-	processorConcurrency := int64(runtime.GOMAXPROCS(0))
-	if processorSpanCount < processorConcurrency {
-		processorConcurrency = processorSpanCount
-	}
-	var processorRowCount atomic.Int64
-	var spansProccessedSinceLastUpdate atomic.Int64
-	var rowsProccessedSinceLastUpdate atomic.Int64
-
-	// Update progress for approximately every 1% of spans processed, at least
-	// 60 seconds apart with jitter.
-	updateEvery := max(1, processorSpanCount/100)
-	updateEveryDuration := 60*time.Second + time.Duration(rand.Int63n(10*1000))*time.Millisecond
-	lastUpdated := timeutil.Now()
-	updateFractionCompleted := func() error {
-		jobID := ttlSpec.JobID
-		lastUpdated = timeutil.Now()
-		spansToAdd := spansProccessedSinceLastUpdate.Swap(0)
-		rowsToAdd := rowsProccessedSinceLastUpdate.Swap(0)
-
-		var deletedRowCount, processedSpanCount, totalSpanCount int64
-		var fractionCompleted float32
-
-		err := jobRegistry.UpdateJobWithTxn(
-			ctx,
-			jobID,
-			nil, /* txn */
-			func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-				progress := md.Progress
-				rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
-				rowLevelTTL.JobProcessedSpanCount += spansToAdd
-				rowLevelTTL.JobDeletedRowCount += rowsToAdd
-				deletedRowCount = rowLevelTTL.JobDeletedRowCount
-				processedSpanCount = rowLevelTTL.JobProcessedSpanCount
-				totalSpanCount = rowLevelTTL.JobTotalSpanCount
-
-				fractionCompleted = float32(rowLevelTTL.JobProcessedSpanCount) / float32(rowLevelTTL.JobTotalSpanCount)
-				progress.Progress = &jobspb.Progress_FractionCompleted{
-					FractionCompleted: fractionCompleted,
-				}
-
-				ju.UpdateProgress(progress)
-				return nil
-			},
-		)
-		if err != nil {
-			return err
-		}
-		processorID := t.ProcessorID
-		log.Infof(
-			ctx,
-			"TTL fractionCompleted updated processorID=%d tableID=%d deletedRowCount=%d processedSpanCount=%d totalSpanCount=%d fractionCompleted=%.3f",
-			processorID, tableID, deletedRowCount, processedSpanCount, totalSpanCount, fractionCompleted,
-		)
-		return nil
+	totalSpanCount := int64(len(ttlSpec.Spans))
+	t.progressUpdater.InitProgress(totalSpanCount)
+	t.processorConcurrency = ttlbase.GetProcessorConcurrency(&flowCtx.Cfg.Settings.SV, int64(runtime.GOMAXPROCS(0)))
+	if totalSpanCount < t.processorConcurrency {
+		t.processorConcurrency = totalSpanCount
 	}
 
 	err = func() error {
-		boundsChan := make(chan QueryBounds, processorConcurrency)
+		boundsChan := make(chan spanutils.QueryBounds, t.processorConcurrency)
 		defer close(boundsChan)
-		for i := int64(0); i < processorConcurrency; i++ {
+		for i := int64(0); i < t.processorConcurrency; i++ {
 			group.GoCtx(func(ctx context.Context) error {
 				for bounds := range boundsChan {
 					start := timeutil.Now()
@@ -243,6 +287,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 							RelationName:      relationName,
 							PKColNames:        pkColNames,
 							PKColDirs:         pkColDirs,
+							PKColTypes:        pkColTypes,
 							Bounds:            bounds,
 							AOSTDuration:      ttlSpec.AOSTDuration,
 							SelectBatchSize:   ttlSpec.SelectBatchSize,
@@ -263,16 +308,14 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 						},
 						cutoff,
 					)
-					spanRowCount, err := t.runTTLOnQueryBounds(
+					spanDeletedRowCount, err := t.runTTLOnQueryBounds(
 						ctx,
 						metrics,
 						selectBuilder,
 						deleteBuilder,
 					)
-					// add before returning err in case of partial success
-					processorRowCount.Add(spanRowCount)
-					rowsProccessedSinceLastUpdate.Add(spanRowCount)
-					spansProccessedSinceLastUpdate.Add(1)
+					// Add to totals even on partial success.
+					t.progressUpdater.OnSpanProcessed(1 /* spansProcessed */, spanDeletedRowCount)
 					if err != nil {
 						// Continue until channel is fully read.
 						// Otherwise, the keys input will be blocked.
@@ -290,7 +333,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 		kvDB := db.KV()
 		var alloc tree.DatumAlloc
 		for i, span := range ttlSpec.Spans {
-			if bounds, hasRows, err := SpanToQueryBounds(
+			if bounds, hasRows, err := spanutils.SpanToQueryBounds(
 				ctx,
 				kvDB,
 				codec,
@@ -308,14 +351,11 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 			} else {
 				// If the span has no rows, we still need to increment the processed
 				// count.
-				spansProccessedSinceLastUpdate.Add(1)
+				t.progressUpdater.OnSpanProcessed(1 /* spansProcessed */, 0 /* deletedRowCount */)
 			}
 
-			if spansProccessedSinceLastUpdate.Load() >= updateEvery &&
-				timeutil.Since(lastUpdated) >= updateEveryDuration {
-				if err := updateFractionCompleted(); err != nil {
-					return err
-				}
+			if err := t.progressUpdater.UpdateProgress(ctx, output); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -327,41 +367,7 @@ func (t *ttlProcessor) work(ctx context.Context) error {
 	if err := group.Wait(); err != nil {
 		return err
 	}
-	if err := updateFractionCompleted(); err != nil {
-		return err
-	}
-
-	sqlInstanceID := flowCtx.NodeID.SQLInstanceID()
-	jobID := ttlSpec.JobID
-	return jobRegistry.UpdateJobWithTxn(
-		ctx,
-		jobID,
-		nil, /* txn */
-		func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
-			progress := md.Progress
-			rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
-			processorID := t.ProcessorID
-			rowLevelTTL.ProcessorProgresses = append(rowLevelTTL.ProcessorProgresses, jobspb.RowLevelTTLProcessorProgress{
-				ProcessorID:          processorID,
-				SQLInstanceID:        sqlInstanceID,
-				ProcessorRowCount:    processorRowCount.Load(),
-				ProcessorSpanCount:   processorSpanCount,
-				ProcessorConcurrency: processorConcurrency,
-			})
-			var fractionCompleted float32
-			if f, ok := progress.Progress.(*jobspb.Progress_FractionCompleted); ok {
-				fractionCompleted = f.FractionCompleted
-			}
-			ju.UpdateProgress(progress)
-			log.VInfof(
-				ctx,
-				2, /* level */
-				"TTL processorRowCount updated processorID=%d sqlInstanceID=%d tableID=%d jobRowCount=%d processorRowCount=%d fractionCompleted=%.3f",
-				processorID, sqlInstanceID, tableID, rowLevelTTL.JobDeletedRowCount, processorRowCount.Load(), fractionCompleted,
-			)
-			return nil
-		},
-	)
+	return t.progressUpdater.FinalizeProgress(ctx, output)
 }
 
 // runTTLOnQueryBounds runs the SELECT/DELETE loop for a single DistSQL span.
@@ -430,7 +436,7 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 					}
 					deleteBatch := expiredRowsPKs[startRowIdx+processed : until]
 					var batchRowCount int64
-					do := func(ctx context.Context, txn isql.Txn) error {
+					do := func(ctx context.Context, txn descs.Txn) error {
 						txn.KV().SetDebugName("ttljob-delete-batch")
 						// We explicitly specify a low retry limit because this operation is
 						// wrapped with its own retry function that will also take care of
@@ -442,13 +448,13 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 						}
 						// If we detected a schema change here, the DELETE will not succeed
 						// (the SELECT still will because of the AOST). Early exit here.
-						desc, err := flowCtx.Descriptors.ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, details.TableID)
+						desc, err := txn.Descriptors().ByIDWithLeased(txn.KV()).WithoutNonPublic().Get().Table(ctx, details.TableID)
 						if err != nil {
 							return err
 						}
 						if ttlSpec.PreDeleteChangeTableVersion || desc.GetVersion() != details.TableVersion {
 							return errors.Newf(
-								"table has had a schema change since the job has started at %s, aborting",
+								"table has had a schema change since the job has started at %s, job will run at the next scheduled time",
 								desc.GetModificationTime().GoTime().Format(time.RFC3339),
 							)
 						}
@@ -458,7 +464,7 @@ func (t *ttlProcessor) runTTLOnQueryBounds(
 						}
 						return nil
 					}
-					if err := serverCfg.DB.Txn(
+					if err := serverCfg.DB.DescsTxn(
 						ctx, do, isql.SteppingEnabled(), isql.WithPriority(admissionpb.BulkLowPri),
 					); err != nil {
 						return errors.Wrapf(err, "error during row deletion")
@@ -520,63 +526,174 @@ func newTTLProcessor(
 	return ttlProcessor, nil
 }
 
-// SpanToQueryBounds converts the span output of the DistSQL planner to
-// QueryBounds to generate SELECT statements.
-func SpanToQueryBounds(
-	ctx context.Context,
-	kvDB *kv.DB,
-	codec keys.SQLCodec,
-	pkColIDs catalog.TableColMap,
-	pkColTypes []*types.T,
-	pkColDirs []catenumpb.IndexColumn_Direction,
-	numFamilies int,
-	span roachpb.Span,
-	alloc *tree.DatumAlloc,
-) (bounds QueryBounds, hasRows bool, _ error) {
-	partialStartKey := span.Key
-	partialEndKey := span.EndKey
-	startKeyValues, err := kvDB.Scan(ctx, partialStartKey, partialEndKey, int64(numFamilies))
-	if err != nil {
-		return bounds, false, errors.Wrapf(err, "scan error startKey=%x endKey=%x", []byte(partialStartKey), []byte(partialEndKey))
-	}
-	// If span has 0 rows then return early - it will not be processed.
-	if len(startKeyValues) == 0 {
-		return bounds, false, nil
-	}
-	endKeyValues, err := kvDB.ReverseScan(ctx, partialStartKey, partialEndKey, int64(numFamilies))
-	if err != nil {
-		return bounds, false, errors.Wrapf(err, "reverse scan error startKey=%x endKey=%x", []byte(partialStartKey), []byte(partialEndKey))
-	}
-	// If span has 0 rows then return early - it will not be processed. This is
-	// checked again here because the calls to Scan and ReverseScan are
-	// non-transactional so the row could have been deleted between the calls.
-	if len(endKeyValues) == 0 {
-		return bounds, false, nil
-	}
-	bounds.Start, err = rowenc.DecodeIndexKeyToDatums(codec, pkColIDs, pkColTypes, pkColDirs, startKeyValues, alloc)
-	if err != nil {
-		return bounds, false, errors.Wrapf(err, "decode startKeyValues error on %+v", startKeyValues)
-	}
-	bounds.End, err = rowenc.DecodeIndexKeyToDatums(codec, pkColIDs, pkColTypes, pkColDirs, endKeyValues, alloc)
-	if err != nil {
-		return bounds, false, errors.Wrapf(err, "decode endKeyValues error on %+v", endKeyValues)
-	}
-	return bounds, true, nil
+// InitProgress implements the ttlProgressUpdater interface.
+func (c *coordinatorStreamUpdater) InitProgress(totalSpanCount int64) {
+	c.totalSpanCount = totalSpanCount
 }
 
-// GetPKColumnTypes returns tableDesc's primary key column types.
-func GetPKColumnTypes(
-	tableDesc catalog.TableDescriptor, indexDesc *descpb.IndexDescriptor,
-) ([]*types.T, error) {
-	pkColTypes := make([]*types.T, 0, len(indexDesc.KeyColumnIDs))
-	for i, id := range indexDesc.KeyColumnIDs {
-		col, err := catalog.MustFindColumnByID(tableDesc, id)
-		if err != nil {
-			return nil, errors.Wrapf(err, "column index=%d", i)
-		}
-		pkColTypes = append(pkColTypes, col.GetType())
+// OnSpanProcessed implements the ttlProgressUpdater interface.
+func (c *coordinatorStreamUpdater) OnSpanProcessed(spansProcessed, deletedRowCount int64) {
+	c.deletedRowCount.Add(deletedRowCount)
+	c.processedSpanCount.Add(spansProcessed)
+}
+
+// UpdateProgress implements the ttlProgressUpdater interface.
+func (c *coordinatorStreamUpdater) UpdateProgress(
+	ctx context.Context, output execinfra.RowReceiver,
+) error {
+	nodeID := c.proc.FlowCtx.NodeID.SQLInstanceID()
+	progressMsg := &jobspb.RowLevelTTLProcessorProgress{
+		ProcessorID:          c.proc.ProcessorID,
+		SQLInstanceID:        nodeID,
+		ProcessorConcurrency: c.proc.processorConcurrency,
+		DeletedRowCount:      c.deletedRowCount.Load(),
+		ProcessedSpanCount:   c.processedSpanCount.Load(),
+		TotalSpanCount:       c.totalSpanCount,
 	}
-	return pkColTypes, nil
+	progressAny, err := pbtypes.MarshalAny(progressMsg)
+	if err != nil {
+		return errors.Wrap(err, "unable to marshal TTL processor progress")
+	}
+	meta := &execinfrapb.ProducerMetadata{
+		BulkProcessorProgress: &execinfrapb.RemoteProducerMetadata_BulkProcessorProgress{
+			ProgressDetails: *progressAny,
+			NodeID:          nodeID,
+			FlowID:          c.proc.FlowCtx.ID,
+			ProcessorID:     c.proc.ProcessorID,
+			Drained:         c.processedSpanCount.Load() == c.totalSpanCount,
+		},
+	}
+	// Push progress after each span. Throttling is now handled by the coordinator.
+	status := output.Push(nil, meta)
+	if status != execinfra.NeedMoreRows {
+		return errors.Errorf("output receiver rejected progress metadata: %v", status)
+	}
+	if c.progressLogger.ShouldLog() {
+		log.Infof(ctx, "TTL processor progress: %v", progressMsg)
+	}
+	return nil
+}
+
+// FinalizeProgress implements the ttlProgressUpdater interface.
+func (c *coordinatorStreamUpdater) FinalizeProgress(
+	ctx context.Context, output execinfra.RowReceiver,
+) error {
+	return c.UpdateProgress(ctx, output)
+}
+
+// InitProgress implements the ttlProgressUpdater interface.
+func (d *directJobProgressUpdater) InitProgress(totalSpanCount int64) {
+	// Update progress for approximately every 1% of spans processed, at least
+	// 60 seconds apart with jitter.
+	d.totalSpanCount = totalSpanCount
+	d.updateEvery = max(1, totalSpanCount/100)
+	d.updateEveryDuration = 60*time.Second + time.Duration(rand.Int63n(10*1000))*time.Millisecond
+	d.lastUpdated = timeutil.Now()
+}
+
+// OnSpanProcessed implements the ttlProgressUpdater interface.
+func (d *directJobProgressUpdater) OnSpanProcessed(spansProcessed, deletedRowCount int64) {
+	d.rowsProcessed.Add(deletedRowCount)
+	d.rowsProcessedSinceLastUpdate.Add(deletedRowCount)
+	d.spansProcessed.Add(spansProcessed)
+	d.spansProcessedSinceLastUpdate.Add(spansProcessed)
+}
+
+func (d *directJobProgressUpdater) updateFractionCompleted(ctx context.Context) error {
+	jobID := d.proc.ttlSpec.JobID
+	d.lastUpdated = timeutil.Now()
+	spansToAdd := d.spansProcessedSinceLastUpdate.Swap(0)
+	rowsToAdd := d.rowsProcessedSinceLastUpdate.Swap(0)
+
+	var deletedRowCount, processedSpanCount, totalSpanCount int64
+	var fractionCompleted float32
+
+	err := d.proc.FlowCtx.Cfg.JobRegistry.UpdateJobWithTxn(
+		ctx,
+		jobID,
+		nil, /* txn */
+		func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+			progress := md.Progress
+			rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
+			rowLevelTTL.JobProcessedSpanCount += spansToAdd
+			rowLevelTTL.JobDeletedRowCount += rowsToAdd
+			deletedRowCount = rowLevelTTL.JobDeletedRowCount
+			processedSpanCount = rowLevelTTL.JobProcessedSpanCount
+			totalSpanCount = rowLevelTTL.JobTotalSpanCount
+
+			fractionCompleted = float32(rowLevelTTL.JobProcessedSpanCount) / float32(rowLevelTTL.JobTotalSpanCount)
+			progress.Progress = &jobspb.Progress_FractionCompleted{
+				FractionCompleted: fractionCompleted,
+			}
+
+			ju.UpdateProgress(progress)
+			return nil
+		},
+	)
+	if err != nil {
+		return err
+	}
+	log.Infof(
+		ctx,
+		"TTL fractionCompleted updated processorID=%d tableID=%d deletedRowCount=%d processedSpanCount=%d totalSpanCount=%d fractionCompleted=%.3f",
+		d.proc.ProcessorID, d.proc.ttlSpec.RowLevelTTLDetails.TableID, deletedRowCount, processedSpanCount, totalSpanCount, fractionCompleted,
+	)
+	return nil
+}
+
+// UpdateProgress implements the ttlProgressUpdater interface.
+func (d *directJobProgressUpdater) UpdateProgress(
+	ctx context.Context, _ execinfra.RowReceiver,
+) error {
+	if d.spansProcessedSinceLastUpdate.Load() >= d.updateEvery &&
+		timeutil.Since(d.lastUpdated) >= d.updateEveryDuration {
+		if err := d.updateFractionCompleted(ctx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// FinalizeProgress implements the ttlProgressUpdater interface.
+func (d *directJobProgressUpdater) FinalizeProgress(
+	ctx context.Context, _ execinfra.RowReceiver,
+) error {
+	if err := d.updateFractionCompleted(ctx); err != nil {
+		return err
+	}
+
+	sqlInstanceID := d.proc.FlowCtx.NodeID.SQLInstanceID()
+	jobID := d.proc.ttlSpec.JobID
+	return d.proc.FlowCtx.Cfg.JobRegistry.UpdateJobWithTxn(
+		ctx,
+		jobID,
+		nil, /* txn */
+		func(_ isql.Txn, md jobs.JobMetadata, ju *jobs.JobUpdater) error {
+			progress := md.Progress
+			rowLevelTTL := progress.Details.(*jobspb.Progress_RowLevelTTL).RowLevelTTL
+			processorID := d.proc.ProcessorID
+			rowLevelTTL.ProcessorProgresses = append(rowLevelTTL.ProcessorProgresses, jobspb.RowLevelTTLProcessorProgress{
+				ProcessorID:          processorID,
+				SQLInstanceID:        sqlInstanceID,
+				DeletedRowCount:      d.rowsProcessed.Load(),
+				ProcessedSpanCount:   d.spansProcessed.Load(),
+				ProcessorConcurrency: d.proc.processorConcurrency,
+			})
+			var fractionCompleted float32
+			if f, ok := progress.Progress.(*jobspb.Progress_FractionCompleted); ok {
+				fractionCompleted = f.FractionCompleted
+			}
+			ju.UpdateProgress(progress)
+			log.VInfof(
+				ctx,
+				2, /* level */
+				"TTL processorRowCount updated processorID=%d sqlInstanceID=%d tableID=%d jobRowCount=%d processorRowCount=%d fractionCompleted=%.3f",
+				processorID, sqlInstanceID, d.proc.ttlSpec.RowLevelTTLDetails.TableID, rowLevelTTL.JobDeletedRowCount,
+				d.rowsProcessed.Load(), fractionCompleted,
+			)
+			return nil
+		},
+	)
 }
 
 func init() {

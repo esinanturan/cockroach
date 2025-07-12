@@ -12,6 +12,7 @@ import (
 	"math"
 	"strings"
 
+	"github.com/cockroachdb/cockroach/pkg/clusterversion"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/catpb"
 	"github.com/cockroachdb/cockroach/pkg/sql/catalog/tabledesc"
 	"github.com/cockroachdb/cockroach/pkg/sql/paramparse"
@@ -36,18 +37,22 @@ type Setter struct {
 	// UpdatedRowLevelTTL is kept separate from the RowLevelTTL in TableDesc
 	// in case changes need to be made in schema changer.
 	UpdatedRowLevelTTL *catpb.RowLevelTTL
+
+	// NewObject bool tracks if this is a newly created object.
+	NewObject bool
 }
 
 var _ storageparam.Setter = (*Setter)(nil)
 
 // NewSetter returns a new Setter.
-func NewSetter(tableDesc *tabledesc.Mutable) *Setter {
+func NewSetter(tableDesc *tabledesc.Mutable, isNewObject bool) *Setter {
 	var updatedRowLevelTTL *catpb.RowLevelTTL
 	if tableDesc.HasRowLevelTTL() {
 		updatedRowLevelTTL = protoutil.Clone(tableDesc.GetRowLevelTTL()).(*catpb.RowLevelTTL)
 	}
 	return &Setter{
 		TableDesc:          tableDesc,
+		NewObject:          isNewObject,
 		UpdatedRowLevelTTL: updatedRowLevelTTL,
 	}
 }
@@ -58,6 +63,11 @@ func (po *Setter) RunPostChecks() error {
 		return err
 	}
 	return nil
+}
+
+// IsNewTableObject implements the Setter interface.
+func (po *Setter) IsNewTableObject() bool {
+	return po.NewObject
 }
 
 func boolFromDatum(
@@ -599,7 +609,12 @@ var tableParams = map[string]tableParam{
 			return nil
 		},
 		onReset: func(ctx context.Context, po *Setter, evalCtx *eval.Context, key string) error {
-			po.TableDesc.SchemaLocked = false
+			schemaLockedDefault := evalCtx.SessionData().CreateTableWithSchemaLocked
+			// Before 25.3 tables were never created with schema_locked by default.
+			if !evalCtx.Settings.Version.IsActive(ctx, clusterversion.V25_3) {
+				schemaLockedDefault = false
+			}
+			po.TableDesc.SchemaLocked = schemaLockedDefault
 			return nil
 		},
 	},

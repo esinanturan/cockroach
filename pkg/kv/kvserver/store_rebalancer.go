@@ -19,6 +19,8 @@ import (
 	"github.com/cockroachdb/cockroach/pkg/roachpb"
 	"github.com/cockroachdb/cockroach/pkg/settings"
 	"github.com/cockroachdb/cockroach/pkg/settings/cluster"
+	"github.com/cockroachdb/cockroach/pkg/util/buildutil"
+	"github.com/cockroachdb/cockroach/pkg/util/errorutil/unimplemented"
 	"github.com/cockroachdb/cockroach/pkg/util/log"
 	"github.com/cockroachdb/cockroach/pkg/util/metric"
 	"github.com/cockroachdb/cockroach/pkg/util/stop"
@@ -32,12 +34,18 @@ var (
 		Help:        "Number of lease transfers motivated by store-level load imbalances",
 		Measurement: "Lease Transfers",
 		Unit:        metric.Unit_COUNT,
+		Essential:   true,
+		Category:    metric.Metadata_REPLICATION,
+		HowToUse:    `Used to identify when there has been more rebalancing activity triggered by imbalance between stores (of QPS or CPU). If this is high (when the count is rated), it indicates that more rebalancing activity is taking place due to load imbalance between stores.`,
 	}
 	metaStoreRebalancerRangeRebalanceCount = metric.Metadata{
 		Name:        "rebalancing.range.rebalances",
 		Help:        "Number of range rebalance operations motivated by store-level load imbalances",
 		Measurement: "Range Rebalances",
 		Unit:        metric.Unit_COUNT,
+		Essential:   true,
+		Category:    metric.Metadata_REPLICATION,
+		HowToUse:    `Used to identify when there has been more rebalancing activity triggered by imbalance between stores (of QPS or CPU). If this is high (when the count is rated), it indicates that more rebalancing activity is taking place due to load imbalance between stores.`,
 	}
 	metaStoreRebalancerImbalancedOverfullOptionsExhausted = metric.Metadata{
 		Name: "rebalancing.state.imbalanced_overfull_options_exhausted",
@@ -63,6 +71,9 @@ func makeStoreRebalancerMetrics() StoreRebalancerMetrics {
 	}
 }
 
+var ErrMultiMetricRebalancingNotSupported = unimplemented.NewWithIssue(
+	103320, "multi-metric rebalancing not supported for production use")
+
 // LoadBasedRebalancingMode controls whether range rebalancing takes
 // additional variables such as write load and disk usage into account.
 // If disabled, rebalancing is done purely based on replica count.
@@ -75,8 +86,16 @@ var LoadBasedRebalancingMode = settings.RegisterEnumSetting(
 		LBRebalancingOff:               "off",
 		LBRebalancingLeasesOnly:        "leases",
 		LBRebalancingLeasesAndReplicas: "leases and replicas",
+		LBRebalancingMultiMetric:       "multi-metric",
 	},
-	settings.WithPublic)
+	settings.WithPublic,
+	settings.WithValidateEnum(func(enumStr string) error {
+		if buildutil.CrdbTestBuild || enumStr != "multi-metric" {
+			return nil
+		}
+		return ErrMultiMetricRebalancingNotSupported
+	}),
+)
 
 // LBRebalancingMode controls if and when we do store-level rebalancing
 // based on load.
@@ -92,6 +111,10 @@ const (
 	// LBRebalancingLeasesAndReplicas means that we rebalance both leases and
 	// replicas based on store-level load imbalances.
 	LBRebalancingLeasesAndReplicas
+	// LBRebalancingMultiMetric means that the store rebalancer yields to the
+	// multi-metric store rebalancer, balancing both leases and replicas based on
+	// store-level load imbalances.
+	LBRebalancingMultiMetric
 )
 
 // RebalanceSearchOutcome returns the result of a rebalance target search. It
